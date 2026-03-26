@@ -502,7 +502,9 @@ impl ListState {
         point(Pixels::ZERO, Pixels::ZERO.max(height - bounds.size.height))
     }
 
-    /// Returns the current scroll offset adjusted for the scrollbar
+    /// Returns the current scroll offset adjusted for the scrollbar.
+    /// S450: Removed drag_offset — consistent with set_offset_from_scrollbar
+    /// which no longer uses drag_offset during drag.
     pub fn scroll_px_offset_for_scrollbar(&self) -> Point<Pixels> {
         let state = &self.0.borrow();
         let logical_scroll_top = state.logical_scroll_top();
@@ -510,11 +512,7 @@ impl ListState {
         let mut cursor = state.items.cursor::<ListItemSummary>(());
         let summary: ListItemSummary =
             cursor.summary(&Count(logical_scroll_top.item_ix), Bias::Right);
-        let content_height = state.items.summary().height;
-        let drag_offset =
-            // if dragging the scrollbar, we want to offset the point if the height changed
-            content_height - state.scrollbar_drag_start_height.unwrap_or(content_height);
-        let offset = summary.height + logical_scroll_top.offset_in_item - drag_offset;
+        let offset = summary.height + logical_scroll_top.offset_in_item;
 
         Point::new(px(0.), -offset)
     }
@@ -944,12 +942,26 @@ impl StateInner {
         let height = bounds.size.height;
 
         let padding = self.last_padding.unwrap_or_default();
-        let content_height = self.items.summary().height;
+        // CS-S449+S450 vendor patch: sign convention + drag_offset fix
+        //
+        // S449: Replaced .abs() with -point.y (scrollbar always sends negative offsets).
+        // S450: Removed drag_offset from new_scroll_top calculation. During drag,
+        // both point.y (from scrollbar) and scroll_max use frozen content_height
+        // (scrollbar_drag_start_height). The drag_offset (LIVE - FROZEN) was
+        // double-compensating: as content grew during drag, drag_offset would
+        // exceed -point.y, making the subtraction go negative and clamping to 0
+        // (scroll jumps to top = inversion). Since both sides of the mapping are
+        // frozen, no correction is needed.
+        //
+        // Callers: scrollbar passes NEGATIVE point.y; our view.rs callers
+        // (follow_output, scroll_to_bottom) also pass NEGATIVE (negated max.height).
+        //
+        // Ref: scroll-interaction-analysis-cog.md Bug 1, gpui-scroll-math-deep-dive.md
+        // Track: P2.9 upstream PR candidate
+        let content_height = self.scrollbar_drag_start_height
+            .unwrap_or_else(|| self.items.summary().height);
         let scroll_max = (content_height + padding.top + padding.bottom - height).max(px(0.));
-        let drag_offset =
-            // if dragging the scrollbar, we want to offset the point if the height changed
-            content_height - self.scrollbar_drag_start_height.unwrap_or(content_height);
-        let new_scroll_top = (point.y - drag_offset).abs().max(px(0.)).min(scroll_max);
+        let new_scroll_top = (-point.y).max(px(0.)).min(scroll_max);
 
         if self.alignment == ListAlignment::Bottom && new_scroll_top == scroll_max {
             self.logical_scroll_top = None;
