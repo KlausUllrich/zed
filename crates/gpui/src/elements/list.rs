@@ -484,6 +484,20 @@ impl ListState {
         self.0.borrow_mut().scrollbar_drag_start_height.take();
     }
 
+    /// Pin the list to the bottom, clearing any explicit scroll position.
+    /// For bottom-aligned lists, this is equivalent to scrolling to the very end.
+    pub fn pin_to_bottom(&self) {
+        let mut state = self.0.borrow_mut();
+        state.logical_scroll_top = None;
+    }
+
+    /// Returns true if the list is pinned to the bottom (no explicit scroll position set).
+    /// Only meaningful for lists with `ListAlignment::Bottom`.
+    pub fn is_pinned_to_bottom(&self) -> bool {
+        let state = self.0.borrow();
+        state.alignment == ListAlignment::Bottom && state.logical_scroll_top.is_none()
+    }
+
     /// Set the offset from the scrollbar
     pub fn set_offset_from_scrollbar(&self, point: Point<Pixels>) {
         self.0.borrow_mut().set_offset_from_scrollbar(point);
@@ -1448,5 +1462,36 @@ mod test {
         let offset = state.logical_scroll_top();
         assert_eq!(offset.item_ix, 2);
         assert_eq!(offset.offset_in_item, px(20.));
+    }
+
+    #[gpui::test]
+    fn test_pin_to_bottom(cx: &mut TestAppContext) {
+        let _cx = cx.add_empty_window();
+
+        let state = ListState::new(10, crate::ListAlignment::Bottom, px(10.));
+
+        // Initially pinned (no explicit scroll position)
+        assert!(state.is_pinned_to_bottom());
+
+        // After scrolling to an explicit position, no longer pinned
+        state.scroll_to(gpui::ListOffset {
+            item_ix: 3,
+            offset_in_item: px(0.0),
+        });
+        assert!(!state.is_pinned_to_bottom());
+
+        // pin_to_bottom restores pinned state
+        state.pin_to_bottom();
+        assert!(state.is_pinned_to_bottom());
+    }
+
+    #[gpui::test]
+    fn test_pin_to_bottom_only_meaningful_for_bottom_alignment(cx: &mut TestAppContext) {
+        let _cx = cx.add_empty_window();
+
+        let state = ListState::new(10, crate::ListAlignment::Top, px(10.));
+
+        // Top-aligned list is never "pinned to bottom" even with no explicit scroll
+        assert!(!state.is_pinned_to_bottom());
     }
 }
