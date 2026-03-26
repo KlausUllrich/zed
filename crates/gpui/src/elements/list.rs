@@ -484,6 +484,20 @@ impl ListState {
         self.0.borrow_mut().scrollbar_drag_start_height.take();
     }
 
+    /// Pin the list to the bottom.
+    /// For bottom-aligned lists, setting logical_scroll_top to None means "pinned to bottom" —
+    /// GPUI will keep the view anchored to the last item.
+    pub fn pin_to_bottom(&self) {
+        self.0.borrow_mut().logical_scroll_top = None;
+    }
+
+    /// Returns true if the list is currently pinned to the bottom.
+    /// Only meaningful for ListAlignment::Bottom lists.
+    pub fn is_pinned_to_bottom(&self) -> bool {
+        let state = self.0.borrow();
+        state.alignment == ListAlignment::Bottom && state.logical_scroll_top.is_none()
+    }
+
     /// Set the offset from the scrollbar
     pub fn set_offset_from_scrollbar(&self, point: Point<Pixels>) {
         self.0.borrow_mut().set_offset_from_scrollbar(point);
