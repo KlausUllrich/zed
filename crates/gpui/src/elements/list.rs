@@ -166,6 +166,9 @@ pub struct ListPrepaintState {
 enum ListItem {
     Unmeasured {
         focus_handle: Option<FocusHandle>,
+        /// Estimated height for SumTree summary. Provides a non-zero height for
+        /// unmeasured items so scrollbar thumb size reflects actual content length.
+        estimated_height: Pixels,
     },
     Measured {
         size: Size<Pixels>,
@@ -184,7 +187,7 @@ impl ListItem {
 
     fn focus_handle(&self) -> Option<FocusHandle> {
         match self {
-            ListItem::Unmeasured { focus_handle } | ListItem::Measured { focus_handle, .. } => {
+            ListItem::Unmeasured { focus_handle, .. } | ListItem::Measured { focus_handle, .. } => {
                 focus_handle.clone()
             }
         }
@@ -192,7 +195,7 @@ impl ListItem {
 
     fn contains_focused(&self, window: &Window, cx: &App) -> bool {
         match self {
-            ListItem::Unmeasured { focus_handle } | ListItem::Measured { focus_handle, .. } => {
+            ListItem::Unmeasured { focus_handle, .. } | ListItem::Measured { focus_handle, .. } => {
                 focus_handle
                     .as_ref()
                     .is_some_and(|handle| handle.contains_focused(window, cx))
@@ -274,6 +277,9 @@ impl ListState {
 
         let new_items = state.items.iter().map(|item| ListItem::Unmeasured {
             focus_handle: item.focus_handle(),
+            // Preserve measured height as estimate when resetting — keeps SumTree
+            // total height accurate during remeasure cycle.
+            estimated_height: item.size().map_or(px(0.), |s| s.height),
         });
 
         // If there's a `logical_scroll_top`, we need to keep track of it as a
@@ -334,7 +340,47 @@ impl ListState {
         new_items.extend(
             focus_handles.into_iter().map(|focus_handle| {
                 spliced_count += 1;
-                ListItem::Unmeasured { focus_handle }
+                ListItem::Unmeasured { focus_handle, estimated_height: px(0.) }
+            }),
+            (),
+        );
+        new_items.append(old_items.suffix(), ());
+        drop(old_items);
+        state.items = new_items;
+
+        if let Some(ListOffset {
+            item_ix,
+            offset_in_item,
+        }) = state.logical_scroll_top.as_mut()
+        {
+            if old_range.contains(item_ix) {
+                *item_ix = old_range.start;
+                *offset_in_item = px(0.);
+            } else if old_range.end <= *item_ix {
+                *item_ix = *item_ix - (old_range.end - old_range.start) + spliced_count;
+            }
+        }
+    }
+
+    /// Like [`Self::splice`], but each new item carries an estimated height for
+    /// the SumTree summary. This allows the scrollbar to reflect realistic content
+    /// size before items are measured. Pass `px(0.)` if no estimate is available.
+    pub fn splice_with_heights(
+        &self,
+        old_range: Range<usize>,
+        items: impl IntoIterator<Item = (Option<FocusHandle>, Pixels)>,
+    ) {
+        let state = &mut *self.0.borrow_mut();
+
+        let mut old_items = state.items.cursor::<Count>(());
+        let mut new_items = old_items.slice(&Count(old_range.start), Bias::Right);
+        old_items.seek_forward(&Count(old_range.end), Bias::Right);
+
+        let mut spliced_count = 0;
+        new_items.extend(
+            items.into_iter().map(|(focus_handle, estimated_height)| {
+                spliced_count += 1;
+                ListItem::Unmeasured { focus_handle, estimated_height }
             }),
             (),
         );
@@ -1124,6 +1170,9 @@ impl Element for List {
             let new_items = SumTree::from_iter(
                 state.items.iter().map(|item| ListItem::Unmeasured {
                     focus_handle: item.focus_handle(),
+                    // Preserve measured height as estimate during width change — prevents
+                    // SumTree total height from collapsing to 0.
+                    estimated_height: item.size().map_or(px(0.), |s| s.height),
                 }),
                 (),
             );
@@ -1209,11 +1258,11 @@ impl sum_tree::Item for ListItem {
 
     fn summary(&self, _: ()) -> Self::Summary {
         match self {
-            ListItem::Unmeasured { focus_handle } => ListItemSummary {
+            ListItem::Unmeasured { focus_handle, estimated_height } => ListItemSummary {
                 count: 1,
                 rendered_count: 0,
                 unrendered_count: 1,
-                height: px(0.),
+                height: *estimated_height,
                 has_focus_handles: focus_handle.is_some(),
             },
             ListItem::Measured {
