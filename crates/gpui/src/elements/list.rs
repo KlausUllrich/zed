@@ -524,10 +524,37 @@ impl ListState {
     }
 
     /// Called when the user stops dragging the scrollbar.
-    ///
-    /// See `scrollbar_drag_started`.
+    /// Unfreezes height and preserves the current scroll position. The user
+    /// continues seeing the same content; only the scrollbar thumb adjusts
+    /// to reflect the live content height (smooth transition vs instant jump).
     pub fn scrollbar_drag_ended(&self) {
-        self.0.borrow_mut().scrollbar_drag_start_height.take();
+        let mut state = self.0.borrow_mut();
+        let frozen = state.scrollbar_drag_start_height.take();
+        // Preserve scroll position through the unfreeze. The logical_scroll_top
+        // was computed against frozen height — it points to the correct item/offset.
+        // No adjustment needed: logical_scroll_top is item-index + offset-in-item,
+        // which is independent of total height. The scrollbar thumb will smoothly
+        // adjust to the live height on next paint.
+        //
+        // Only case needing care: if we were pinned to bottom (logical_scroll_top = None)
+        // during drag, keep it pinned — the bottom-alignment semantics handle this.
+        if let (Some(frozen_h), Some(scroll_top)) = (frozen, state.logical_scroll_top) {
+            let live_h = state.items.summary().height;
+            // If heights differ significantly and we were near the bottom,
+            // re-pin to bottom to avoid appearing stuck above new content.
+            let bounds = state.last_layout_bounds.unwrap_or_default();
+            let padding = state.last_padding.unwrap_or_default();
+            let scroll_max = (live_h + padding.top + padding.bottom - bounds.size.height).max(px(0.));
+            let scroll_pos = {
+                let mut cursor = state.items.cursor::<ListItemSummary>(());
+                let summary: ListItemSummary =
+                    cursor.summary(&Count(scroll_top.item_ix), Bias::Right);
+                summary.height + scroll_top.offset_in_item
+            };
+            if state.alignment == ListAlignment::Bottom && scroll_pos >= scroll_max {
+                state.logical_scroll_top = None;
+            }
+        }
     }
 
     /// Pin the list to the bottom.
@@ -550,14 +577,23 @@ impl ListState {
     }
 
     /// Returns the maximum scroll offset according to the items we have measured.
-    /// This value remains constant while dragging to prevent the scrollbar from moving away unexpectedly.
+    /// During drag, uses frozen height but allows it to grow if content has grown —
+    /// prevents getting stuck at stale max while allowing access to new content.
     pub fn max_offset_for_scrollbar(&self) -> Point<Pixels> {
-        let state = self.0.borrow();
+        let mut state = self.0.borrow_mut();
         let bounds = state.last_layout_bounds.unwrap_or_default();
+        let live_height = state.items.summary().height;
 
-        let height = state
-            .scrollbar_drag_start_height
-            .unwrap_or_else(|| state.items.summary().height);
+        let height = match state.scrollbar_drag_start_height {
+            Some(frozen) if live_height > frozen => {
+                // Content grew during drag — update frozen to live so new content
+                // is reachable. Only grows, never shrinks — thumb position stays stable.
+                state.scrollbar_drag_start_height = Some(live_height);
+                live_height
+            }
+            Some(frozen) => frozen,
+            None => live_height,
+        };
 
         point(Pixels::ZERO, Pixels::ZERO.max(height - bounds.size.height))
     }
@@ -1018,8 +1054,17 @@ impl StateInner {
         //
         // Ref: scroll-interaction-analysis-cog.md Bug 1, gpui-scroll-math-deep-dive.md
         // Track: P2.9 upstream PR candidate
-        let content_height = self.scrollbar_drag_start_height
-            .unwrap_or_else(|| self.items.summary().height);
+        // Phase C: Grow frozen height during drag if content has grown.
+        // Keeps frozen → live mapping consistent with max_offset_for_scrollbar().
+        let live_height = self.items.summary().height;
+        let content_height = match self.scrollbar_drag_start_height {
+            Some(frozen) if live_height > frozen => {
+                self.scrollbar_drag_start_height = Some(live_height);
+                live_height
+            }
+            Some(frozen) => frozen,
+            None => live_height,
+        };
         let scroll_max = (content_height + padding.top + padding.bottom - height).max(px(0.));
         let new_scroll_top = (-point.y).max(px(0.)).min(scroll_max);
 
