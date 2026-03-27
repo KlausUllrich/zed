@@ -75,6 +75,9 @@ struct StateInner {
     smoothed_scrollbar_height: Option<Pixels>,
     measuring_behavior: ListMeasuringBehavior,
     pending_scroll: Option<PendingScrollFraction>,
+    /// When true, the built-in scroll wheel handler is suppressed.
+    /// Used by ConversationView to handle wheel events with smooth pixel animation.
+    suppress_wheel_scroll: bool,
 }
 
 /// Keeps track of a fractional scroll position within an item for restoration
@@ -243,6 +246,7 @@ impl ListState {
             smoothed_scrollbar_height: None,
             measuring_behavior: ListMeasuringBehavior::default(),
             pending_scroll: None,
+            suppress_wheel_scroll: false,
         })));
         this.splice(0..0, item_count);
         this
@@ -443,6 +447,13 @@ impl ListState {
             item_ix: cursor.start().count,
             offset_in_item: new_pixel_offset - cursor.start().height,
         });
+    }
+
+    /// Suppress or enable the built-in scroll wheel handler.
+    /// When suppressed, the caller is responsible for registering their own scroll
+    /// handler (e.g., via `on_scroll_wheel` on a parent element).
+    pub fn set_suppress_wheel_scroll(&self, suppress: bool) {
+        self.0.borrow_mut().suppress_wheel_scroll = suppress;
     }
 
     /// Scroll the list to the given offset
@@ -1364,6 +1375,9 @@ impl Element for List {
         let hitbox_id = prepaint.hitbox.id;
         let mut accumulated_scroll_delta = ScrollDelta::default();
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+            if list_state.0.borrow().suppress_wheel_scroll {
+                return;
+            }
             if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
                 accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
                 let pixel_delta = accumulated_scroll_delta.pixel_delta(px(20.));
