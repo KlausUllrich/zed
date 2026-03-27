@@ -669,6 +669,13 @@ impl ListState {
         (scroll_max - current_pos) < tolerance
     }
 
+    /// Returns true if the scrollbar is currently being dragged.
+    /// The Scrollbar component sets this via `scrollbar_drag_started()`/`scrollbar_drag_ended()`.
+    /// Useful for detecting mouse-up without relying on position-stable timeouts.
+    pub fn is_scrollbar_dragging(&self) -> bool {
+        self.0.borrow().scrollbar_drag_start_height.is_some()
+    }
+
     /// Returns the current scroll offset adjusted for the scrollbar.
     /// S450: Removed drag_offset — consistent with set_offset_from_scrollbar
     /// which no longer uses drag_offset during drag.
