@@ -560,12 +560,15 @@ impl ListState {
     /// Pin the list to the bottom.
     /// For bottom-aligned lists, setting logical_scroll_top to None means "pinned to bottom" —
     /// GPUI will keep the view anchored to the last item.
+    /// Note: Unused by CS (which uses ListAlignment::Top + scroll_to_max());
+    /// retained for GPUI API compatibility with ListAlignment::Bottom callers.
     pub fn pin_to_bottom(&self) {
         self.0.borrow_mut().logical_scroll_top = None;
     }
 
     /// Returns true if the list is currently pinned to the bottom.
     /// Only meaningful for ListAlignment::Bottom lists.
+    /// Note: Unused by CS (which uses is_at_bottom()); retained for GPUI API compatibility.
     pub fn is_pinned_to_bottom(&self) -> bool {
         let state = self.0.borrow();
         state.alignment == ListAlignment::Bottom && state.logical_scroll_top.is_none()
@@ -596,6 +599,74 @@ impl ListState {
         };
 
         point(Pixels::ZERO, Pixels::ZERO.max(height - bounds.size.height))
+    }
+
+    /// Scroll to the maximum offset (bottom of content).
+    /// Unlike pin_to_bottom() which sets logical_scroll_top=None (a sentinel),
+    /// this computes the actual scroll position. Works with any ListAlignment.
+    pub fn scroll_to_max(&self) {
+        let state = &mut *self.0.borrow_mut();
+        let bounds = state.last_layout_bounds.unwrap_or_default();
+        let padding = state.last_padding.unwrap_or_default();
+        let total_height = state.items.summary().height;
+        let scroll_max =
+            (total_height + padding.top + padding.bottom - bounds.size.height).max(px(0.));
+
+        let (start, ..) =
+            state
+                .items
+                .find::<ListItemSummary, _>((), &Height(scroll_max), Bias::Right);
+        state.logical_scroll_top = Some(ListOffset {
+            item_ix: start.count,
+            offset_in_item: scroll_max - start.height,
+        });
+    }
+
+    /// Returns true if the list is scrolled to (or very near) the bottom.
+    /// Works with any alignment by comparing current scroll position to max.
+    pub fn is_at_bottom(&self) -> bool {
+        let state = self.0.borrow();
+        let bounds = state.last_layout_bounds.unwrap_or_default();
+        let padding = state.last_padding.unwrap_or_default();
+        let total_height = state.items.summary().height;
+        let scroll_max =
+            (total_height + padding.top + padding.bottom - bounds.size.height).max(px(0.));
+
+        if scroll_max == px(0.) {
+            return true; // Content fits in viewport
+        }
+
+        let scroll_top = state.logical_scroll_top();
+        let mut cursor = state.items.cursor::<ListItemSummary>(());
+        let summary: ListItemSummary =
+            cursor.summary(&Count(scroll_top.item_ix), Bias::Right);
+        let current_pos = summary.height + scroll_top.offset_in_item;
+
+        (scroll_max - current_pos) < px(1.0)
+    }
+
+    /// Returns true if the list is within `tolerance` pixels of the bottom.
+    /// Use for re-engagement checks where height estimation oscillation (±25px)
+    /// makes the strict 1px `is_at_bottom()` unreliable.
+    pub fn is_near_bottom(&self, tolerance: Pixels) -> bool {
+        let state = self.0.borrow();
+        let bounds = state.last_layout_bounds.unwrap_or_default();
+        let padding = state.last_padding.unwrap_or_default();
+        let total_height = state.items.summary().height;
+        let scroll_max =
+            (total_height + padding.top + padding.bottom - bounds.size.height).max(px(0.));
+
+        if scroll_max == px(0.) {
+            return true;
+        }
+
+        let scroll_top = state.logical_scroll_top();
+        let mut cursor = state.items.cursor::<ListItemSummary>(());
+        let summary: ListItemSummary =
+            cursor.summary(&Count(scroll_top.item_ix), Bias::Right);
+        let current_pos = summary.height + scroll_top.offset_in_item;
+
+        (scroll_max - current_pos) < tolerance
     }
 
     /// Returns the current scroll offset adjusted for the scrollbar.
