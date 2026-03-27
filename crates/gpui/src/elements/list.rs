@@ -70,6 +70,9 @@ struct StateInner {
     #[allow(clippy::type_complexity)]
     scroll_handler: Option<Box<dyn FnMut(&ListScrollEvent, &mut Window, &mut App)>>,
     scrollbar_drag_start_height: Option<Pixels>,
+    /// Smoothed content height for scrollbar — prevents thumb jumps during auto-scroll.
+    /// Lerps toward live height each frame (factor 0.3). None until first scrollbar query.
+    smoothed_scrollbar_height: Option<Pixels>,
     measuring_behavior: ListMeasuringBehavior,
     pending_scroll: Option<PendingScrollFraction>,
 }
@@ -237,6 +240,7 @@ impl ListState {
             scroll_handler: None,
             reset: false,
             scrollbar_drag_start_height: None,
+            smoothed_scrollbar_height: None,
             measuring_behavior: ListMeasuringBehavior::default(),
             pending_scroll: None,
         })));
@@ -262,6 +266,7 @@ impl ListState {
             state.measuring_behavior.reset();
             state.logical_scroll_top = None;
             state.scrollbar_drag_start_height = None;
+            state.smoothed_scrollbar_height = None;
             state.items.summary().count
         };
 
@@ -530,6 +535,9 @@ impl ListState {
     pub fn scrollbar_drag_ended(&self) {
         let mut state = self.0.borrow_mut();
         let frozen = state.scrollbar_drag_start_height.take();
+        // Re-initialize smoothed height from live so it doesn't jump on first
+        // non-drag scrollbar query after drag ends.
+        state.smoothed_scrollbar_height = None;
         // Preserve scroll position through the unfreeze. The logical_scroll_top
         // was computed against frozen height — it points to the correct item/offset.
         // No adjustment needed: logical_scroll_top is item-index + offset-in-item,
@@ -595,7 +603,17 @@ impl ListState {
                 live_height
             }
             Some(frozen) => frozen,
-            None => live_height,
+            None => {
+                // Not dragging — apply smoothing to prevent thumb jumps during
+                // auto-scroll / streaming. Lerp 30% toward live each frame:
+                // ~90% converged in 7 frames (~116ms at 60fps).
+                let smoothed = match state.smoothed_scrollbar_height {
+                    Some(prev) => prev + (live_height - prev) * 0.3,
+                    None => live_height,
+                };
+                state.smoothed_scrollbar_height = Some(smoothed);
+                smoothed
+            }
         };
 
         point(Pixels::ZERO, Pixels::ZERO.max(height - bounds.size.height))
