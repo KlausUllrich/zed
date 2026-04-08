@@ -1072,10 +1072,27 @@ impl StateInner {
                 let element_size = element.layout_as_root(available_item_space, window, cx);
                 size = Some(element_size);
 
-                // If there's a pending scroll adjustment for the scroll-top
-                // item, apply it, ensuring proportional scroll position is
-                // maintained after re-measuring.
                 if ix == 0 {
+                    // CS patch: Scroll offset compensation.
+                    // When the scroll-top item's measured height differs from its
+                    // previously known height (cached measure or size_hint), adjust
+                    // offset_in_item by the delta so the viewport stays visually stable.
+                    // This eliminates micro-stutter when scrolling up through items
+                    // whose estimated height differs from their actual measured height.
+                    let old_height = item.size_hint()
+                        .map(|s| s.height)
+                        .unwrap_or(px(0.));
+                    let height_delta = element_size.height - old_height;
+                    if height_delta != px(0.) && scroll_top.offset_in_item > px(0.) {
+                        scroll_top.offset_in_item = (scroll_top.offset_in_item + height_delta)
+                            .max(px(0.))
+                            .min(element_size.height);
+                        self.logical_scroll_top = Some(scroll_top);
+                    }
+
+                    // If there's a pending scroll adjustment (from remeasure_items),
+                    // apply it — proportional preservation takes priority over our
+                    // delta correction.
                     if let Some(pending_scroll) = self.pending_scroll.take() {
                         if pending_scroll.item_ix == scroll_top.item_ix {
                             scroll_top.offset_in_item =
