@@ -80,6 +80,12 @@ struct StateInner {
     suppress_wheel_scroll: bool,
     /// Follow mode state — controls auto-scroll to end behavior.
     follow_state: FollowState,
+    /// Target scroll position for smooth auto-scroll animation in Tail mode.
+    /// When Some, layout_items() lerps toward this position instead of snapping.
+    smooth_scroll_target: Option<Pixels>,
+    /// Previous frame's item count when in Tail mode. Used to detect actual content
+    /// insertion (immune to height fluctuations from re-measurement).
+    prev_tail_item_count: usize,
 }
 
 /// Keeps track of a fractional scroll position within an item for restoration
@@ -289,6 +295,8 @@ impl ListState {
             pending_scroll: None,
             suppress_wheel_scroll: false,
             follow_state: FollowState::Normal,
+            smooth_scroll_target: None,
+            prev_tail_item_count: 0,
         })));
         this.splice(0..0, item_count);
         this
@@ -551,6 +559,8 @@ impl ListState {
             if let FollowState::Tail { ref mut is_following } = state.follow_state {
                 *is_following = false;
             }
+            // Cancel smooth scroll animation — user is scrolling away
+            state.smooth_scroll_target = None;
         }
     }
 
@@ -861,9 +871,12 @@ impl ListState {
         match mode {
             FollowMode::Normal => {
                 state.follow_state = FollowState::Normal;
+                state.smooth_scroll_target = None;
             }
             FollowMode::Tail => {
                 state.follow_state = FollowState::Tail { is_following: true };
+                // Reset growth tracking for fresh animation detection
+                state.prev_tail_item_count = 0;
             }
         }
     }
@@ -879,6 +892,17 @@ impl ListState {
     /// Scroll to the end of the list. Alias for `scroll_to_max()`.
     pub fn scroll_to_end(&self) {
         self.scroll_to_max();
+    }
+
+    /// Returns true if a smooth scroll animation is in progress (Tail mode lerp).
+    pub fn is_smooth_scrolling(&self) -> bool {
+        self.0.borrow().smooth_scroll_target.is_some()
+    }
+
+    /// Cancel any in-progress smooth scroll animation.
+    pub fn cancel_smooth_scroll(&self) {
+        let state = &mut *self.0.borrow_mut();
+        state.smooth_scroll_target = None;
     }
 }
 
@@ -983,6 +1007,17 @@ impl StateInner {
         start.height + logical_scroll_top.offset_in_item
     }
 
+    /// Set `logical_scroll_top` to the ListOffset corresponding to a pixel position.
+    fn set_logical_scroll_top_to(&mut self, position: Pixels) {
+        let (start, ..) =
+            self.items
+                .find::<ListItemSummary, _>((), &Height(position), Bias::Right);
+        self.logical_scroll_top = Some(ListOffset {
+            item_ix: start.count,
+            offset_in_item: position - start.height,
+        });
+    }
+
     fn layout_all_items(
         &mut self,
         available_width: Pixels,
@@ -1034,19 +1069,51 @@ impl StateInner {
         window: &mut Window,
         cx: &mut App,
     ) -> LayoutItemsResponse {
-        // If following tail, scroll to end before layout so we render from the bottom
+        // If following tail, scroll toward end before layout.
+        // Smooth animation: when content grows, lerp toward the new bottom instead
+        // of snapping. This creates a "slide in from below" effect where existing
+        // content stays stable and new content smoothly scrolls into view.
+        const SMOOTH_SCROLL_LERP: f32 = 0.5;
+
         if let FollowState::Tail { is_following: true } = self.follow_state {
             let total_height = self.items.summary().height;
             let scroll_max =
                 (total_height + padding.top + padding.bottom - available_height).max(px(0.));
+            let current_item_count = self.items.summary().count;
+
             if scroll_max > px(0.) {
-                let (start, ..) =
-                    self.items
-                        .find::<ListItemSummary, _>((), &Height(scroll_max), Bias::Right);
-                self.logical_scroll_top = Some(ListOffset {
-                    item_ix: start.count,
-                    offset_in_item: scroll_max - start.height,
-                });
+                if self.smooth_scroll_target.is_some() {
+                    // Animation in progress — lerp toward current scroll_max.
+                    // Target always chases live max (growing content extends it).
+                    let current_pos = self.logical_scroll_top
+                        .map(|off| self.scroll_top(&off))
+                        .unwrap_or(px(0.));
+                    let delta = f32::from(scroll_max - current_pos);
+
+                    if delta < 1.0 {
+                        // Converged — snap to exact bottom, stop animating
+                        self.set_logical_scroll_top_to(scroll_max);
+                        self.smooth_scroll_target = None;
+                    } else {
+                        // Lerp: move a fraction of the remaining distance
+                        let step = px(delta * SMOOTH_SCROLL_LERP);
+                        let new_pos = current_pos + step;
+                        self.set_logical_scroll_top_to(new_pos);
+                        self.smooth_scroll_target = Some(scroll_max);
+                    }
+                } else if self.prev_tail_item_count > 0
+                    && current_item_count > self.prev_tail_item_count
+                {
+                    // Content grew (new items inserted) — start smooth animation.
+                    // Don't update scroll_top: viewport stays stable this frame,
+                    // new content appears below the visible area.
+                    self.smooth_scroll_target = Some(scroll_max);
+                } else {
+                    // No growth or first content load — snap directly (no animation)
+                    self.set_logical_scroll_top_to(scroll_max);
+                }
+
+                self.prev_tail_item_count = current_item_count;
             }
         }
 
@@ -1429,6 +1496,7 @@ impl StateInner {
 
         // Scrollbar drag exits tail mode entirely
         self.follow_state = FollowState::Normal;
+        self.smooth_scroll_target = None;
     }
 }
 
