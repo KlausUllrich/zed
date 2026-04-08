@@ -1076,16 +1076,15 @@ impl StateInner {
     ) -> LayoutItemsResponse {
         // If following tail, scroll toward end before layout.
         // Smooth animation: when content grows, lerp toward the new bottom instead
-        // of snapping. This creates a "slide in from below" effect where existing
-        // content stays stable and new content smoothly scrolls into view.
+        // of snapping. Growth detection and lerp are unified — when growth is
+        // detected, the first lerp step runs immediately (no 1-frame stall).
         //
         // Growth is detected two ways:
         //   (a) Item count increased — new cards added
         //   (b) scroll_max increased by >GROWTH_THRESHOLD — existing card grew
-        //       (streaming text). The threshold filters re-measurement noise
-        //       (typically ±2-4px) while catching real growth (20-60px per chunk).
+        //       (streaming text adds height without changing item count)
         const SMOOTH_SCROLL_LERP: f32 = 0.3;
-        const GROWTH_THRESHOLD: f32 = 5.0;
+        const GROWTH_THRESHOLD: f32 = 4.0;
 
         if let FollowState::Tail { is_following: true } = self.follow_state {
             let total_height = self.items.summary().height;
@@ -1094,44 +1093,42 @@ impl StateInner {
             let current_item_count = self.items.summary().count;
 
             if scroll_max > px(0.) {
-                if self.smooth_scroll_target.is_some() {
-                    // Animation in progress — lerp toward current scroll_max.
-                    // Target always chases live max (growing content extends it).
-                    let current_pos = self.logical_scroll_top
-                        .map(|off| self.scroll_top(&off))
-                        .unwrap_or(px(0.));
-                    let delta = f32::from(scroll_max - current_pos);
+                let current_pos = self.logical_scroll_top
+                    .map(|off| self.scroll_top(&off))
+                    .unwrap_or(px(0.));
+                let delta = f32::from(scroll_max - current_pos);
 
-                    if delta < 1.0 {
-                        // Converged — snap to exact bottom, stop animating
+                // Check if content grew since last frame
+                let animating = self.smooth_scroll_target.is_some();
+                let new_items = self.prev_tail_item_count > 0
+                    && current_item_count > self.prev_tail_item_count;
+                let scroll_growth = f32::from(scroll_max - self.prev_tail_scroll_max);
+                let card_grew = self.prev_tail_scroll_max > px(0.)
+                    && current_item_count >= self.prev_tail_item_count
+                    && scroll_growth > GROWTH_THRESHOLD;
+
+                if animating || new_items || card_grew {
+                    // Smooth scroll: lerp toward current scroll_max.
+                    // Uses delta.abs() so re-measurement noise (scroll_max
+                    // temporarily shrinking) doesn't falsely stop the animation.
+                    if delta.abs() < 1.0 {
+                        // Converged — snap to exact position, stop animating
                         self.set_logical_scroll_top_to(scroll_max);
                         self.smooth_scroll_target = None;
-                    } else {
-                        // Lerp: move a fraction of the remaining distance
+                    } else if delta > 0.0 {
+                        // Behind scroll_max — lerp toward it
                         let step = px(delta * SMOOTH_SCROLL_LERP);
                         let new_pos = current_pos + step;
                         self.set_logical_scroll_top_to(new_pos);
                         self.smooth_scroll_target = Some(scroll_max);
+                    } else {
+                        // Ahead of scroll_max (re-measurement shrink) — snap back
+                        self.set_logical_scroll_top_to(scroll_max);
+                        self.smooth_scroll_target = Some(scroll_max);
                     }
                 } else {
-                    // Check for content growth (no animation in progress yet).
-                    let new_items = self.prev_tail_item_count > 0
-                        && current_item_count > self.prev_tail_item_count;
-                    let scroll_max_delta =
-                        f32::from(scroll_max - self.prev_tail_scroll_max);
-                    let card_grew = self.prev_tail_scroll_max > px(0.)
-                        && current_item_count >= self.prev_tail_item_count
-                        && scroll_max_delta > GROWTH_THRESHOLD;
-
-                    if new_items || card_grew {
-                        // Content grew — start smooth animation.
-                        // Don't update scroll_top this frame: viewport stays stable,
-                        // new content appears below the visible area.
-                        self.smooth_scroll_target = Some(scroll_max);
-                    } else {
-                        // No growth or first content load — snap directly (no animation)
-                        self.set_logical_scroll_top_to(scroll_max);
-                    }
+                    // No growth or first content load — snap directly (no animation)
+                    self.set_logical_scroll_top_to(scroll_max);
                 }
 
                 self.prev_tail_item_count = current_item_count;
