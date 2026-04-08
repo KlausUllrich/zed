@@ -83,8 +83,10 @@ struct StateInner {
     /// Target scroll position for smooth auto-scroll animation in Tail mode.
     /// When Some, layout_items() lerps toward this position instead of snapping.
     smooth_scroll_target: Option<Pixels>,
-    /// Previous frame's scroll_max when in Tail mode. Used to detect content growth.
-    prev_tail_scroll_max: Pixels,
+    /// Previous frame's item count when in Tail mode. Used to detect content growth.
+    /// Item count only changes on actual insertion/deletion, not on re-measurement,
+    /// preventing false growth detection from height fluctuations.
+    prev_tail_item_count: usize,
 }
 
 /// Keeps track of a fractional scroll position within an item for restoration
@@ -117,13 +119,15 @@ pub enum FollowMode {
 }
 
 /// Internal state tracking for follow mode.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FollowState {
     /// Not following — user controls scroll position.
+    /// User scroll actions (scroll_by, scroll_to) transition Tail → Normal.
     Normal,
-    /// Following the tail of the list.
-    /// `is_following` is false when the user has scrolled away (suspended).
-    Tail { is_following: bool },
+    /// Actively following the tail of the list.
+    /// User scroll actions exit to Normal; re-engagement requires explicit
+    /// `set_follow_mode(Tail)` from the caller (e.g., view.rs).
+    Tail,
 }
 
 impl Default for FollowState {
@@ -295,7 +299,7 @@ impl ListState {
             suppress_wheel_scroll: false,
             follow_state: FollowState::Normal,
             smooth_scroll_target: None,
-            prev_tail_scroll_max: px(0.),
+            prev_tail_item_count: 0,
         })));
         this.splice(0..0, item_count);
         this
@@ -553,12 +557,10 @@ impl ListState {
             offset_in_item: new_pixel_offset - cursor.start().height,
         });
 
-        // Scrolling up suspends follow-tail (but stays in Tail mode for re-engagement)
+        // Scrolling up fully exits Tail mode — user is taking control.
+        // Re-engagement is handled by the caller (e.g., view.rs set_follow_mode).
         if distance < px(0.) {
-            if let FollowState::Tail { ref mut is_following } = state.follow_state {
-                *is_following = false;
-            }
-            // Cancel smooth scroll animation — user is scrolling away
+            state.follow_state = FollowState::Normal;
             state.smooth_scroll_target = None;
         }
     }
@@ -581,10 +583,9 @@ impl ListState {
 
         state.logical_scroll_top = Some(scroll_top);
 
-        // Explicit scroll-to suspends follow-tail
-        if let FollowState::Tail { ref mut is_following } = state.follow_state {
-            *is_following = false;
-        }
+        // Explicit scroll-to fully exits Tail mode — caller is taking control.
+        state.follow_state = FollowState::Normal;
+        state.smooth_scroll_target = None;
     }
 
     /// Scroll the list to the given item, such that the item is fully visible.
@@ -873,9 +874,9 @@ impl ListState {
                 state.smooth_scroll_target = None;
             }
             FollowMode::Tail => {
-                state.follow_state = FollowState::Tail { is_following: true };
+                state.follow_state = FollowState::Tail;
                 // Reset growth tracking for fresh animation detection
-                state.prev_tail_scroll_max = px(0.);
+                state.prev_tail_item_count = 0;
             }
         }
     }
@@ -884,7 +885,7 @@ impl ListState {
     pub fn is_following_tail(&self) -> bool {
         matches!(
             self.0.borrow().follow_state,
-            FollowState::Tail { is_following: true }
+            FollowState::Tail
         )
     }
 
@@ -954,16 +955,18 @@ impl StateInner {
             });
         }
 
-        // Wheel scroll away from bottom suspends follow-tail
-        if let FollowState::Tail { ref mut is_following } = self.follow_state {
+        // Wheel scroll away from bottom fully exits Tail mode.
+        // Re-engagement is handled by the caller (e.g., view.rs set_follow_mode).
+        if let FollowState::Tail = self.follow_state {
             if new_scroll_top < scroll_max {
-                *is_following = false;
+                self.follow_state = FollowState::Normal;
+                self.smooth_scroll_target = None;
             }
         }
 
         let is_following_tail = matches!(
             self.follow_state,
-            FollowState::Tail { is_following: true }
+            FollowState::Tail
         );
 
         if let Some(handler) = self.scroll_handler.as_mut() {
@@ -1074,10 +1077,11 @@ impl StateInner {
         // content stays stable and new content smoothly scrolls into view.
         const SMOOTH_SCROLL_LERP: f32 = 0.5;
 
-        if let FollowState::Tail { is_following: true } = self.follow_state {
+        if let FollowState::Tail = self.follow_state {
             let total_height = self.items.summary().height;
             let scroll_max =
                 (total_height + padding.top + padding.bottom - available_height).max(px(0.));
+            let current_item_count = self.items.summary().count;
 
             if scroll_max > px(0.) {
                 if self.smooth_scroll_target.is_some() {
@@ -1099,10 +1103,12 @@ impl StateInner {
                         self.set_logical_scroll_top_to(new_pos);
                         self.smooth_scroll_target = Some(scroll_max);
                     }
-                } else if self.prev_tail_scroll_max > px(0.)
-                    && scroll_max > self.prev_tail_scroll_max
+                } else if self.prev_tail_item_count > 0
+                    && current_item_count > self.prev_tail_item_count
                 {
-                    // Content grew while following — start smooth animation.
+                    // Content grew (new items added) — start smooth animation.
+                    // Item count only changes on actual insertion/deletion, not on
+                    // re-measurement, so this won't false-trigger on height fluctuations.
                     // Don't update scroll_top: viewport stays stable this frame,
                     // new content appears below the visible area.
                     self.smooth_scroll_target = Some(scroll_max);
@@ -1111,7 +1117,7 @@ impl StateInner {
                     self.set_logical_scroll_top_to(scroll_max);
                 }
 
-                self.prev_tail_scroll_max = scroll_max;
+                self.prev_tail_item_count = current_item_count;
             }
         }
 
@@ -1325,21 +1331,6 @@ impl StateInner {
                 }
                 cursor.next();
             }
-        }
-
-        // Re-engagement check: if in Tail mode but suspended, check if the user
-        // has scrolled back to the bottom. If so, re-engage auto-following.
-        let should_reengage = if matches!(self.follow_state, FollowState::Tail { is_following: false }) {
-            let total_height = self.items.summary().height;
-            let scroll_max =
-                (total_height + padding.top + padding.bottom - available_height).max(px(0.));
-            let current_pos = self.scroll_top(&scroll_top);
-            scroll_max == px(0.) || (scroll_max - current_pos) < px(1.0)
-        } else {
-            false
-        };
-        if should_reengage {
-            self.follow_state = FollowState::Tail { is_following: true };
         }
 
         LayoutItemsResponse {
