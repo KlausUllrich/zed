@@ -725,11 +725,24 @@ impl ListState {
             }
             Some(frozen) => frozen,
             None => {
-                // Not dragging — apply smoothing to prevent thumb jumps during
-                // auto-scroll / streaming. Lerp 30% toward live each frame:
-                // ~90% converged in 7 frames (~116ms at 60fps).
+                // Not dragging — apply capped-lerp smoothing to prevent thumb
+                // jumps when items are re-measured with large height deltas
+                // (e.g., scroll-up through items with estimated heights).
+                // The lerp (30%) tracks streaming growth well for small deltas.
+                // The cap (5px/frame) prevents visible jumps on large one-time
+                // deltas: 5px in total-height space ≈ <0.1px in thumb size.
                 let smoothed = match state.smoothed_scrollbar_height {
-                    Some(prev) => prev + (live_height - prev) * 0.3,
+                    Some(prev) => {
+                        let delta = live_height - prev;
+                        let lerp_step = delta * 0.3;
+                        let max_step = px(5.0);
+                        let step = if lerp_step.0.abs() > max_step.0 {
+                            Pixels(max_step.0 * lerp_step.0.signum())
+                        } else {
+                            lerp_step
+                        };
+                        prev + step
+                    }
                     None => live_height,
                 };
                 state.smoothed_scrollbar_height = Some(smoothed);
@@ -1073,21 +1086,21 @@ impl StateInner {
                 size = Some(element_size);
 
                 if ix == 0 {
-                    // CS patch: Scroll offset compensation.
-                    // When the scroll-top item's measured height differs from its
-                    // previously known height (cached measure or size_hint), adjust
-                    // offset_in_item by the delta so the viewport stays visually stable.
-                    // This eliminates micro-stutter when scrolling up through items
-                    // whose estimated height differs from their actual measured height.
-                    let old_height = item.size_hint()
-                        .map(|s| s.height)
-                        .unwrap_or(px(0.));
-                    let height_delta = element_size.height - old_height;
-                    if height_delta != px(0.) && scroll_top.offset_in_item > px(0.) {
-                        scroll_top.offset_in_item = (scroll_top.offset_in_item + height_delta)
-                            .max(px(0.))
-                            .min(element_size.height);
-                        self.logical_scroll_top = Some(scroll_top);
+                    // CS patch: Scroll offset compensation (wheel/trackpad scroll only).
+                    // During scrollbar drag, scroll position comes from the scrollbar's
+                    // absolute pixel mapping — compensation is not needed and would
+                    // compound each frame since we freeze SumTree heights during drag.
+                    if self.scrollbar_drag_start_height.is_none() {
+                        let old_height = item.size_hint()
+                            .map(|s| s.height)
+                            .unwrap_or(px(0.));
+                        let height_delta = element_size.height - old_height;
+                        if height_delta != px(0.) && scroll_top.offset_in_item > px(0.) {
+                            scroll_top.offset_in_item = (scroll_top.offset_in_item + height_delta)
+                                .max(px(0.))
+                                .min(element_size.height);
+                            self.logical_scroll_top = Some(scroll_top);
+                        }
                     }
 
                     // If there's a pending scroll adjustment (from remeasure_items),
@@ -1117,8 +1130,17 @@ impl StateInner {
             let size = size.unwrap();
             rendered_height += size.height;
             max_item_width = max_item_width.max(size.width);
+            // During scrollbar drag, preserve old SumTree heights to keep
+            // the pixel→item scroll mapping stable across frames.
+            // Visual layout uses actual measured sizes (above); only the
+            // SumTree entry is frozen to prevent mapping drift.
+            let tree_size = if self.scrollbar_drag_start_height.is_some() {
+                item.size_hint().unwrap_or(size)
+            } else {
+                size
+            };
             measured_items.push_back(ListItem::Measured {
-                size,
+                size: tree_size,
                 focus_handle: item.focus_handle(),
             });
         }
@@ -1138,8 +1160,13 @@ impl StateInner {
                     let element_size = element.layout_as_root(available_item_space, window, cx);
                     let focus_handle = item.focus_handle();
                     rendered_height += element_size.height;
+                    let tree_size = if self.scrollbar_drag_start_height.is_some() {
+                        item.size_hint().unwrap_or(element_size)
+                    } else {
+                        element_size
+                    };
                     measured_items.push_front(ListItem::Measured {
-                        size: element_size,
+                        size: tree_size,
                         focus_handle,
                     });
                     item_layouts.push_front(ItemLayout {
@@ -1180,16 +1207,22 @@ impl StateInner {
         while leading_overdraw < self.overdraw {
             cursor.prev();
             if let Some(item) = cursor.item() {
-                let size = if let ListItem::Measured { size, .. } = item {
-                    *size
+                let (size, tree_size) = if let ListItem::Measured { size, .. } = item {
+                    (*size, *size)
                 } else {
                     let mut element = render_item(cursor.start().0, window, cx);
-                    element.layout_as_root(available_item_space, window, cx)
+                    let actual = element.layout_as_root(available_item_space, window, cx);
+                    let tree = if self.scrollbar_drag_start_height.is_some() {
+                        item.size_hint().unwrap_or(actual)
+                    } else {
+                        actual
+                    };
+                    (actual, tree)
                 };
 
                 leading_overdraw += size.height;
                 measured_items.push_front(ListItem::Measured {
-                    size,
+                    size: tree_size,
                     focus_handle: item.focus_handle(),
                 });
             } else {
