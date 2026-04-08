@@ -80,14 +80,12 @@ struct StateInner {
     suppress_wheel_scroll: bool,
     /// Follow mode state — controls auto-scroll to end behavior.
     follow_state: FollowState,
-    /// Target scroll position for smooth auto-scroll animation in Tail mode.
-    /// When Some, layout_items() lerps toward this position instead of snapping.
-    smooth_scroll_target: Option<Pixels>,
+    /// Velocity for inertia-based smooth scroll in Tail mode (px/frame).
+    /// Content growth adds impulses; friction decays velocity each frame.
+    tail_scroll_velocity: f32,
     /// Previous frame's item count when in Tail mode. Used to detect new card insertion.
     prev_tail_item_count: usize,
-    /// Previous frame's scroll_max in Tail mode. Used with a threshold to detect
-    /// content growth within existing cards (streaming text makes cards taller
-    /// without changing item count).
+    /// Previous frame's scroll_max in Tail mode. Used to compute per-frame growth.
     prev_tail_scroll_max: Pixels,
 }
 
@@ -298,7 +296,7 @@ impl ListState {
             pending_scroll: None,
             suppress_wheel_scroll: false,
             follow_state: FollowState::Normal,
-            smooth_scroll_target: None,
+            tail_scroll_velocity: 0.0,
             prev_tail_item_count: 0,
             prev_tail_scroll_max: px(0.),
         })));
@@ -564,7 +562,7 @@ impl ListState {
                 *is_following = false;
             }
             // Cancel smooth scroll animation — user is scrolling away
-            state.smooth_scroll_target = None;
+            state.tail_scroll_velocity = 0.0;
         }
     }
 
@@ -875,11 +873,12 @@ impl ListState {
         match mode {
             FollowMode::Normal => {
                 state.follow_state = FollowState::Normal;
-                state.smooth_scroll_target = None;
+                state.tail_scroll_velocity = 0.0;
             }
             FollowMode::Tail => {
                 state.follow_state = FollowState::Tail { is_following: true };
-                // Reset growth tracking for fresh animation detection
+                // Reset growth tracking and velocity for fresh start
+                state.tail_scroll_velocity = 0.0;
                 state.prev_tail_item_count = 0;
                 state.prev_tail_scroll_max = px(0.);
             }
@@ -899,15 +898,15 @@ impl ListState {
         self.scroll_to_max();
     }
 
-    /// Returns true if a smooth scroll animation is in progress (Tail mode lerp).
+    /// Returns true if a smooth scroll animation is in progress (inertia scroll).
     pub fn is_smooth_scrolling(&self) -> bool {
-        self.0.borrow().smooth_scroll_target.is_some()
+        self.0.borrow().tail_scroll_velocity.abs() > 0.5
     }
 
     /// Cancel any in-progress smooth scroll animation.
     pub fn cancel_smooth_scroll(&self) {
         let state = &mut *self.0.borrow_mut();
-        state.smooth_scroll_target = None;
+        state.tail_scroll_velocity = 0.0;
     }
 }
 
@@ -1075,16 +1074,14 @@ impl StateInner {
         cx: &mut App,
     ) -> LayoutItemsResponse {
         // If following tail, scroll toward end before layout.
-        // Smooth animation: when content grows, lerp toward the new bottom instead
-        // of snapping. Growth detection and lerp are unified — when growth is
-        // detected, the first lerp step runs immediately (no 1-frame stall).
-        //
-        // Growth is detected two ways:
-        //   (a) Item count increased — new cards added
-        //   (b) scroll_max increased by >GROWTH_THRESHOLD — existing card grew
-        //       (streaming text adds height without changing item count)
-        const SMOOTH_SCROLL_LERP: f32 = 0.3;
-        const GROWTH_THRESHOLD: f32 = 4.0;
+        // Inertia-based smooth scroll for Tail mode.
+        // Content growth adds velocity impulses; friction decays velocity each frame.
+        // impulse_factor = 1 - friction ensures one-time jumps (new cards) produce
+        // exactly the right total displacement without overshoot. Continuous growth
+        // (streaming) naturally converges to matching the growth rate.
+        const FRICTION: f32 = 0.80;
+        const IMPULSE_FACTOR: f32 = 0.20; // = 1.0 - FRICTION
+        const MIN_VELOCITY: f32 = 0.5;
 
         if let FollowState::Tail { is_following: true } = self.follow_state {
             let total_height = self.items.summary().height;
@@ -1098,36 +1095,25 @@ impl StateInner {
                     .unwrap_or(px(0.));
                 let delta = f32::from(scroll_max - current_pos);
 
-                // Check if content grew since last frame
-                let animating = self.smooth_scroll_target.is_some();
-                let new_items = self.prev_tail_item_count > 0
-                    && current_item_count > self.prev_tail_item_count;
-                let scroll_growth = f32::from(scroll_max - self.prev_tail_scroll_max);
-                let card_grew = self.prev_tail_scroll_max > px(0.)
-                    && current_item_count >= self.prev_tail_item_count
-                    && scroll_growth > GROWTH_THRESHOLD;
+                // 1. Apply friction to existing velocity
+                self.tail_scroll_velocity *= FRICTION;
 
-                if animating || new_items || card_grew {
-                    // Smooth scroll: lerp toward current scroll_max.
-                    // Uses delta.abs() so re-measurement noise (scroll_max
-                    // temporarily shrinking) doesn't falsely stop the animation.
-                    if delta.abs() < 1.0 {
-                        // Converged — snap to exact position, stop animating
-                        self.set_logical_scroll_top_to(scroll_max);
-                        self.smooth_scroll_target = None;
-                    } else if delta > 0.0 {
-                        // Behind scroll_max — lerp toward it
-                        let step = px(delta * SMOOTH_SCROLL_LERP);
-                        let new_pos = current_pos + step;
-                        self.set_logical_scroll_top_to(new_pos);
-                        self.smooth_scroll_target = Some(scroll_max);
-                    } else {
-                        // Ahead of scroll_max (re-measurement shrink) — snap back
-                        self.set_logical_scroll_top_to(scroll_max);
-                        self.smooth_scroll_target = Some(scroll_max);
+                // 2. Add impulse from content growth this frame
+                if self.prev_tail_scroll_max > px(0.) {
+                    let scroll_growth = f32::from(scroll_max - self.prev_tail_scroll_max);
+                    if scroll_growth > 0.5 {
+                        self.tail_scroll_velocity += scroll_growth * IMPULSE_FACTOR;
                     }
+                }
+
+                // 3. Apply velocity or snap
+                if self.tail_scroll_velocity > MIN_VELOCITY && delta > 1.0 {
+                    // Inertia scroll — move by velocity, clamped to scroll_max
+                    let new_pos = (current_pos + px(self.tail_scroll_velocity)).min(scroll_max);
+                    self.set_logical_scroll_top_to(new_pos);
                 } else {
-                    // No growth or first content load — snap directly (no animation)
+                    // At rest or very close — pin to bottom
+                    self.tail_scroll_velocity = 0.0;
                     self.set_logical_scroll_top_to(scroll_max);
                 }
 
@@ -1515,7 +1501,7 @@ impl StateInner {
 
         // Scrollbar drag exits tail mode entirely
         self.follow_state = FollowState::Normal;
-        self.smooth_scroll_target = None;
+        self.tail_scroll_velocity = 0.0;
     }
 }
 
