@@ -83,9 +83,12 @@ struct StateInner {
     /// Target scroll position for smooth auto-scroll animation in Tail mode.
     /// When Some, layout_items() lerps toward this position instead of snapping.
     smooth_scroll_target: Option<Pixels>,
-    /// Previous frame's item count when in Tail mode. Used to detect actual content
-    /// insertion (immune to height fluctuations from re-measurement).
+    /// Previous frame's item count when in Tail mode. Used to detect new card insertion.
     prev_tail_item_count: usize,
+    /// Previous frame's scroll_max in Tail mode. Used with a threshold to detect
+    /// content growth within existing cards (streaming text makes cards taller
+    /// without changing item count).
+    prev_tail_scroll_max: Pixels,
 }
 
 /// Keeps track of a fractional scroll position within an item for restoration
@@ -297,6 +300,7 @@ impl ListState {
             follow_state: FollowState::Normal,
             smooth_scroll_target: None,
             prev_tail_item_count: 0,
+            prev_tail_scroll_max: px(0.),
         })));
         this.splice(0..0, item_count);
         this
@@ -877,6 +881,7 @@ impl ListState {
                 state.follow_state = FollowState::Tail { is_following: true };
                 // Reset growth tracking for fresh animation detection
                 state.prev_tail_item_count = 0;
+                state.prev_tail_scroll_max = px(0.);
             }
         }
     }
@@ -1073,7 +1078,14 @@ impl StateInner {
         // Smooth animation: when content grows, lerp toward the new bottom instead
         // of snapping. This creates a "slide in from below" effect where existing
         // content stays stable and new content smoothly scrolls into view.
-        const SMOOTH_SCROLL_LERP: f32 = 0.5;
+        //
+        // Growth is detected two ways:
+        //   (a) Item count increased — new cards added
+        //   (b) scroll_max increased by >GROWTH_THRESHOLD — existing card grew
+        //       (streaming text). The threshold filters re-measurement noise
+        //       (typically ±2-4px) while catching real growth (20-60px per chunk).
+        const SMOOTH_SCROLL_LERP: f32 = 0.3;
+        const GROWTH_THRESHOLD: f32 = 5.0;
 
         if let FollowState::Tail { is_following: true } = self.follow_state {
             let total_height = self.items.summary().height;
@@ -1101,19 +1113,29 @@ impl StateInner {
                         self.set_logical_scroll_top_to(new_pos);
                         self.smooth_scroll_target = Some(scroll_max);
                     }
-                } else if self.prev_tail_item_count > 0
-                    && current_item_count > self.prev_tail_item_count
-                {
-                    // Content grew (new items inserted) — start smooth animation.
-                    // Don't update scroll_top: viewport stays stable this frame,
-                    // new content appears below the visible area.
-                    self.smooth_scroll_target = Some(scroll_max);
                 } else {
-                    // No growth or first content load — snap directly (no animation)
-                    self.set_logical_scroll_top_to(scroll_max);
+                    // Check for content growth (no animation in progress yet).
+                    let new_items = self.prev_tail_item_count > 0
+                        && current_item_count > self.prev_tail_item_count;
+                    let scroll_max_delta =
+                        f32::from(scroll_max - self.prev_tail_scroll_max);
+                    let card_grew = self.prev_tail_scroll_max > px(0.)
+                        && current_item_count >= self.prev_tail_item_count
+                        && scroll_max_delta > GROWTH_THRESHOLD;
+
+                    if new_items || card_grew {
+                        // Content grew — start smooth animation.
+                        // Don't update scroll_top this frame: viewport stays stable,
+                        // new content appears below the visible area.
+                        self.smooth_scroll_target = Some(scroll_max);
+                    } else {
+                        // No growth or first content load — snap directly (no animation)
+                        self.set_logical_scroll_top_to(scroll_max);
+                    }
                 }
 
                 self.prev_tail_item_count = current_item_count;
+                self.prev_tail_scroll_max = scroll_max;
             }
         }
 
