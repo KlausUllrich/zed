@@ -78,6 +78,8 @@ struct StateInner {
     /// When true, the built-in scroll wheel handler is suppressed.
     /// Used by ConversationView to handle wheel events with smooth pixel animation.
     suppress_wheel_scroll: bool,
+    /// Follow mode state — controls auto-scroll to end behavior.
+    follow_state: FollowState,
 }
 
 /// Keeps track of a fractional scroll position within an item for restoration
@@ -98,6 +100,33 @@ pub enum ListAlignment {
     Bottom,
 }
 
+/// Controls the auto-scroll behavior of the list.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FollowMode {
+    /// No auto-scrolling — the user controls the scroll position.
+    Normal,
+    /// Automatically scroll to the end of the list when new content is added
+    /// or items are remeasured. If the user scrolls away, following is suspended
+    /// but re-engages automatically when they scroll back to the bottom.
+    Tail,
+}
+
+/// Internal state tracking for follow mode.
+#[derive(Clone, Copy, Debug)]
+enum FollowState {
+    /// Not following — user controls scroll position.
+    Normal,
+    /// Following the tail of the list.
+    /// `is_following` is false when the user has scrolled away (suspended).
+    Tail { is_following: bool },
+}
+
+impl Default for FollowState {
+    fn default() -> Self {
+        FollowState::Normal
+    }
+}
+
 /// A scroll event that has been converted to be in terms of the list's items.
 pub struct ListScrollEvent {
     /// The range of items currently visible in the list, after applying the scroll event.
@@ -108,6 +137,9 @@ pub struct ListScrollEvent {
 
     /// Whether the list has been scrolled.
     pub is_scrolled: bool,
+
+    /// Whether the list is currently auto-following the tail (end) of the list.
+    pub is_following_tail: bool,
 }
 
 /// The sizing behavior to apply during layout.
@@ -171,10 +203,10 @@ pub struct ListPrepaintState {
 #[derive(Clone)]
 enum ListItem {
     Unmeasured {
+        /// Hint from the last measured size, used to keep SumTree height stable
+        /// while the item is unmeasured. `None` for truly new items.
+        size_hint: Option<Size<Pixels>>,
         focus_handle: Option<FocusHandle>,
-        /// Estimated height for SumTree summary. Provides a non-zero height for
-        /// unmeasured items so scrollbar thumb size reflects actual content length.
-        estimated_height: Pixels,
     },
     Measured {
         size: Size<Pixels>,
@@ -188,6 +220,15 @@ impl ListItem {
             Some(*size)
         } else {
             None
+        }
+    }
+
+    /// Returns the best known size: measured size for Measured items,
+    /// or the preserved size hint for Unmeasured items.
+    fn size_hint(&self) -> Option<Size<Pixels>> {
+        match self {
+            ListItem::Measured { size, .. } => Some(*size),
+            ListItem::Unmeasured { size_hint, .. } => *size_hint,
         }
     }
 
@@ -247,6 +288,7 @@ impl ListState {
             measuring_behavior: ListMeasuringBehavior::default(),
             pending_scroll: None,
             suppress_wheel_scroll: false,
+            follow_state: FollowState::Normal,
         })));
         this.splice(0..0, item_count);
         this
@@ -286,9 +328,9 @@ impl ListState {
 
         let new_items = state.items.iter().map(|item| ListItem::Unmeasured {
             focus_handle: item.focus_handle(),
-            // Preserve measured height as estimate when resetting — keeps SumTree
-            // total height accurate during remeasure cycle.
-            estimated_height: item.size().map_or(px(0.), |s| s.height),
+            // Preserve last known size as hint — keeps SumTree height stable
+            // during remeasure cycle.
+            size_hint: item.size_hint(),
         });
 
         // If there's a `logical_scroll_top`, we need to keep track of it as a
@@ -317,6 +359,59 @@ impl ListState {
 
         state.items = SumTree::from_iter(new_items, ());
         state.measuring_behavior.reset();
+    }
+
+    /// Mark a range of items for remeasure without changing the item count.
+    /// Unlike `splice()`, this preserves the last measured size as a `size_hint`,
+    /// keeping the SumTree height stable during the remeasure cycle.
+    /// Use for content updates (e.g., streaming tokens) where items change height
+    /// but the number of items stays the same.
+    pub fn remeasure_items(&self, range: Range<usize>) {
+        let state = &mut *self.0.borrow_mut();
+
+        // Save scroll position fraction if scroll_top item is in the range
+        if let Some(scroll_top) = state.logical_scroll_top {
+            if range.contains(&scroll_top.item_ix) {
+                let mut scroll_cursor = state.items.cursor::<Count>(());
+                scroll_cursor.seek(&Count(scroll_top.item_ix), Bias::Right);
+                if let Some(item) = scroll_cursor.item() {
+                    if let Some(size) = item.size() {
+                        let fraction = if size.height.0 > 0.0 {
+                            (scroll_top.offset_in_item.0 / size.height.0).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        state.pending_scroll = Some(PendingScrollFraction {
+                            item_ix: scroll_top.item_ix,
+                            fraction,
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut cursor = state.items.cursor::<Count>(());
+        let mut new_items = cursor.slice(&Count(range.start), Bias::Right);
+
+        // Mark items in range as unmeasured, preserving their last known size
+        while cursor.start() < &Count(range.end) {
+            if let Some(item) = cursor.item() {
+                new_items.push(
+                    ListItem::Unmeasured {
+                        size_hint: item.size_hint(),
+                        focus_handle: item.focus_handle(),
+                    },
+                    (),
+                );
+                cursor.next();
+            } else {
+                break;
+            }
+        }
+
+        new_items.append(cursor.suffix(), ());
+        drop(cursor);
+        state.items = new_items;
     }
 
     /// The number of items in this list.
@@ -349,7 +444,7 @@ impl ListState {
         new_items.extend(
             focus_handles.into_iter().map(|focus_handle| {
                 spliced_count += 1;
-                ListItem::Unmeasured { focus_handle, estimated_height: px(0.) }
+                ListItem::Unmeasured { size_hint: None, focus_handle }
             }),
             (),
         );
@@ -389,7 +484,10 @@ impl ListState {
         new_items.extend(
             items.into_iter().map(|(focus_handle, estimated_height)| {
                 spliced_count += 1;
-                ListItem::Unmeasured { focus_handle, estimated_height }
+                ListItem::Unmeasured {
+                    size_hint: Some(size(px(0.), estimated_height)),
+                    focus_handle,
+                }
             }),
             (),
         );
@@ -447,6 +545,13 @@ impl ListState {
             item_ix: cursor.start().count,
             offset_in_item: new_pixel_offset - cursor.start().height,
         });
+
+        // Scrolling up suspends follow-tail (but stays in Tail mode for re-engagement)
+        if distance < px(0.) {
+            if let FollowState::Tail { ref mut is_following } = state.follow_state {
+                *is_following = false;
+            }
+        }
     }
 
     /// Suppress or enable the built-in scroll wheel handler.
@@ -466,6 +571,11 @@ impl ListState {
         }
 
         state.logical_scroll_top = Some(scroll_top);
+
+        // Explicit scroll-to suspends follow-tail
+        if let FollowState::Tail { ref mut is_following } = state.follow_state {
+            *is_following = false;
+        }
     }
 
     /// Scroll the list to the given item, such that the item is fully visible.
@@ -627,7 +737,9 @@ impl ListState {
             }
         };
 
-        point(Pixels::ZERO, Pixels::ZERO.max(height - bounds.size.height))
+        let padding = state.last_padding.unwrap_or_default();
+        let padded = height + padding.top + padding.bottom;
+        point(Pixels::ZERO, Pixels::ZERO.max(padded - bounds.size.height))
     }
 
     /// Scroll to the maximum offset (bottom of content).
@@ -724,6 +836,37 @@ impl ListState {
     pub fn viewport_bounds(&self) -> Bounds<Pixels> {
         self.0.borrow().last_layout_bounds.unwrap_or_default()
     }
+
+    /// Set the follow mode for the list.
+    ///
+    /// `FollowMode::Tail` causes the list to automatically scroll to the end
+    /// whenever items are laid out. If the user scrolls away, following is
+    /// suspended but re-engages when they scroll back to the bottom.
+    /// Scrollbar drag exits tail mode entirely.
+    pub fn set_follow_mode(&self, mode: FollowMode) {
+        let mut state = self.0.borrow_mut();
+        match mode {
+            FollowMode::Normal => {
+                state.follow_state = FollowState::Normal;
+            }
+            FollowMode::Tail => {
+                state.follow_state = FollowState::Tail { is_following: true };
+            }
+        }
+    }
+
+    /// Returns true if the list is currently auto-following the tail.
+    pub fn is_following_tail(&self) -> bool {
+        matches!(
+            self.0.borrow().follow_state,
+            FollowState::Tail { is_following: true }
+        )
+    }
+
+    /// Scroll to the end of the list. Alias for `scroll_to_max()`.
+    pub fn scroll_to_end(&self) {
+        self.scroll_to_max();
+    }
 }
 
 impl StateInner {
@@ -775,6 +918,18 @@ impl StateInner {
             });
         }
 
+        // Wheel scroll away from bottom suspends follow-tail
+        if let FollowState::Tail { ref mut is_following } = self.follow_state {
+            if new_scroll_top < scroll_max {
+                *is_following = false;
+            }
+        }
+
+        let is_following_tail = matches!(
+            self.follow_state,
+            FollowState::Tail { is_following: true }
+        );
+
         if let Some(handler) = self.scroll_handler.as_mut() {
             let visible_range = Self::visible_range(&self.items, height, scroll_top);
             handler(
@@ -782,6 +937,7 @@ impl StateInner {
                     visible_range,
                     count: self.items.summary().count,
                     is_scrolled: self.logical_scroll_top.is_some(),
+                    is_following_tail,
                 },
                 window,
                 cx,
@@ -865,6 +1021,22 @@ impl StateInner {
         window: &mut Window,
         cx: &mut App,
     ) -> LayoutItemsResponse {
+        // If following tail, scroll to end before layout so we render from the bottom
+        if let FollowState::Tail { is_following: true } = self.follow_state {
+            let total_height = self.items.summary().height;
+            let scroll_max =
+                (total_height + padding.top + padding.bottom - available_height).max(px(0.));
+            if scroll_max > px(0.) {
+                let (start, ..) =
+                    self.items
+                        .find::<ListItemSummary, _>((), &Height(scroll_max), Bias::Right);
+                self.logical_scroll_top = Some(ListOffset {
+                    item_ix: start.count,
+                    offset_in_item: scroll_max - start.height,
+                });
+            }
+        }
+
         let old_items = self.items.clone();
         let mut measured_items = VecDeque::new();
         let mut item_layouts = VecDeque::new();
@@ -1040,6 +1212,21 @@ impl StateInner {
             }
         }
 
+        // Re-engagement check: if in Tail mode but suspended, check if the user
+        // has scrolled back to the bottom. If so, re-engage auto-following.
+        let should_reengage = if matches!(self.follow_state, FollowState::Tail { is_following: false }) {
+            let total_height = self.items.summary().height;
+            let scroll_max =
+                (total_height + padding.top + padding.bottom - available_height).max(px(0.));
+            let current_pos = self.scroll_top(&scroll_top);
+            scroll_max == px(0.) || (scroll_max - current_pos) < px(1.0)
+        } else {
+            false
+        };
+        if should_reengage {
+            self.follow_state = FollowState::Tail { is_following: true };
+        }
+
         LayoutItemsResponse {
             max_item_width,
             scroll_top,
@@ -1189,6 +1376,9 @@ impl StateInner {
                 offset_in_item,
             });
         }
+
+        // Scrollbar drag exits tail mode entirely
+        self.follow_state = FollowState::Normal;
     }
 }
 
@@ -1344,9 +1534,9 @@ impl Element for List {
             let new_items = SumTree::from_iter(
                 state.items.iter().map(|item| ListItem::Unmeasured {
                     focus_handle: item.focus_handle(),
-                    // Preserve measured height as estimate during width change — prevents
+                    // Preserve last known size as hint during width change — prevents
                     // SumTree total height from collapsing to 0.
-                    estimated_height: item.size().map_or(px(0.), |s| s.height),
+                    size_hint: item.size_hint(),
                 }),
                 (),
             );
@@ -1435,11 +1625,11 @@ impl sum_tree::Item for ListItem {
 
     fn summary(&self, _: ()) -> Self::Summary {
         match self {
-            ListItem::Unmeasured { focus_handle, estimated_height } => ListItemSummary {
+            ListItem::Unmeasured { focus_handle, size_hint } => ListItemSummary {
                 count: 1,
                 rendered_count: 0,
                 unrendered_count: 1,
-                height: *estimated_height,
+                height: size_hint.map_or(px(0.), |s| s.height),
                 has_focus_handles: focus_handle.is_some(),
             },
             ListItem::Measured {
