@@ -41,8 +41,31 @@ pub struct ScrollTelemetry {
 /// Callback type for scroll telemetry. Registered by the app at startup.
 type ScrollTelemetryCallback = Box<dyn Fn(&ScrollTelemetry) + 'static>;
 
+/// Performance data emitted after each `layout_items()` call.
+/// Helps diagnose which items are expensive to render.
+#[derive(Clone, Debug)]
+pub struct LayoutPerfTelemetry {
+    /// Total layout_items() wall time in seconds.
+    pub total_secs: f32,
+    /// Number of items that called render_item + layout_as_root.
+    pub rendered_count: usize,
+    /// Number of items skipped (used cached size).
+    pub cached_count: usize,
+    /// Total item count in the list.
+    pub item_count: usize,
+    /// Scroll top item index.
+    pub scroll_top_ix: usize,
+    /// Slowest single item render time in seconds (0 if none rendered).
+    pub slowest_item_secs: f32,
+    /// Index of the slowest item.
+    pub slowest_item_ix: usize,
+}
+
+type LayoutPerfCallback = Box<dyn Fn(&LayoutPerfTelemetry) + 'static>;
+
 thread_local! {
     static SCROLL_TELEMETRY_CB: Cell<Option<*const ScrollTelemetryCallback>> = const { Cell::new(None) };
+    static LAYOUT_PERF_CB: Cell<Option<*const LayoutPerfCallback>> = const { Cell::new(None) };
 }
 
 /// Register a callback to receive scroll telemetry during Tail mode inertia.
@@ -56,10 +79,26 @@ pub fn set_scroll_telemetry_callback(callback: ScrollTelemetryCallback) {
     SCROLL_TELEMETRY_CB.with(|cell| cell.set(Some(leaked as *const ScrollTelemetryCallback)));
 }
 
+/// Register a callback to receive layout performance telemetry.
+/// Fires after every `layout_items()` call. Only reports when total time > 8ms
+/// to avoid noise during fast frames.
+pub fn set_layout_perf_callback(callback: LayoutPerfCallback) {
+    let leaked = Box::leak(Box::new(callback));
+    LAYOUT_PERF_CB.with(|cell| cell.set(Some(leaked as *const LayoutPerfCallback)));
+}
+
 fn emit_scroll_telemetry(telemetry: &ScrollTelemetry) {
     SCROLL_TELEMETRY_CB.with(|cell| {
         if let Some(ptr) = cell.get() {
-            // SAFETY: Pointer is valid for the lifetime of the process (Box::leak in set_*).
+            let cb = unsafe { &*ptr };
+            cb(telemetry);
+        }
+    });
+}
+
+fn emit_layout_perf(telemetry: &LayoutPerfTelemetry) {
+    LAYOUT_PERF_CB.with(|cell| {
+        if let Some(ptr) = cell.get() {
             let cb = unsafe { &*ptr };
             cb(telemetry);
         }
@@ -1241,6 +1280,13 @@ impl StateInner {
 
         let mut cursor = old_items.cursor::<Count>(());
 
+        // Perf telemetry: track per-item render cost
+        let layout_start = Instant::now();
+        let mut perf_rendered_count: usize = 0;
+        let mut perf_cached_count: usize = 0;
+        let mut perf_slowest_secs: f32 = 0.0;
+        let mut perf_slowest_ix: usize = 0;
+
         // Render items after the scroll top, including those in the trailing overdraw
         cursor.seek(&Count(scroll_top.item_ix), Bias::Right);
         for (ix, item) in cursor.by_ref().enumerate() {
@@ -1255,8 +1301,15 @@ impl StateInner {
             // If we're within the visible area or the height wasn't cached, render and measure the item's element
             if visible_height < available_height || size.is_none() {
                 let item_index = scroll_top.item_ix + ix;
+                let item_start = Instant::now();
                 let mut element = render_item(item_index, window, cx);
                 let element_size = element.layout_as_root(available_item_space, window, cx);
+                let item_elapsed = item_start.elapsed().as_secs_f32();
+                perf_rendered_count += 1;
+                if item_elapsed > perf_slowest_secs {
+                    perf_slowest_secs = item_elapsed;
+                    perf_slowest_ix = item_index;
+                }
                 size = Some(element_size);
 
                 if ix == 0 {
@@ -1299,6 +1352,8 @@ impl StateInner {
                         rendered_focused_item = true;
                     }
                 }
+            } else {
+                perf_cached_count += 1;
             }
 
             let size = size.unwrap();
@@ -1449,6 +1504,20 @@ impl StateInner {
         };
         if should_reengage {
             self.follow_state = FollowState::Tail { is_following: true };
+        }
+
+        // Emit layout perf telemetry when frame is slow (> 8ms).
+        let layout_elapsed = layout_start.elapsed().as_secs_f32();
+        if layout_elapsed > 0.008 {
+            emit_layout_perf(&LayoutPerfTelemetry {
+                total_secs: layout_elapsed,
+                rendered_count: perf_rendered_count,
+                cached_count: perf_cached_count,
+                item_count: self.items.summary().count,
+                scroll_top_ix: scroll_top.item_ix,
+                slowest_item_secs: perf_slowest_secs,
+                slowest_item_ix: perf_slowest_ix,
+            });
         }
 
         LayoutItemsResponse {
