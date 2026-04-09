@@ -1173,10 +1173,13 @@ impl StateInner {
                 self.tail_scroll_velocity *= FRICTION_60.powf(dt * 60.0);
 
                 // 2. Add impulse from content growth this frame.
-                // Impulse is scaled by dt*60 so total displacement matches regardless of FPS.
-                // New-card events (item count increased) use higher impulse for
-                // faster convergence on discrete jumps.
-                // Skip first frame after follow-start — prev values are zeroed.
+                // scroll_growth is per-frame (px). Convert to velocity impulse (px/s):
+                //   growth_rate_px_per_sec = scroll_growth / dt
+                //   impulse = growth_rate * IMPULSE_FACTOR
+                // Simplified: growth * IMPULSE_FACTOR * 60.0 (normalized to 60fps base).
+                // The *60 converts the per-frame factor to per-second: at 60fps, one frame's
+                // impulse = growth * factor. At 30fps, growth is 2x larger (same total rate)
+                // so impulse per second stays constant.
                 if self.prev_tail_scroll_max > px(0.) {
                     let scroll_growth = f32::from(scroll_max - self.prev_tail_scroll_max);
                     if scroll_growth > 0.5 {
@@ -1185,10 +1188,7 @@ impl StateInner {
                         } else {
                             IMPULSE_FACTOR
                         };
-                        // Scale impulse by dt*60: at 60fps (dt=1/60), factor*dt*60 = factor.
-                        // Growth is already per-frame, so scale it to per-second by *60,
-                        // then scale back by dt for this frame's contribution.
-                        self.tail_scroll_velocity += scroll_growth * factor * dt * 60.0;
+                        self.tail_scroll_velocity += scroll_growth * factor * 60.0;
                     }
                 }
 
