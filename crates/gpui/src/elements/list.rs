@@ -1154,25 +1154,28 @@ impl StateInner {
                     self.set_logical_scroll_top_to(scroll_max);
                 }
 
-                // Debug telemetry: frame timing, velocity, branch taken
+                // Debug telemetry: only log when inertia is active or content grew.
+                // Silent at rest (vel=0, growth=0) to avoid flooding stderr.
                 #[cfg(debug_assertions)]
                 {
-                    let delta = f32::from(scroll_max - current_pos);
                     let growth = f32::from(scroll_max - self.prev_tail_scroll_max);
-                    let branch = if self.tail_scroll_velocity.abs() > MIN_VELOCITY {
-                        "inertia"
-                    } else {
-                        "snap"
-                    };
-                    eprintln!(
-                        "INERTIA: vel={:.1}px/s dt={:.1}ms delta={:.1} growth={:.1} items={} branch={}",
-                        self.tail_scroll_velocity,
-                        dt * 1000.0,
-                        delta,
-                        growth,
-                        current_item_count,
-                        branch,
-                    );
+                    if self.tail_scroll_velocity.abs() > 0.1 || growth > 0.1 {
+                        let delta = f32::from(scroll_max - current_pos);
+                        let branch = if self.tail_scroll_velocity.abs() > MIN_VELOCITY {
+                            "inertia"
+                        } else {
+                            "snap"
+                        };
+                        eprintln!(
+                            "INERTIA: vel={:.1}px/s dt={:.1}ms delta={:.1} growth={:.1} items={} branch={}",
+                            self.tail_scroll_velocity,
+                            dt * 1000.0,
+                            delta,
+                            growth,
+                            current_item_count,
+                            branch,
+                        );
+                    }
                 }
 
                 self.prev_tail_item_count = current_item_count;
