@@ -900,7 +900,7 @@ impl ListState {
 
     /// Returns true if a smooth scroll animation is in progress (inertia scroll).
     pub fn is_smooth_scrolling(&self) -> bool {
-        self.0.borrow().tail_scroll_velocity.abs() > 0.5
+        self.0.borrow().tail_scroll_velocity.abs() > 0.2
     }
 
     /// Cancel any in-progress smooth scroll animation.
@@ -1076,12 +1076,18 @@ impl StateInner {
         // If following tail, scroll toward end before layout.
         // Inertia-based smooth scroll for Tail mode.
         // Content growth adds velocity impulses; friction decays velocity each frame.
-        // impulse_factor = 1 - friction ensures one-time jumps (new cards) produce
-        // exactly the right total displacement without overshoot. Continuous growth
-        // (streaming) naturally converges to matching the growth rate.
+        // Two impulse factors: IMPULSE_FACTOR (streaming — converges to growth rate)
+        // and NEW_CARD_IMPULSE (card insertion — faster response for discrete jumps).
         const FRICTION: f32 = 0.80;
-        const IMPULSE_FACTOR: f32 = 0.20; // = 1.0 - FRICTION
-        const MIN_VELOCITY: f32 = 0.5;
+        // Streaming impulse: = 1.0 - FRICTION. Velocity converges to match
+        // continuous growth rate without overshoot (geometric series proof).
+        const IMPULSE_FACTOR: f32 = 0.20;
+        // New-card impulse: higher than streaming — discrete card insertion
+        // is a one-time height jump that needs faster first-frame response.
+        // Tuned: fast enough to feel instant, clamped by .min(scroll_max).
+        const NEW_CARD_IMPULSE: f32 = 0.35;
+        // 0.2 px/frame — below this, movement is imperceptible; snap is fine.
+        const MIN_VELOCITY: f32 = 0.2;
 
         if let FollowState::Tail { is_following: true } = self.follow_state {
             let total_height = self.items.summary().height;
@@ -1093,21 +1099,33 @@ impl StateInner {
                 let current_pos = self.logical_scroll_top
                     .map(|off| self.scroll_top(&off))
                     .unwrap_or(px(0.));
-                let delta = f32::from(scroll_max - current_pos);
 
                 // 1. Apply friction to existing velocity
                 self.tail_scroll_velocity *= FRICTION;
 
-                // 2. Add impulse from content growth this frame
+                // 2. Add impulse from content growth this frame.
+                // New-card events (item count increased) use higher impulse for
+                // faster convergence on discrete jumps. Streaming growth (existing
+                // card grew) uses standard impulse for smooth steady-state tracking.
+                // Skip first frame after follow-start — prev values are zeroed,
+                // no meaningful growth delta yet.
                 if self.prev_tail_scroll_max > px(0.) {
                     let scroll_growth = f32::from(scroll_max - self.prev_tail_scroll_max);
+                    // Ignore sub-pixel growth (< 0.5px) — measurement noise
                     if scroll_growth > 0.5 {
-                        self.tail_scroll_velocity += scroll_growth * IMPULSE_FACTOR;
+                        if current_item_count > self.prev_tail_item_count {
+                            self.tail_scroll_velocity += scroll_growth * NEW_CARD_IMPULSE;
+                        } else {
+                            self.tail_scroll_velocity += scroll_growth * IMPULSE_FACTOR;
+                        }
                     }
                 }
 
                 // 3. Apply velocity or snap
-                if self.tail_scroll_velocity > MIN_VELOCITY && delta > 1.0 {
+                // No distance threshold — .min(scroll_max) clamp prevents overshoot.
+                // The previous `delta > 1.0` check killed inertia during slow streaming
+                // where the gap to scroll_max ≈ growth_rate < 1.0 px/frame.
+                if self.tail_scroll_velocity > MIN_VELOCITY {
                     // Inertia scroll — move by velocity, clamped to scroll_max
                     let new_pos = (current_pos + px(self.tail_scroll_velocity)).min(scroll_max);
                     self.set_logical_scroll_top_to(new_pos);
