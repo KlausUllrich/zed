@@ -274,8 +274,16 @@ impl Primitive {
                 }
             }
             Primitive::Underline(u) => u.bounds.origin += offset,
-            Primitive::MonochromeSprite(s) => s.bounds.origin += offset,
-            Primitive::SubpixelSprite(s) => s.bounds.origin += offset,
+            Primitive::MonochromeSprite(s) => {
+                s.bounds.origin += offset;
+                s.transformation.translation[0] += offset.x.0;
+                s.transformation.translation[1] += offset.y.0;
+            }
+            Primitive::SubpixelSprite(s) => {
+                s.bounds.origin += offset;
+                s.transformation.translation[0] += offset.x.0;
+                s.transformation.translation[1] += offset.y.0;
+            }
             Primitive::PolychromeSprite(s) => s.bounds.origin += offset,
             Primitive::Surface(s) => s.bounds.origin += offset,
         }

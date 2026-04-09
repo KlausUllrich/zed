@@ -66,6 +66,11 @@ fn emit_scroll_telemetry(telemetry: &ScrollTelemetry) {
     });
 }
 
+/// Minimum velocity threshold for Tail mode inertia (px/s).
+/// Below this, movement is imperceptible and we snap to scroll_max.
+/// Referenced by both `layout_items()` and `is_smooth_scrolling()`.
+const MIN_VELOCITY_PX_PER_SEC: f32 = 12.0;
+
 /// Construct a new list element
 pub fn list(
     state: ListState,
@@ -951,9 +956,8 @@ impl ListState {
     }
 
     /// Returns true if a smooth scroll animation is in progress (inertia scroll).
-    /// Threshold matches MIN_VELOCITY (12 px/s) in layout_items().
     pub fn is_smooth_scrolling(&self) -> bool {
-        self.0.borrow().tail_scroll_velocity.abs() > 12.0
+        self.0.borrow().tail_scroll_velocity.abs() > MIN_VELOCITY_PX_PER_SEC
     }
 
     /// Cancel any in-progress smooth scroll animation.
@@ -1141,9 +1145,8 @@ impl StateInner {
         // Impulse factors scaled by (dt * 60): at 60 FPS, dt=1/60, so dt*60=1 → same as before.
         const IMPULSE_FACTOR: f32 = 0.20;
         const NEW_CARD_IMPULSE: f32 = 0.35;
-        // 12 px/s — below this, movement is imperceptible; snap is fine.
-        // (Was 0.2 px/frame = 0.2 * 60 = 12 px/s at 60 FPS)
-        const MIN_VELOCITY: f32 = 12.0;
+        // Velocity threshold — see module-level MIN_VELOCITY_PX_PER_SEC.
+        const MIN_VELOCITY: f32 = MIN_VELOCITY_PX_PER_SEC;
 
         if let FollowState::Tail { is_following: true } = self.follow_state {
             let total_height = self.items.summary().height;
