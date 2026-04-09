@@ -41,21 +41,23 @@ pub struct ScrollTelemetry {
 /// Callback type for scroll telemetry. Registered by the app at startup.
 type ScrollTelemetryCallback = Box<dyn Fn(&ScrollTelemetry) + 'static>;
 
-/// Performance data emitted after each `layout_items()` call.
+/// Performance data emitted after layout_items() or prepaint_items().
 /// Helps diagnose which items are expensive to render.
 #[derive(Clone, Debug)]
 pub struct LayoutPerfTelemetry {
-    /// Total layout_items() wall time in seconds.
+    /// Which phase: "layout" (render_item + layout_as_root) or "prepaint" (prepaint_at).
+    pub phase: &'static str,
+    /// Total wall time in seconds.
     pub total_secs: f32,
-    /// Number of items that called render_item + layout_as_root.
+    /// Number of items processed (rendered or prepainted).
     pub rendered_count: usize,
-    /// Number of items skipped (used cached size).
+    /// Number of items skipped (used cached size). Only meaningful for layout phase.
     pub cached_count: usize,
     /// Total item count in the list.
     pub item_count: usize,
     /// Scroll top item index.
     pub scroll_top_ix: usize,
-    /// Slowest single item render time in seconds (0 if none rendered).
+    /// Slowest single item time in seconds (0 if none processed).
     pub slowest_item_secs: f32,
     /// Index of the slowest item.
     pub slowest_item_ix: usize,
@@ -1510,6 +1512,7 @@ impl StateInner {
         let layout_elapsed = layout_start.elapsed().as_secs_f32();
         if layout_elapsed > 0.008 {
             emit_layout_perf(&LayoutPerfTelemetry {
+                phase: "layout",
                 total_secs: layout_elapsed,
                 rendered_count: perf_rendered_count,
                 cached_count: perf_cached_count,
@@ -1560,10 +1563,19 @@ impl StateInner {
             if bounds.size.height > padding.top + padding.bottom {
                 let mut item_origin = bounds.origin + Point::new(px(0.), padding.top);
                 item_origin.y -= layout_response.scroll_top.offset_in_item;
+                let prepaint_phase_start = Instant::now();
+                let mut prepaint_slowest_secs: f32 = 0.0;
+                let mut prepaint_slowest_ix: usize = 0;
                 for item in &mut layout_response.item_layouts {
+                    let prepaint_item_start = Instant::now();
                     window.with_content_mask(Some(ContentMask { bounds }), |window| {
                         item.element.prepaint_at(item_origin, window, cx);
                     });
+                    let prepaint_item_elapsed = prepaint_item_start.elapsed().as_secs_f32();
+                    if prepaint_item_elapsed > prepaint_slowest_secs {
+                        prepaint_slowest_secs = prepaint_item_elapsed;
+                        prepaint_slowest_ix = item.index;
+                    }
 
                     if let Some(autoscroll_bounds) = window.take_autoscroll()
                         && autoscroll
@@ -1607,6 +1619,21 @@ impl StateInner {
                     }
 
                     item_origin.y += item.size.height;
+                }
+
+                // Emit prepaint perf telemetry when slow (> 8ms).
+                let prepaint_elapsed = prepaint_phase_start.elapsed().as_secs_f32();
+                if prepaint_elapsed > 0.008 {
+                    emit_layout_perf(&LayoutPerfTelemetry {
+                        phase: "prepaint",
+                        total_secs: prepaint_elapsed,
+                        rendered_count: layout_response.item_layouts.len(),
+                        cached_count: 0,
+                        item_count: self.items.summary().count,
+                        scroll_top_ix: layout_response.scroll_top.item_ix,
+                        slowest_item_secs: prepaint_slowest_secs,
+                        slowest_item_ix: prepaint_slowest_ix,
+                    });
                 }
             } else {
                 layout_response.item_layouts.clear();
