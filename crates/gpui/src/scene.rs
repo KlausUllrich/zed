@@ -134,6 +134,36 @@ impl Scene {
         }
     }
 
+    /// Replay paint operations from a previous scene with a Y offset applied.
+    /// Used by list render caching: items that haven't changed content can have
+    /// their paint commands replayed at a different scroll position.
+    pub fn replay_with_y_offset(
+        &mut self,
+        range: Range<usize>,
+        prev_scene: &Scene,
+        y_offset: ScaledPixels,
+    ) {
+        if y_offset == ScaledPixels(0.0) {
+            return self.replay(range, prev_scene);
+        }
+        let offset = point(ScaledPixels(0.0), y_offset);
+        for operation in &prev_scene.paint_operations[range.clone()] {
+            match operation {
+                PaintOperation::Primitive(primitive) => {
+                    let mut translated = primitive.clone();
+                    translated.translate(offset);
+                    self.insert_primitive(translated);
+                }
+                PaintOperation::StartLayer(bounds) => {
+                    let mut translated = *bounds;
+                    translated.origin += offset;
+                    self.push_layer(translated);
+                }
+                PaintOperation::EndLayer => self.pop_layer(),
+            }
+        }
+    }
+
     pub fn finish(&mut self) {
         self.shadows.sort_by_key(|shadow| shadow.order);
         self.quads.sort_by_key(|quad| quad.order);
@@ -228,6 +258,26 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+        }
+    }
+
+    /// Translate all position data by the given offset.
+    /// Used by list render caching to replay paint operations at a new scroll position.
+    pub fn translate(&mut self, offset: Point<ScaledPixels>) {
+        match self {
+            Primitive::Shadow(s) => s.bounds.origin += offset,
+            Primitive::Quad(q) => q.bounds.origin += offset,
+            Primitive::Path(p) => {
+                p.bounds.origin += offset;
+                for vertex in &mut p.vertices {
+                    vertex.xy_position += offset;
+                }
+            }
+            Primitive::Underline(u) => u.bounds.origin += offset,
+            Primitive::MonochromeSprite(s) => s.bounds.origin += offset,
+            Primitive::SubpixelSprite(s) => s.bounds.origin += offset,
+            Primitive::PolychromeSprite(s) => s.bounds.origin += offset,
+            Primitive::Surface(s) => s.bounds.origin += offset,
         }
     }
 

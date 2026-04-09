@@ -15,7 +15,7 @@ use crate::{
 };
 use collections::VecDeque;
 use refineable::Refineable as _;
-use std::{cell::RefCell, ops::Range, rc::Rc};
+use std::{cell::RefCell, ops::Range, rc::Rc, time::Instant};
 use sum_tree::{Bias, Dimensions, SumTree};
 
 type RenderItemFn = dyn FnMut(usize, &mut Window, &mut App) -> AnyElement + 'static;
@@ -80,13 +80,16 @@ struct StateInner {
     suppress_wheel_scroll: bool,
     /// Follow mode state — controls auto-scroll to end behavior.
     follow_state: FollowState,
-    /// Velocity for inertia-based smooth scroll in Tail mode (px/frame).
+    /// Velocity for inertia-based smooth scroll in Tail mode (px/second).
     /// Content growth adds impulses; friction decays velocity each frame.
+    /// Delta-time-based: animation speed is constant regardless of frame rate.
     tail_scroll_velocity: f32,
     /// Previous frame's item count when in Tail mode. Used to detect new card insertion.
     prev_tail_item_count: usize,
     /// Previous frame's scroll_max in Tail mode. Used to compute per-frame growth.
     prev_tail_scroll_max: Pixels,
+    /// Timestamp of the last inertia physics update. Used for delta-time calculation.
+    last_inertia_time: Option<Instant>,
 }
 
 /// Keeps track of a fractional scroll position within an item for restoration
@@ -299,6 +302,7 @@ impl ListState {
             tail_scroll_velocity: 0.0,
             prev_tail_item_count: 0,
             prev_tail_scroll_max: px(0.),
+            last_inertia_time: None,
         })));
         this.splice(0..0, item_count);
         this
@@ -874,6 +878,7 @@ impl ListState {
             FollowMode::Normal => {
                 state.follow_state = FollowState::Normal;
                 state.tail_scroll_velocity = 0.0;
+                state.last_inertia_time = None;
             }
             FollowMode::Tail => {
                 state.follow_state = FollowState::Tail { is_following: true };
@@ -881,6 +886,7 @@ impl ListState {
                 state.tail_scroll_velocity = 0.0;
                 state.prev_tail_item_count = 0;
                 state.prev_tail_scroll_max = px(0.);
+                state.last_inertia_time = None;
             }
         }
     }
@@ -899,8 +905,9 @@ impl ListState {
     }
 
     /// Returns true if a smooth scroll animation is in progress (inertia scroll).
+    /// Threshold matches MIN_VELOCITY (12 px/s) in layout_items().
     pub fn is_smooth_scrolling(&self) -> bool {
-        self.0.borrow().tail_scroll_velocity.abs() > 0.2
+        self.0.borrow().tail_scroll_velocity.abs() > 12.0
     }
 
     /// Cancel any in-progress smooth scroll animation.
@@ -1074,20 +1081,23 @@ impl StateInner {
         cx: &mut App,
     ) -> LayoutItemsResponse {
         // If following tail, scroll toward end before layout.
-        // Inertia-based smooth scroll for Tail mode.
-        // Content growth adds velocity impulses; friction decays velocity each frame.
+        // Inertia-based smooth scroll for Tail mode (delta-time).
+        // Content growth adds velocity impulses; friction decays velocity per second.
+        // All constants are normalized to 60 FPS feel — animation speed is constant
+        // regardless of actual frame rate (Wayland VSync, thermal throttling, etc.).
+        //
         // Two impulse factors: IMPULSE_FACTOR (streaming — converges to growth rate)
         // and NEW_CARD_IMPULSE (card insertion — faster response for discrete jumps).
-        const FRICTION: f32 = 0.80;
-        // Streaming impulse: = 1.0 - FRICTION. Velocity converges to match
-        // continuous growth rate without overshoot (geometric series proof).
+
+        // Friction per frame at 60 FPS: 0.80. Per second: 0.80^60.
+        // At any FPS: friction_per_frame = FRICTION_60.powf(dt * 60.0)
+        const FRICTION_60: f32 = 0.80;
+        // Impulse factors scaled by (dt * 60): at 60 FPS, dt=1/60, so dt*60=1 → same as before.
         const IMPULSE_FACTOR: f32 = 0.20;
-        // New-card impulse: higher than streaming — discrete card insertion
-        // is a one-time height jump that needs faster first-frame response.
-        // Tuned: fast enough to feel instant, clamped by .min(scroll_max).
         const NEW_CARD_IMPULSE: f32 = 0.35;
-        // 0.2 px/frame — below this, movement is imperceptible; snap is fine.
-        const MIN_VELOCITY: f32 = 0.2;
+        // 12 px/s — below this, movement is imperceptible; snap is fine.
+        // (Was 0.2 px/frame = 0.2 * 60 = 12 px/s at 60 FPS)
+        const MIN_VELOCITY: f32 = 12.0;
 
         if let FollowState::Tail { is_following: true } = self.follow_state {
             let total_height = self.items.summary().height;
@@ -1100,39 +1110,69 @@ impl StateInner {
                     .map(|off| self.scroll_top(&off))
                     .unwrap_or(px(0.));
 
-                // 1. Apply friction to existing velocity
-                self.tail_scroll_velocity *= FRICTION;
+                // Delta-time: seconds since last inertia update.
+                // First frame after follow-start: use 1/60 as default.
+                // Cap at 50ms to prevent velocity explosion after pause.
+                let now = Instant::now();
+                let dt = self.last_inertia_time
+                    .map(|last| now.duration_since(last).as_secs_f32())
+                    .unwrap_or(1.0 / 60.0)
+                    .min(0.05);
+                self.last_inertia_time = Some(now);
+
+                // 1. Apply friction (time-normalized: same decay per second at any FPS)
+                self.tail_scroll_velocity *= FRICTION_60.powf(dt * 60.0);
 
                 // 2. Add impulse from content growth this frame.
+                // Impulse is scaled by dt*60 so total displacement matches regardless of FPS.
                 // New-card events (item count increased) use higher impulse for
-                // faster convergence on discrete jumps. Streaming growth (existing
-                // card grew) uses standard impulse for smooth steady-state tracking.
-                // Skip first frame after follow-start — prev values are zeroed,
-                // no meaningful growth delta yet.
+                // faster convergence on discrete jumps.
+                // Skip first frame after follow-start — prev values are zeroed.
                 if self.prev_tail_scroll_max > px(0.) {
                     let scroll_growth = f32::from(scroll_max - self.prev_tail_scroll_max);
-                    // Ignore sub-pixel growth (< 0.5px) — measurement noise
                     if scroll_growth > 0.5 {
-                        if current_item_count > self.prev_tail_item_count {
-                            self.tail_scroll_velocity += scroll_growth * NEW_CARD_IMPULSE;
+                        let factor = if current_item_count > self.prev_tail_item_count {
+                            NEW_CARD_IMPULSE
                         } else {
-                            self.tail_scroll_velocity += scroll_growth * IMPULSE_FACTOR;
-                        }
+                            IMPULSE_FACTOR
+                        };
+                        // Scale impulse by dt*60: at 60fps (dt=1/60), factor*dt*60 = factor.
+                        // Growth is already per-frame, so scale it to per-second by *60,
+                        // then scale back by dt for this frame's contribution.
+                        self.tail_scroll_velocity += scroll_growth * factor * dt * 60.0;
                     }
                 }
 
                 // 3. Apply velocity or snap
-                // No distance threshold — .min(scroll_max) clamp prevents overshoot.
-                // The previous `delta > 1.0` check killed inertia during slow streaming
-                // where the gap to scroll_max ≈ growth_rate < 1.0 px/frame.
-                if self.tail_scroll_velocity > MIN_VELOCITY {
-                    // Inertia scroll — move by velocity, clamped to scroll_max
-                    let new_pos = (current_pos + px(self.tail_scroll_velocity)).min(scroll_max);
+                // Velocity is now px/s. Displacement = velocity * dt.
+                if self.tail_scroll_velocity.abs() > MIN_VELOCITY {
+                    let displacement = self.tail_scroll_velocity * dt;
+                    let new_pos = (current_pos + px(displacement)).min(scroll_max);
                     self.set_logical_scroll_top_to(new_pos);
                 } else {
-                    // At rest or very close — pin to bottom
                     self.tail_scroll_velocity = 0.0;
                     self.set_logical_scroll_top_to(scroll_max);
+                }
+
+                // Debug telemetry: frame timing, velocity, branch taken
+                #[cfg(debug_assertions)]
+                {
+                    let delta = f32::from(scroll_max - current_pos);
+                    let growth = f32::from(scroll_max - self.prev_tail_scroll_max);
+                    let branch = if self.tail_scroll_velocity.abs() > MIN_VELOCITY {
+                        "inertia"
+                    } else {
+                        "snap"
+                    };
+                    eprintln!(
+                        "INERTIA: vel={:.1}px/s dt={:.1}ms delta={:.1} growth={:.1} items={} branch={}",
+                        self.tail_scroll_velocity,
+                        dt * 1000.0,
+                        delta,
+                        growth,
+                        current_item_count,
+                        branch,
+                    );
                 }
 
                 self.prev_tail_item_count = current_item_count;
