@@ -15,10 +15,56 @@ use crate::{
 };
 use collections::VecDeque;
 use refineable::Refineable as _;
-use std::{cell::RefCell, ops::Range, rc::Rc, time::Instant};
+use std::{cell::Cell, cell::RefCell, ops::Range, rc::Rc, time::Instant};
 use sum_tree::{Bias, Dimensions, SumTree};
 
 type RenderItemFn = dyn FnMut(usize, &mut Window, &mut App) -> AnyElement + 'static;
+
+/// Telemetry data emitted each frame during Tail mode inertia scroll.
+/// Consumed by the app's debug viewer (e.g., cs-debug Scroll tab).
+#[derive(Clone, Debug)]
+pub struct ScrollTelemetry {
+    /// Current velocity in px/s.
+    pub velocity: f32,
+    /// Frame delta time in seconds.
+    pub dt: f32,
+    /// Distance from current position to scroll_max in px.
+    pub delta: f32,
+    /// Content growth this frame in px.
+    pub growth: f32,
+    /// Total item count.
+    pub item_count: usize,
+    /// Which branch fired: true = inertia, false = snap.
+    pub inertia_active: bool,
+}
+
+/// Callback type for scroll telemetry. Registered by the app at startup.
+type ScrollTelemetryCallback = Box<dyn Fn(&ScrollTelemetry) + 'static>;
+
+thread_local! {
+    static SCROLL_TELEMETRY_CB: Cell<Option<*const ScrollTelemetryCallback>> = const { Cell::new(None) };
+}
+
+/// Register a callback to receive scroll telemetry during Tail mode inertia.
+/// Call once at app startup. The callback should forward to the debug logging system.
+///
+/// # Safety
+/// The callback must outlive all List elements. In practice, register a `Box::leak`'d
+/// callback at startup and never unregister.
+pub fn set_scroll_telemetry_callback(callback: ScrollTelemetryCallback) {
+    let leaked = Box::leak(Box::new(callback));
+    SCROLL_TELEMETRY_CB.with(|cell| cell.set(Some(leaked as *const ScrollTelemetryCallback)));
+}
+
+fn emit_scroll_telemetry(telemetry: &ScrollTelemetry) {
+    SCROLL_TELEMETRY_CB.with(|cell| {
+        if let Some(ptr) = cell.get() {
+            // SAFETY: Pointer is valid for the lifetime of the process (Box::leak in set_*).
+            let cb = unsafe { &*ptr };
+            cb(telemetry);
+        }
+    });
+}
 
 /// Construct a new list element
 pub fn list(
@@ -1154,27 +1200,19 @@ impl StateInner {
                     self.set_logical_scroll_top_to(scroll_max);
                 }
 
-                // Debug telemetry: only log when inertia is active or content grew.
-                // Silent at rest (vel=0, growth=0) to avoid flooding stderr.
-                #[cfg(debug_assertions)]
+                // Telemetry: emit via registered callback (cs-debug Scroll tab).
+                // Only fires when inertia is active or content grew — silent at rest.
                 {
                     let growth = f32::from(scroll_max - self.prev_tail_scroll_max);
                     if self.tail_scroll_velocity.abs() > 0.1 || growth > 0.1 {
-                        let delta = f32::from(scroll_max - current_pos);
-                        let branch = if self.tail_scroll_velocity.abs() > MIN_VELOCITY {
-                            "inertia"
-                        } else {
-                            "snap"
-                        };
-                        eprintln!(
-                            "INERTIA: vel={:.1}px/s dt={:.1}ms delta={:.1} growth={:.1} items={} branch={}",
-                            self.tail_scroll_velocity,
-                            dt * 1000.0,
-                            delta,
+                        emit_scroll_telemetry(&ScrollTelemetry {
+                            velocity: self.tail_scroll_velocity,
+                            dt,
+                            delta: f32::from(scroll_max - current_pos),
                             growth,
-                            current_item_count,
-                            branch,
-                        );
+                            item_count: current_item_count,
+                            inertia_active: self.tail_scroll_velocity.abs() > MIN_VELOCITY,
+                        });
                     }
                 }
 
