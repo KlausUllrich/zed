@@ -119,6 +119,10 @@ pub struct RenderCacheFrameData {
     pub total_scene_ops: usize,
     pub fresh_scene_ops: usize,
     pub replay_scene_ops: usize,
+    pub mask_expanded: bool,
+    pub original_height: f32,
+    pub expanded_height: f32,
+    pub max_item_height: f32,
 }
 
 /// Per-item render cache data for one visible list item.
@@ -133,6 +137,8 @@ pub struct RenderCacheItemData {
     pub scene_range_start: usize,
     pub scene_range_end: usize,
     pub measured_height: f32,
+    pub fully_visible: bool,
+    pub capture_quality: &'static str,
 }
 
 /// Fate of a single primitive during replay (from scene.rs replay_with_y_offset).
@@ -148,6 +154,8 @@ pub struct PrimitiveFateData {
     pub intersection: (f32, f32, f32, f32),
     pub survived: bool,
     pub transform_translation: Option<(f32, f32)>,
+    pub in_original_viewport: bool,
+    pub in_expanded_mask: bool,
 }
 
 /// Data emitted when render caches are invalidated (scroll stop).
@@ -169,6 +177,16 @@ pub struct TransitionItemData {
     pub height_collapsed: bool,
 }
 
+/// Per-item data emitted when an item is stored in the scene cache.
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct CacheStoreData {
+    pub item_index: usize,
+    pub scene_ops: usize,
+    pub y_origin: f32,
+    pub fully_visible: bool,
+}
+
 /// Aggregate event emitted to the debug callback.
 #[derive(Clone, Debug)]
 #[allow(missing_docs)]
@@ -179,6 +197,7 @@ pub enum RenderCacheDebugEvent {
         primitive_fates: Vec<PrimitiveFateData>,
     },
     Transition(CacheTransitionData),
+    CacheStore(Vec<CacheStoreData>),
 }
 
 type RenderCacheDebugCallback = Box<dyn Fn(&RenderCacheDebugEvent) + 'static>;
@@ -2146,7 +2165,7 @@ impl Element for List {
 
         // Collect scene ranges for fresh items and replay cached items.
         // Updated after the paint loop to avoid borrow conflicts with ListState.
-        let mut scene_updates: Vec<(usize, Range<usize>, Pixels, Range<PrepaintStateIndex>)> =
+        let mut scene_updates: Vec<(usize, Range<usize>, Pixels, Range<PrepaintStateIndex>, Pixels)> =
             Vec::new();
         let debug_active = render_cache_debug_active();
         let mut debug_items: Vec<RenderCacheItemData> = Vec::new();
@@ -2162,13 +2181,13 @@ impl Element for List {
         // get full scene captures. Without expansion, insert_primitive culls
         // primitives at viewport edges (bounds ∩ content_mask = empty at capture time).
         let caching_enabled = self.state.0.borrow().caching_enabled;
+        let max_item_height = prepaint
+            .layout
+            .item_layouts
+            .iter()
+            .map(|item| item.size.height)
+            .fold(px(0.), |a, b| if b > a { b } else { a });
         let paint_bounds = if caching_enabled {
-            let max_item_height = prepaint
-                .layout
-                .item_layouts
-                .iter()
-                .map(|item| item.size.height)
-                .fold(px(0.), |a, b| if b > a { b } else { a });
             Bounds::new(
                 point(bounds.origin.x, bounds.origin.y - max_item_height),
                 size(
@@ -2191,6 +2210,10 @@ impl Element for List {
                         fresh_scene_ops += ops;
                         fresh_count += 1;
                         if debug_active {
+                            let item_top = item.y_origin;
+                            let item_bottom = item.y_origin + item.size.height;
+                            let fv = item_top >= bounds.origin.y
+                                && item_bottom <= bounds.origin.y + bounds.size.height;
                             debug_items.push(RenderCacheItemData {
                                 item_index: item.index,
                                 render_mode: "Fresh",
@@ -2200,6 +2223,8 @@ impl Element for List {
                                 scene_range_start: start,
                                 scene_range_end: end,
                                 measured_height: item.size.height.0,
+                                fully_visible: fv,
+                                capture_quality: if ops >= 5 { "good" } else { "low" },
                             });
                         }
                         scene_updates.push((
@@ -2207,6 +2232,7 @@ impl Element for List {
                             start..end,
                             item.y_origin,
                             item.prepaint_range.clone(),
+                            item.size.height,
                         ));
                     }
                     ItemRender::Cached {
@@ -2220,6 +2246,14 @@ impl Element for List {
                         // Use debug replay for first cached item when debug is active.
                         if debug_active && !first_cached_debug_done {
                             first_cached_debug_done = true;
+                            let scale = window.scale_factor();
+                            let vp_top = bounds.origin.y.0 * scale;
+                            let vp_bottom = (bounds.origin.y.0 + bounds.size.height.0) * scale;
+                            let vp_left = bounds.origin.x.0 * scale;
+                            let vp_right = (bounds.origin.x.0 + bounds.size.width.0) * scale;
+                            let ep_top = paint_bounds.origin.y.0 * scale;
+                            let ep_bottom =
+                                (paint_bounds.origin.y.0 + paint_bounds.size.height.0) * scale;
                             let (new_range, fates) = window
                                 .replay_cached_scene_with_y_offset_debug(
                                     scene_range.clone(),
@@ -2228,6 +2262,19 @@ impl Element for List {
                             let ops = new_range.end - new_range.start;
                             replay_scene_ops += ops;
                             for (ptype, bb, ba, mb, ma, inter, surv, tt) in fates {
+                                let (px, py, pw, ph) = ba;
+                                let p_top = py;
+                                let p_bottom = py + ph;
+                                let p_left = px;
+                                let p_right = px + pw;
+                                let in_orig = p_right > vp_left
+                                    && p_left < vp_right
+                                    && p_bottom > vp_top
+                                    && p_top < vp_bottom;
+                                let in_exp = p_right > vp_left
+                                    && p_left < vp_right
+                                    && p_bottom > ep_top
+                                    && p_top < ep_bottom;
                                 debug_fates.push(PrimitiveFateData {
                                     item_index: item.index,
                                     primitive_type: ptype,
@@ -2238,8 +2285,14 @@ impl Element for List {
                                     intersection: inter,
                                     survived: surv,
                                     transform_translation: tt,
+                                    in_original_viewport: in_orig,
+                                    in_expanded_mask: in_exp,
                                 });
                             }
+                            let item_top = item.y_origin;
+                            let item_bottom = item.y_origin + item.size.height;
+                            let fv = item_top >= bounds.origin.y
+                                && item_bottom <= bounds.origin.y + bounds.size.height;
                             debug_items.push(RenderCacheItemData {
                                 item_index: item.index,
                                 render_mode: "Cached",
@@ -2249,12 +2302,15 @@ impl Element for List {
                                 scene_range_start: scene_range.start,
                                 scene_range_end: scene_range.end,
                                 measured_height: item.size.height.0,
+                                fully_visible: fv,
+                                capture_quality: if ops >= 5 { "good" } else { "low" },
                             });
                             scene_updates.push((
                                 item.index,
                                 new_range,
                                 item.y_origin,
                                 item.prepaint_range.clone(),
+                                item.size.height,
                             ));
                         } else {
                             let new_range = window
@@ -2262,6 +2318,11 @@ impl Element for List {
                             let ops = new_range.end - new_range.start;
                             replay_scene_ops += ops;
                             if debug_active {
+                                let item_top = item.y_origin;
+                                let item_bottom = item.y_origin + item.size.height;
+                                let fv = item_top >= bounds.origin.y
+                                    && item_bottom
+                                        <= bounds.origin.y + bounds.size.height;
                                 debug_items.push(RenderCacheItemData {
                                     item_index: item.index,
                                     render_mode: "Cached",
@@ -2271,6 +2332,8 @@ impl Element for List {
                                     scene_range_start: scene_range.start,
                                     scene_range_end: scene_range.end,
                                     measured_height: item.size.height.0,
+                                    fully_visible: fv,
+                                    capture_quality: if ops >= 5 { "good" } else { "low" },
                                 });
                             }
                             scene_updates.push((
@@ -2278,6 +2341,7 @@ impl Element for List {
                                 new_range,
                                 item.y_origin,
                                 item.prepaint_range.clone(),
+                                item.size.height,
                             ));
                         }
                     }
@@ -2297,6 +2361,10 @@ impl Element for List {
                     total_scene_ops,
                     fresh_scene_ops,
                     replay_scene_ops,
+                    mask_expanded: caching_enabled,
+                    original_height: bounds.size.height.0,
+                    expanded_height: paint_bounds.size.height.0,
+                    max_item_height: max_item_height.0,
                 },
                 items: debug_items,
                 primitive_fates: debug_fates,
@@ -2310,13 +2378,26 @@ impl Element for List {
                 // Evict entries for items no longer visible.
                 let visible_indices: HashSet<usize> = scene_updates
                     .iter()
-                    .map(|(index, _, _, _)| *index)
+                    .map(|(index, _, _, _, _)| *index)
                     .collect();
                 state
                     .item_scene_cache
                     .retain(|index, _| visible_indices.contains(index));
                 // Insert/update entries for currently visible items.
-                for (index, range, y_origin, prepaint_range) in scene_updates {
+                let mut debug_stores: Vec<CacheStoreData> = Vec::new();
+                for (index, range, y_origin, prepaint_range, item_height) in scene_updates {
+                    if debug_active {
+                        let ops = range.end - range.start;
+                        let item_bottom = y_origin + item_height;
+                        let fv = y_origin >= bounds.origin.y
+                            && item_bottom <= bounds.origin.y + bounds.size.height;
+                        debug_stores.push(CacheStoreData {
+                            item_index: index,
+                            scene_ops: ops,
+                            y_origin: y_origin.0,
+                            fully_visible: fv,
+                        });
+                    }
                     state.item_scene_cache.insert(
                         index,
                         CachedItemScene {
@@ -2325,6 +2406,9 @@ impl Element for List {
                             prepaint_range,
                         },
                     );
+                }
+                if debug_active && !debug_stores.is_empty() {
+                    emit_render_cache_debug(&RenderCacheDebugEvent::CacheStore(debug_stores));
                 }
             }
         }
