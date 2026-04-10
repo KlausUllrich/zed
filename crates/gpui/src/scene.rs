@@ -138,35 +138,27 @@ impl Scene {
     /// Used by list render caching: items that haven't changed content can have
     /// their paint commands replayed at a different scroll position.
     ///
-    /// `viewport_mask` is the list's current viewport clip rect. After translating
-    /// each primitive (which moves both bounds AND content_mask), the translated
-    /// content_mask is intersected with the viewport. This preserves inner
-    /// overflow_hidden clipping (moves with content) while restoring viewport-
-    /// level clipping (intersect with current viewport bounds).
+    /// `translate()` moves both bounds AND content_mask by the same offset.
+    /// This preserves the relationship between content and its clip rects
+    /// (including inner overflow_hidden containers). Viewport clipping is
+    /// naturally handled by the GPU framebuffer bounds.
+    ///
+    /// IMPORTANT: Only fully-visible items should be replayed. Edge items
+    /// (partially clipped at viewport boundaries) have incomplete scene data
+    /// because glyphs outside the viewport were culled during Fresh paint.
+    /// The caller (list.rs) enforces this via the fully_visible guard.
     pub fn replay_with_y_offset(
         &mut self,
         range: Range<usize>,
         prev_scene: &Scene,
         y_offset: ScaledPixels,
-        viewport_mask: ContentMask<ScaledPixels>,
     ) {
-        // Only Y moves during list scroll — X position is always fixed.
         let offset = point(ScaledPixels(0.0), y_offset);
         for operation in &prev_scene.paint_operations[range] {
             match operation {
                 PaintOperation::Primitive(primitive) => {
                     let mut translated = primitive.clone();
-                    // Translate moves bounds, content_mask, vertices, transforms.
                     translated.translate(offset);
-                    // Intersect translated mask with viewport: preserves inner
-                    // overflow_hidden clipping while adding viewport clipping.
-                    let intersected = ContentMask {
-                        bounds: translated
-                            .content_mask()
-                            .bounds
-                            .intersect(&viewport_mask.bounds),
-                    };
-                    translated.set_content_mask(intersected);
                     self.insert_primitive(translated);
                 }
                 PaintOperation::StartLayer(bounds) => {
