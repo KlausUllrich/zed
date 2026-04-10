@@ -159,11 +159,6 @@ impl Scene {
                 PaintOperation::Primitive(primitive) => {
                     let mut translated = primitive.clone();
                     translated.translate(offset);
-                    // DEBUG: tint cached quads blue to distinguish from Fresh
-                    if let Primitive::Quad(ref mut q) = translated {
-                        q.background.solid.h = 0.6;
-                        q.background.solid.s = q.background.solid.s.max(0.4);
-                    }
                     self.insert_primitive(translated);
                 }
                 PaintOperation::StartLayer(bounds) => {

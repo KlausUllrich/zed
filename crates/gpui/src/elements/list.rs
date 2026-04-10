@@ -190,10 +190,6 @@ struct StateInner {
     /// (when interactivity is intentionally suppressed). Disabled on scroll stop
     /// to ensure all items render Fresh with full hitboxes.
     caching_enabled: bool,
-    /// DEBUG: rolling buffer of last 2 frames for transition analysis.
-    debug_frame_buffer: VecDeque<DebugFrameData>,
-    /// DEBUG: how many Fresh frames to capture after a stop transition.
-    debug_post_stop_frames: u8,
 }
 
 /// Keeps track of a fractional scroll position within an item for restoration
@@ -217,15 +213,6 @@ struct CachedItemScene {
     /// Range of text layouts used by this item (prepaint + paint combined).
     /// Must be reused each frame to prevent the text system from evicting them.
     line_layout_range: Range<LineLayoutIndex>,
-}
-
-/// DEBUG: per-frame snapshot for transition analysis.
-#[derive(Clone)]
-struct DebugFrameData {
-    scroll_item_ix: usize,
-    scroll_offset: f32,
-    caching_enabled: bool,
-    items: Vec<(usize, bool, f32, f32)>, // (index, is_cached, y_origin, height)
 }
 
 /// Whether a list item should be rendered fresh or replayed from scene cache.
@@ -450,8 +437,6 @@ impl ListState {
             last_inertia_time: None,
             item_scene_cache: HashMap::default(),
             caching_enabled: false,
-            debug_frame_buffer: VecDeque::with_capacity(4),
-            debug_post_stop_frames: 0,
         })));
         this.splice(0..0, item_count);
         this
@@ -478,25 +463,12 @@ impl ListState {
         let mut state = self.0.borrow_mut();
         state.item_scene_cache.clear();
         state.caching_enabled = false;
-        // DEBUG: trigger post-stop capture (2 frames after this point)
-        state.debug_post_stop_frames = 2;
-        // Mark the transition point in the buffer
-        state.debug_frame_buffer.push_back(DebugFrameData {
-            scroll_item_ix: usize::MAX, // sentinel
-            scroll_offset: 0.0,
-            caching_enabled: false,
-            items: vec![], // empty = marker
-        });
     }
 
     /// Enable or disable scene caching. When enabled, unchanged items skip
     /// the full element lifecycle during scroll. When disabled, all items render
     /// Fresh with full hitboxes for interactivity.
-    #[track_caller]
     pub fn set_item_caching_enabled(&self, enabled: bool) {
-        if enabled {
-            eprintln!("[CACHE-ON] caching enabled from {}", std::panic::Location::caller());
-        }
         self.0.borrow_mut().caching_enabled = enabled;
     }
 
@@ -1447,7 +1419,18 @@ impl StateInner {
                     perf_slowest_secs = item_elapsed;
                     perf_slowest_ix = item_index;
                 }
-                size = Some(element_size);
+                // If the item already has a measured height, preserve it for positioning.
+                // The first Fresh layout after cache invalidation may return a minimal
+                // height (element state not yet populated). Use the known-good measured
+                // height to prevent a one-frame position jump.
+                if size.is_some() {
+                    size = Some(Size {
+                        width: element_size.width,
+                        height: size.unwrap().height,
+                    });
+                } else {
+                    size = Some(element_size);
+                }
 
                 if ix == 0 {
                     // CS patch: Scroll offset compensation (wheel/trackpad scroll only).
@@ -2058,14 +2041,8 @@ impl Element for List {
         let mut scene_updates: Vec<(usize, Range<usize>, Pixels, Range<LineLayoutIndex>, bool)> =
             Vec::new();
 
-        // DEBUG: collect per-item data for transition file dump
-        let mut debug_items: Vec<(usize, bool, f32, f32)> = Vec::new();
-
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             for item in &mut prepaint.layout.item_layouts {
-                let is_cached = matches!(&item.render, ItemRender::Cached { .. });
-                debug_items.push((item.index, is_cached, item.y_origin.0, item.size.height.0));
-
                 match &mut item.render {
                     ItemRender::Fresh { element } => {
                         let start = window.scene_len();
@@ -2110,46 +2087,6 @@ impl Element for List {
                 }
             }
         });
-
-        // DEBUG: buffer frame data and dump to file on cache→fresh transition
-        {
-            let mut state = self.state.0.borrow_mut();
-            let scroll_top = state.logical_scroll_top();
-            let frame = DebugFrameData {
-                scroll_item_ix: scroll_top.item_ix,
-                scroll_offset: scroll_top.offset_in_item.0,
-                caching_enabled: state.caching_enabled,
-                items: debug_items,
-            };
-
-            // If post-stop capture is active, write frames to file
-            if state.debug_post_stop_frames > 0 {
-                state.debug_frame_buffer.push_back(frame);
-                state.debug_post_stop_frames -= 1;
-                if state.debug_post_stop_frames == 0 {
-                    // Dump all buffered frames to file
-                    if let Ok(mut f) = std::fs::File::create("/tmp/cache-transition.log") {
-                        use std::io::Write;
-                        for (i, fd) in state.debug_frame_buffer.iter().enumerate() {
-                            let _ = writeln!(f, "--- Frame {} (caching={}) scroll_top=({}, {:.1}) ---",
-                                i, fd.caching_enabled, fd.scroll_item_ix, fd.scroll_offset);
-                            for &(ix, cached, y, h) in &fd.items {
-                                let _ = writeln!(f, "  ix={:>3} {} y={:>8.1} h={:>8.1}",
-                                    ix, if cached { "C" } else { "F" }, y, h);
-                            }
-                        }
-                        eprintln!("[DEBUG] Wrote transition data to /tmp/cache-transition.log");
-                    }
-                    state.debug_frame_buffer.clear();
-                }
-            } else {
-                // Rolling buffer: keep last 2 frames
-                if state.debug_frame_buffer.len() >= 2 {
-                    state.debug_frame_buffer.pop_front();
-                }
-                state.debug_frame_buffer.push_back(frame);
-            }
-        }
 
         // Update scene cache with new ranges from this frame (only when caching is active).
         {
