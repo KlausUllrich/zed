@@ -2030,10 +2030,15 @@ impl Element for List {
         let mut scene_updates: Vec<(usize, Range<usize>, Pixels, Range<LineLayoutIndex>, bool)> =
             Vec::new();
 
+        // DEBUG: count fresh vs cached for transition detection
+        let mut debug_fresh_count = 0usize;
+        let mut debug_cached_count = 0usize;
+
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             for item in &mut prepaint.layout.item_layouts {
                 match &mut item.render {
                     ItemRender::Fresh { element } => {
+                        debug_fresh_count += 1;
                         let start = window.scene_len();
                         element.paint(window, cx);
                         let end = window.scene_len();
@@ -2056,6 +2061,7 @@ impl Element for List {
                         cached_y,
                         line_layout_range,
                     } => {
+                        debug_cached_count += 1;
                         // Reuse text layouts — preserves glyph atlas entries.
                         // Capture new indices so the cache stays valid for the next frame
                         // (reuse_layouts pushes to current_frame at new positions).
@@ -2076,6 +2082,23 @@ impl Element for List {
                 }
             }
         });
+
+        // DEBUG: log cache transition
+        if debug_cached_count > 0 || debug_fresh_count > 0 {
+            let state = self.state.0.borrow();
+            if !state.caching_enabled && debug_cached_count == 0 && debug_fresh_count > 0 {
+                let scroll_top = state.logical_scroll_top();
+                eprintln!(
+                    "[TRANSITION] all-fresh frame: {} items, scroll_top=({}, {:.1})",
+                    debug_fresh_count, scroll_top.item_ix, scroll_top.offset_in_item.0
+                );
+            } else if debug_cached_count > 0 {
+                eprintln!(
+                    "[PAINT] fresh={} cached={} caching_enabled={}",
+                    debug_fresh_count, debug_cached_count, state.caching_enabled
+                );
+            }
+        }
 
         // Update scene cache with new ranges from this frame (only when caching is active).
         {
