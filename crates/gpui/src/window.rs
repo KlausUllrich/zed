@@ -2733,10 +2733,12 @@ impl Window {
         let start = self.next_frame.scene.len();
         let scale = self.scale_factor;
         let y_offset_scaled = ScaledPixels(y_offset.0 * scale);
+        let current_mask = self.content_mask().scale(scale);
         self.next_frame.scene.replay_with_y_offset(
             range,
             &self.rendered_frame.scene,
             y_offset_scaled,
+            current_mask,
         );
         let end = self.next_frame.scene.len();
         start..end
