@@ -1379,11 +1379,16 @@ impl StateInner {
             let item_index = scroll_top.item_ix + ix;
             let in_viewport = visible_height < available_height;
 
-            // Scene cache hit: item is visible, already measured, and has a cached scene.
-            // Skip element construction + Taffy layout entirely.
-            // Only visible items are cached — overdraw items exist solely for height measurement.
+            // Scene cache hit: item is fully visible, already measured, and has a cached scene.
+            // Edge items (partially clipped by viewport) always render Fresh to avoid
+            // incomplete scene caches — glyphs outside the viewport are culled at paint
+            // time and would be permanently missing from the cached scene_range.
+            let item_height = size.map(|s| s.height).unwrap_or(px(0.));
+            let fully_visible = visible_height >= px(0.)
+                && visible_height + item_height <= available_height;
             let scene_cache_hit = self.caching_enabled
                 && in_viewport
+                && fully_visible
                 && size.is_some()
                 && self.item_scene_cache.contains_key(&item_index);
 
@@ -2021,7 +2026,8 @@ impl Element for List {
 
         // Collect scene ranges + text layout ranges for fresh items and replay cached items.
         // Updated after the paint loop to avoid borrow conflicts with ListState.
-        let mut scene_updates: Vec<(usize, Range<usize>, Pixels, Range<LineLayoutIndex>)> =
+        // Tuple: (index, scene_range, y_origin, line_layout_range, fully_visible)
+        let mut scene_updates: Vec<(usize, Range<usize>, Pixels, Range<LineLayoutIndex>, bool)> =
             Vec::new();
 
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
@@ -2032,11 +2038,17 @@ impl Element for List {
                         element.paint(window, cx);
                         let end = window.scene_len();
                         let text_end = window.text_layout_index();
+                        // Only cache items fully within the viewport — edge items
+                        // have incomplete scene_ranges (glyphs culled at paint time).
+                        let fully_visible = item.y_origin >= bounds.origin.y
+                            && item.y_origin + item.size.height
+                                <= bounds.origin.y + bounds.size.height;
                         scene_updates.push((
                             item.index,
                             start..end,
                             item.y_origin,
                             item.text_layout_start.clone()..text_end,
+                            fully_visible,
                         ));
                     }
                     ItemRender::Cached {
@@ -2058,6 +2070,7 @@ impl Element for List {
                             new_range,
                             item.y_origin,
                             new_text_start..new_text_end,
+                            true, // Cached items passed fully_visible check at layout time
                         ));
                     }
                 }
@@ -2071,13 +2084,18 @@ impl Element for List {
                 // Evict entries for items no longer visible.
                 let visible_indices: HashSet<usize> = scene_updates
                     .iter()
-                    .map(|(index, _, _, _)| *index)
+                    .map(|(index, _, _, _, _)| *index)
                     .collect();
                 state
                     .item_scene_cache
                     .retain(|index, _| visible_indices.contains(index));
-                // Insert/update entries for currently visible items.
-                for (index, range, y_origin, line_layout_range) in scene_updates {
+                // Insert/update entries for fully visible items only.
+                // Edge items (partially clipped) are excluded to prevent
+                // caching incomplete scene_ranges with missing glyphs.
+                for (index, range, y_origin, line_layout_range, fully_visible) in scene_updates {
+                    if !fully_visible {
+                        continue;
+                    }
                     state.item_scene_cache.insert(
                         index,
                         CachedItemScene {
