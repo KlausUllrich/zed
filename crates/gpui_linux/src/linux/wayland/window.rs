@@ -117,6 +117,9 @@ pub struct WaylandWindowState {
     active: bool,
     hovered: bool,
     pub(crate) force_render_after_recovery: bool,
+    /// Last presentation timestamp from wp_presentation_time (monotonic nanos).
+    /// Updated by the compositor after each frame is actually displayed.
+    presentation_time_nanos: Option<u64>,
     in_progress_configure: Option<InProgressConfigure>,
     resize_throttle: bool,
     in_progress_window_controls: Option<WindowControls>,
@@ -391,6 +394,7 @@ impl WaylandWindowState {
             active: false,
             hovered: false,
             force_render_after_recovery: false,
+            presentation_time_nanos: None,
             in_progress_window_controls: None,
             window_controls: WindowControls::default(),
             client_inset: None,
@@ -568,18 +572,29 @@ impl WaylandWindowStatePtr {
         !state.children.is_empty()
     }
 
+    /// Store the presentation timestamp from wp_presentation_time feedback.
+    /// Called by the Dispatch handler when the compositor reports when a frame was displayed.
+    pub fn set_presentation_time(&self, nanos: u64) {
+        let mut state = self.state.borrow_mut();
+        state.presentation_time_nanos = Some(nanos);
+    }
+
     pub fn frame(&self) {
         let mut state = self.state.borrow_mut();
         state.surface.frame(&state.globals.qh, state.surface.id());
         state.resize_throttle = false;
         let force_render = state.force_render_after_recovery;
         state.force_render_after_recovery = false;
+        // Take the presentation timestamp from the previous frame's feedback.
+        // This is the actual VSync time reported by the compositor.
+        let presentation_time_nanos = state.presentation_time_nanos.take();
         drop(state);
 
         let mut cb = self.callbacks.borrow_mut();
         if let Some(fun) = cb.request_frame.as_mut() {
             fun(RequestFrameOptions {
                 force_render,
+                presentation_time_nanos,
                 ..Default::default()
             });
         }
@@ -1388,6 +1403,19 @@ impl PlatformWindow for WaylandWindow {
 
     fn completed_frame(&self) {
         let state = self.borrow();
+        // Register for presentation feedback before commit (wp_presentation_time).
+        // The compositor will fire Presented with the actual VSync timestamp,
+        // enabling accurate animation dt computation.
+        if let Some(ref presentation) = state.globals.presentation {
+            // The feedback object is kept alive by the Wayland dispatch queue.
+            // Dropping it here is intentional — the Dispatch<WpPresentationFeedback>
+            // handler in client.rs fires when the compositor sends the Presented event.
+            let _feedback = presentation.feedback(
+                &state.surface,
+                &state.globals.qh,
+                state.surface.id(),
+            );
+        }
         state.surface.commit();
     }
 

@@ -316,12 +316,25 @@ impl WgpuRenderer {
             );
         }
 
+        // Prefer Mailbox (triple-buffered, no VSync cliff) to avoid the Wayland binary
+        // FPS halving problem: with Fifo, any frame exceeding the VSync budget drops to
+        // the next slot (e.g. 144→72→48 FPS). Mailbox lets us present the most recent
+        // frame at each VSync without blocking. Fall back to Fifo if unsupported.
+        let present_mode = if surface_caps
+            .present_modes
+            .contains(&wgpu::PresentMode::Mailbox)
+        {
+            wgpu::PresentMode::Mailbox
+        } else {
+            wgpu::PresentMode::Fifo
+        };
+
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width: clamped_width.max(1),
             height: clamped_height.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
+            present_mode,
             desired_maximum_frame_latency: 2,
             alpha_mode,
             view_formats: vec![],
