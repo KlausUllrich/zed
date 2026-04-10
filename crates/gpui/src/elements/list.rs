@@ -1419,18 +1419,11 @@ impl StateInner {
                     perf_slowest_secs = item_elapsed;
                     perf_slowest_ix = item_index;
                 }
-                // If the item already has a measured height, preserve it for positioning.
-                // The first Fresh layout after cache invalidation may return a minimal
-                // height (element state not yet populated). Use the known-good measured
-                // height to prevent a one-frame position jump.
-                if size.is_some() {
-                    size = Some(Size {
-                        width: element_size.width,
-                        height: size.unwrap().height,
-                    });
-                } else {
-                    size = Some(element_size);
-                }
+                // Always use the freshly-measured size — do NOT preserve the old
+                // cached height here. Stale heights cause a one-frame overlay on
+                // scroll stop: positioning uses old height while content renders
+                // at its true height, pushing subsequent items too close together.
+                size = Some(element_size);
 
                 if ix == 0 {
                     // CS patch: Scroll offset compensation (wheel/trackpad scroll only).

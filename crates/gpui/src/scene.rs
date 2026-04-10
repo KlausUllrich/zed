@@ -153,6 +153,9 @@ impl Scene {
         prev_scene: &Scene,
         y_offset: ScaledPixels,
     ) {
+        if y_offset == ScaledPixels(0.0) { // exact zero: item position unchanged
+            return self.replay(range, prev_scene);
+        }
         let offset = point(ScaledPixels(0.0), y_offset);
         for operation in &prev_scene.paint_operations[range] {
             match operation {
@@ -331,27 +334,6 @@ impl Primitive {
         }
     }
 
-    /// Replace the baked content_mask with the current viewport clip rect.
-    ///
-    /// During render-cache replay, each primitive carries the clip rect that was
-    /// computed at original paint time — which may reflect a different scroll
-    /// position. Replacing wholesale (rather than re-intersecting) is correct
-    /// because `replay_with_y_offset` always supplies the fully-computed mask
-    /// from `Window::content_mask()` for the current frame.
-    ///
-    /// Only called from `replay_with_y_offset`.
-    pub fn set_content_mask(&mut self, mask: ContentMask<ScaledPixels>) {
-        match self {
-            Primitive::Shadow(s) => s.content_mask = mask,
-            Primitive::Quad(q) => q.content_mask = mask,
-            Primitive::Path(p) => p.content_mask = mask,
-            Primitive::Underline(u) => u.content_mask = mask,
-            Primitive::MonochromeSprite(s) => s.content_mask = mask,
-            Primitive::SubpixelSprite(s) => s.content_mask = mask,
-            Primitive::PolychromeSprite(s) => s.content_mask = mask,
-            Primitive::Surface(s) => s.content_mask = mask,
-        }
-    }
 }
 
 #[cfg_attr(
