@@ -85,62 +85,43 @@ impl Scene {
             .last()
             .copied()
             .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
-        Self::push_primitive_to_batches(&mut primitive, order, self);
-        self.paint_operations
-            .push(PaintOperation::Primitive(primitive));
-    }
-
-    /// Insert a primitive without the bounds/content_mask intersection cull check.
-    /// Used during render cache replay — primitives were already validated at
-    /// original paint time. Re-culling with translated bounds and a replaced
-    /// viewport mask causes false drops (especially small text glyphs).
-    fn insert_primitive_unchecked(&mut self, mut primitive: Primitive) {
-        let order = self
-            .layer_stack
-            .last()
-            .copied()
-            .unwrap_or_else(|| self.primitive_bounds.insert(*primitive.bounds()));
-        Self::push_primitive_to_batches(&mut primitive, order, self);
-        self.paint_operations
-            .push(PaintOperation::Primitive(primitive));
-    }
-
-    fn push_primitive_to_batches(primitive: &mut Primitive, order: DrawOrder, scene: &mut Scene) {
-        match primitive {
+        match &mut primitive {
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
-                scene.shadows.push(shadow.clone());
+                self.shadows.push(shadow.clone());
             }
             Primitive::Quad(quad) => {
                 quad.order = order;
-                scene.quads.push(quad.clone());
+                self.quads.push(quad.clone());
             }
             Primitive::Path(path) => {
                 path.order = order;
-                path.id = PathId(scene.paths.len());
-                scene.paths.push(path.clone());
+                path.id = PathId(self.paths.len());
+                self.paths.push(path.clone());
             }
             Primitive::Underline(underline) => {
                 underline.order = order;
-                scene.underlines.push(underline.clone());
+                self.underlines.push(underline.clone());
             }
             Primitive::MonochromeSprite(sprite) => {
                 sprite.order = order;
-                scene.monochrome_sprites.push(sprite.clone());
+                self.monochrome_sprites.push(sprite.clone());
             }
             Primitive::SubpixelSprite(sprite) => {
                 sprite.order = order;
-                scene.subpixel_sprites.push(sprite.clone());
+                self.subpixel_sprites.push(sprite.clone());
             }
             Primitive::PolychromeSprite(sprite) => {
                 sprite.order = order;
-                scene.polychrome_sprites.push(sprite.clone());
+                self.polychrome_sprites.push(sprite.clone());
             }
             Primitive::Surface(surface) => {
                 surface.order = order;
-                scene.surfaces.push(surface.clone());
+                self.surfaces.push(surface.clone());
             }
         }
+        self.paint_operations
+            .push(PaintOperation::Primitive(primitive));
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
@@ -176,7 +157,7 @@ impl Scene {
                     let mut translated = primitive.clone();
                     translated.translate(offset);
                     translated.set_content_mask(viewport_mask.clone());
-                    self.insert_primitive_unchecked(translated);
+                    self.insert_primitive(translated);
                 }
                 PaintOperation::StartLayer(bounds) => {
                     // Layer bounds only affect draw ordering — content_mask
