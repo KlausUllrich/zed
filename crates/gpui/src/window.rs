@@ -2707,6 +2707,41 @@ impl Window {
         );
     }
 
+    /// Returns the current number of paint operations in the frame being built.
+    /// Used by List to track scene ranges for render caching.
+    pub fn scene_len(&self) -> usize {
+        self.next_frame.scene.len()
+    }
+
+    /// Replay cached scene primitives from the previous frame with a Y offset.
+    /// Used by List to skip relayout for unchanged items during scroll.
+    /// The `range` indexes into the previous frame's scene paint operations.
+    /// Returns the range of the replayed operations in the current frame's scene.
+    /// NOTE: `y_offset` is in logical `Pixels`; converted to `ScaledPixels`
+    /// using the window's current scale factor before forwarding to the scene layer.
+    pub fn replay_cached_scene_with_y_offset(
+        &mut self,
+        range: Range<usize>,
+        y_offset: Pixels,
+    ) -> Range<usize> {
+        debug_assert!(
+            range.end <= self.rendered_frame.scene.len(),
+            "cached scene range {:?} out of bounds (scene has {} ops)",
+            range,
+            self.rendered_frame.scene.len()
+        );
+        let start = self.next_frame.scene.len();
+        let scale = self.scale_factor;
+        let y_offset_scaled = ScaledPixels(y_offset.0 * scale);
+        self.next_frame.scene.replay_with_y_offset(
+            range,
+            &self.rendered_frame.scene,
+            y_offset_scaled,
+        );
+        let end = self.next_frame.scene.len();
+        start..end
+    }
+
     /// Push a text style onto the stack, and call a function with that style active.
     /// Use [`Window::text_style`] to get the current, combined text style. This method
     /// should only be called as part of element drawing.

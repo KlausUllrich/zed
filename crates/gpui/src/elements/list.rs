@@ -13,7 +13,7 @@ use crate::{
     Overflow, Pixels, Point, ScrollDelta, ScrollWheelEvent, Size, Style, StyleRefinement, Styled,
     Window, point, px, size,
 };
-use collections::VecDeque;
+use collections::{HashMap, HashSet, VecDeque};
 use refineable::Refineable as _;
 use std::{cell::Cell, cell::RefCell, ops::Range, rc::Rc, time::Instant};
 use sum_tree::{Bias, Dimensions, SumTree};
@@ -182,6 +182,14 @@ struct StateInner {
     prev_tail_scroll_max: Pixels,
     /// Timestamp of the last inertia physics update. Used for delta-time calculation.
     last_inertia_time: Option<Instant>,
+    /// Per-item scene cache: maps item index → cached scene range + Y position.
+    /// Populated during paint, consulted during layout_items to skip element construction.
+    /// Cleared by invalidate_item_cache / invalidate_all_item_caches.
+    item_scene_cache: HashMap<usize, CachedItemScene>,
+    /// Whether scene caching is active. Only enabled during scroll animation
+    /// (when interactivity is intentionally suppressed). Disabled on scroll stop
+    /// to ensure all items render Fresh with full hitboxes.
+    caching_enabled: bool,
 }
 
 /// Keeps track of a fractional scroll position within an item for restoration
@@ -191,6 +199,28 @@ struct PendingScrollFraction {
     item_ix: usize,
     /// Fractional offset (0.0 to 1.0) within the item's height.
     fraction: f32,
+}
+
+/// Cached scene data for a single list item. Enables skipping full element
+/// lifecycle (construction + layout + prepaint + paint) during scroll when
+/// item content hasn't changed.
+#[derive(Clone)]
+struct CachedItemScene {
+    /// Range of paint operations in the most recently rendered frame's scene.
+    scene_range: Range<usize>,
+    /// The Y position (logical Pixels) where this scene was last captured/replayed.
+    y_origin: Pixels,
+}
+
+/// Whether a list item should be rendered fresh or replayed from scene cache.
+enum ItemRender {
+    /// Full element lifecycle: prepaint + paint.
+    Fresh { element: AnyElement },
+    /// Skip prepaint + paint, replay cached scene with Y offset.
+    Cached {
+        scene_range: Range<usize>,
+        cached_y: Pixels,
+    },
 }
 
 /// Whether the list is scrolling from top to bottom or bottom to top.
@@ -292,8 +322,10 @@ struct LayoutItemsResponse {
 
 struct ItemLayout {
     index: usize,
-    element: AnyElement,
+    render: ItemRender,
     size: Size<Pixels>,
+    /// Absolute Y position on screen, set during prepaint.
+    y_origin: Pixels,
 }
 
 /// Frame state used by the [List] element after layout.
@@ -395,6 +427,8 @@ impl ListState {
             prev_tail_item_count: 0,
             prev_tail_scroll_max: px(0.),
             last_inertia_time: None,
+            item_scene_cache: HashMap::default(),
+            caching_enabled: false,
         })));
         this.splice(0..0, item_count);
         this
@@ -408,6 +442,28 @@ impl ListState {
         self
     }
 
+    /// Invalidate the scene cache for a single item, forcing a full re-render
+    /// on the next frame. Call when an item's content changes.
+    pub fn invalidate_item_cache(&self, index: usize) {
+        self.0.borrow_mut().item_scene_cache.remove(&index);
+    }
+
+    /// Invalidate all item scene caches and disable caching, forcing a full
+    /// re-render of every visible item on the next frame. Call when scroll stops,
+    /// viewport resizes, or any event transitions from "scrolling" to "interactive".
+    pub fn invalidate_all_item_caches(&self) {
+        let mut state = self.0.borrow_mut();
+        state.item_scene_cache.clear();
+        state.caching_enabled = false;
+    }
+
+    /// Enable or disable scene caching. When enabled, unchanged items skip
+    /// the full element lifecycle during scroll. When disabled, all items render
+    /// Fresh with full hitboxes for interactivity.
+    pub fn set_item_caching_enabled(&self, enabled: bool) {
+        self.0.borrow_mut().caching_enabled = enabled;
+    }
+
     /// Reset this instantiation of the list state.
     ///
     /// Note that this will cause scroll events to be dropped until the next paint.
@@ -419,6 +475,7 @@ impl ListState {
             state.logical_scroll_top = None;
             state.scrollbar_drag_start_height = None;
             state.smoothed_scrollbar_height = None;
+            state.item_scene_cache.clear();
             state.items.summary().count
         };
 
@@ -570,6 +627,9 @@ impl ListState {
                 *item_ix = *item_ix - (old_range.end - old_range.start) + spliced_count;
             }
         }
+
+        // Invalidate scene caches: spliced items are gone, items after have shifted.
+        state.item_scene_cache.clear();
     }
 
     /// Like [`Self::splice`], but each new item carries an estimated height for
@@ -613,6 +673,9 @@ impl ListState {
                 *item_ix = *item_ix - (old_range.end - old_range.start) + spliced_count;
             }
         }
+
+        // Invalidate scene caches: spliced items are gone, items after have shifted.
+        state.item_scene_cache.clear();
     }
 
     /// Set a handler that will be called when the list is scrolled.
@@ -1239,6 +1302,10 @@ impl StateInner {
                     let displacement = self.tail_scroll_velocity * dt;
                     let new_pos = (current_pos + px(displacement)).min(scroll_max);
                     self.set_logical_scroll_top_to(new_pos);
+                    // Self-schedule next animation frame so inertia continues
+                    // even when no external source (e.g. streaming) triggers repaints.
+                    // Matches the pattern used by animation.rs:174 and scrollbar.rs.
+                    window.request_animation_frame();
                 } else {
                     self.tail_scroll_velocity = 0.0;
                     self.set_logical_scroll_top_to(scroll_max);
@@ -1301,8 +1368,33 @@ impl StateInner {
             let mut size = item.size();
 
             // If we're within the visible area or the height wasn't cached, render and measure the item's element
-            if visible_height < available_height || size.is_none() {
-                let item_index = scroll_top.item_ix + ix;
+            let item_index = scroll_top.item_ix + ix;
+            let in_viewport = visible_height < available_height;
+
+            // Scene cache hit: item is visible, already measured, and has a cached scene.
+            // Skip element construction + Taffy layout entirely.
+            // Only visible items are cached — overdraw items exist solely for height measurement.
+            let scene_cache_hit = self.caching_enabled
+                && in_viewport
+                && size.is_some()
+                && self.item_scene_cache.contains_key(&item_index);
+
+            if scene_cache_hit {
+                // SAFETY: scene_cache_hit guarantees both size.is_some() and key presence.
+                let cached = self.item_scene_cache.get(&item_index)
+                    .expect("scene cache hit guarantees entry presence");
+                let measured_size = size.expect("cache hit requires measured size");
+                perf_cached_count += 1;
+                item_layouts.push_back(ItemLayout {
+                    index: item_index,
+                    render: ItemRender::Cached {
+                        scene_range: cached.scene_range.clone(),
+                        cached_y: cached.y_origin,
+                    },
+                    size: measured_size,
+                    y_origin: px(0.), // set during prepaint
+                });
+            } else if in_viewport || size.is_none() {
                 let item_start = Instant::now();
                 let mut element = render_item(item_index, window, cx);
                 let element_size = element.layout_as_root(available_item_space, window, cx);
@@ -1344,11 +1436,12 @@ impl StateInner {
                     }
                 }
 
-                if visible_height < available_height {
+                if in_viewport {
                     item_layouts.push_back(ItemLayout {
                         index: item_index,
-                        element,
+                        render: ItemRender::Fresh { element },
                         size: element_size,
+                        y_origin: px(0.), // set during prepaint
                     });
                     if item.contains_focused(window, cx) {
                         rendered_focused_item = true;
@@ -1402,8 +1495,9 @@ impl StateInner {
                     });
                     item_layouts.push_front(ItemLayout {
                         index: item_index,
-                        element,
+                        render: ItemRender::Fresh { element },
                         size: element_size,
+                        y_origin: px(0.), // set during prepaint
                     });
                     if item.contains_focused(window, cx) {
                         rendered_focused_item = true;
@@ -1484,8 +1578,9 @@ impl StateInner {
                     let size = element.layout_as_root(available_item_space, window, cx);
                     item_layouts.push_back(ItemLayout {
                         index: item_index,
-                        element,
+                        render: ItemRender::Fresh { element },
                         size,
+                        y_origin: px(0.), // set during prepaint
                     });
                     break;
                 }
@@ -1567,14 +1662,24 @@ impl StateInner {
                 let mut prepaint_slowest_secs: f32 = 0.0;
                 let mut prepaint_slowest_ix: usize = 0;
                 for item in &mut layout_response.item_layouts {
-                    let prepaint_item_start = Instant::now();
-                    window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                        item.element.prepaint_at(item_origin, window, cx);
-                    });
-                    let prepaint_item_elapsed = prepaint_item_start.elapsed().as_secs_f32();
-                    if prepaint_item_elapsed > prepaint_slowest_secs {
-                        prepaint_slowest_secs = prepaint_item_elapsed;
-                        prepaint_slowest_ix = item.index;
+                    item.y_origin = item_origin.y;
+
+                    match &mut item.render {
+                        ItemRender::Fresh { element } => {
+                            let prepaint_item_start = Instant::now();
+                            window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                                element.prepaint_at(item_origin, window, cx);
+                            });
+                            let prepaint_item_elapsed = prepaint_item_start.elapsed().as_secs_f32();
+                            if prepaint_item_elapsed > prepaint_slowest_secs {
+                                prepaint_slowest_secs = prepaint_item_elapsed;
+                                prepaint_slowest_ix = item.index;
+                            }
+                        }
+                        ItemRender::Cached { .. } => {
+                            // Skip prepaint — no hitboxes or dispatch nodes for cached items.
+                            // Interactivity restored when caches are invalidated on scroll stop.
+                        }
                     }
 
                     if let Some(autoscroll_bounds) = window.take_autoscroll()
@@ -1864,6 +1969,8 @@ impl Element for List {
 
             state.items = new_items;
             state.measuring_behavior.reset();
+            // Width changed — cached scenes clip to the old width's content mask.
+            state.item_scene_cache.clear();
         }
 
         let padding = style
@@ -1896,11 +2003,53 @@ impl Element for List {
         cx: &mut App,
     ) {
         let current_view = window.current_view();
+
+        // Collect scene ranges for fresh items and replay cached items.
+        // Updated after the paint loop to avoid borrow conflicts with ListState.
+        let mut scene_updates: Vec<(usize, Range<usize>, Pixels)> = Vec::new();
+
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             for item in &mut prepaint.layout.item_layouts {
-                item.element.paint(window, cx);
+                match &mut item.render {
+                    ItemRender::Fresh { element } => {
+                        let start = window.scene_len();
+                        element.paint(window, cx);
+                        let end = window.scene_len();
+                        scene_updates.push((item.index, start..end, item.y_origin));
+                    }
+                    ItemRender::Cached {
+                        scene_range,
+                        cached_y,
+                    } => {
+                        let y_delta = item.y_origin - *cached_y;
+                        let new_range = window
+                            .replay_cached_scene_with_y_offset(scene_range.clone(), y_delta);
+                        scene_updates.push((item.index, new_range, item.y_origin));
+                    }
+                }
             }
         });
+
+        // Update scene cache with new ranges from this frame (only when caching is active).
+        {
+            let mut state = self.state.0.borrow_mut();
+            if state.caching_enabled {
+                // Evict entries for items no longer visible.
+                let visible_indices: HashSet<usize> = scene_updates
+                    .iter()
+                    .map(|(index, _, _)| *index)
+                    .collect();
+                state
+                    .item_scene_cache
+                    .retain(|index, _| visible_indices.contains(index));
+                // Insert/update entries for currently visible items.
+                for (index, range, y_origin) in scene_updates {
+                    state
+                        .item_scene_cache
+                        .insert(index, CachedItemScene { scene_range: range, y_origin });
+                }
+            }
+        }
 
         let list_state = self.state.clone();
         let height = bounds.size.height;
