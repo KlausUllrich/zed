@@ -2158,7 +2158,29 @@ impl Element for List {
         // Only capture primitive fates for the first cached item (to limit noise).
         let mut first_cached_debug_done = false;
 
-        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        // When caching is active, expand the content_mask vertically so edge items
+        // get full scene captures. Without expansion, insert_primitive culls
+        // primitives at viewport edges (bounds ∩ content_mask = empty at capture time).
+        let caching_enabled = self.state.0.borrow().caching_enabled;
+        let paint_bounds = if caching_enabled {
+            let max_item_height = prepaint
+                .layout
+                .item_layouts
+                .iter()
+                .map(|item| item.size.height)
+                .fold(px(0.), |a, b| if b > a { b } else { a });
+            Bounds::new(
+                point(bounds.origin.x, bounds.origin.y - max_item_height),
+                size(
+                    bounds.size.width,
+                    bounds.size.height + max_item_height * 2.0,
+                ),
+            )
+        } else {
+            bounds
+        };
+
+        window.with_content_mask(Some(ContentMask { bounds: paint_bounds }), |window| {
             for item in &mut prepaint.layout.item_layouts {
                 match &mut item.render {
                     ItemRender::Fresh { element } => {
