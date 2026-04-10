@@ -2713,6 +2713,20 @@ impl Window {
         self.next_frame.scene.len()
     }
 
+    /// Returns the current text layout index for tracking which layouts
+    /// belong to a given element. Used by List render caching to record
+    /// per-item text layout ranges.
+    pub(crate) fn text_layout_index(&self) -> LineLayoutIndex {
+        self.text_system.layout_index()
+    }
+
+    /// Preserve text layouts from the previous frame so they survive the
+    /// frame-transition eviction. Without this, cached glyph sprites would
+    /// reference stale atlas entries after the text layout cache is pruned.
+    pub(crate) fn reuse_text_layouts(&self, range: Range<LineLayoutIndex>) {
+        self.text_system.reuse_layouts(range);
+    }
+
     /// Replay cached scene primitives from the previous frame with a Y offset.
     /// Used by List to skip relayout for unchanged items during scroll.
     /// The `range` indexes into the previous frame's scene paint operations.
