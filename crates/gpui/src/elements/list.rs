@@ -1690,13 +1690,10 @@ impl StateInner {
                                 prepaint_slowest_ix = item.index;
                             }
                         }
-                        ItemRender::Cached {
-                            line_layout_range, ..
-                        } => {
-                            // Preserve text layouts from the previous frame so glyph atlas
-                            // entries survive. Without this, cached text sprites reference
-                            // stale atlas tiles and render as invisible.
-                            window.reuse_text_layouts(line_layout_range.clone());
+                        ItemRender::Cached { .. } => {
+                            // Text layout reuse happens during paint (see below).
+                            // No prepaint state needed for cached items — hitboxes and
+                            // dispatch nodes are restored when caches are invalidated.
                         }
                     }
 
@@ -2047,8 +2044,12 @@ impl Element for List {
                         cached_y,
                         line_layout_range,
                     } => {
-                        // Reuse text layouts during paint too (matching View-level pattern).
+                        // Reuse text layouts — preserves glyph atlas entries.
+                        // Capture new indices so the cache stays valid for the next frame
+                        // (reuse_layouts pushes to current_frame at new positions).
+                        let new_text_start = window.text_layout_index();
                         window.reuse_text_layouts(line_layout_range.clone());
+                        let new_text_end = window.text_layout_index();
                         let y_delta = item.y_origin - *cached_y;
                         let new_range = window
                             .replay_cached_scene_with_y_offset(scene_range.clone(), y_delta);
@@ -2056,7 +2057,7 @@ impl Element for List {
                             item.index,
                             new_range,
                             item.y_origin,
-                            line_layout_range.clone(),
+                            new_text_start..new_text_end,
                         ));
                     }
                 }
