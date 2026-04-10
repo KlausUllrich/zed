@@ -2733,10 +2733,24 @@ impl Window {
         let start = self.next_frame.scene.len();
         let scale = self.scale_factor;
         let y_offset_scaled = ScaledPixels(y_offset.0 * scale);
+        let mask = self.content_mask();
+        let viewport_mask = ContentMask {
+            bounds: Bounds::new(
+                point(
+                    ScaledPixels(mask.bounds.origin.x.0 * scale),
+                    ScaledPixels(mask.bounds.origin.y.0 * scale),
+                ),
+                size(
+                    ScaledPixels(mask.bounds.size.width.0 * scale),
+                    ScaledPixels(mask.bounds.size.height.0 * scale),
+                ),
+            ),
+        };
         self.next_frame.scene.replay_with_y_offset(
             range,
             &self.rendered_frame.scene,
             y_offset_scaled,
+            Some(viewport_mask),
         );
         let end = self.next_frame.scene.len();
         start..end
@@ -2764,10 +2778,24 @@ impl Window {
         let start = self.next_frame.scene.len();
         let scale = self.scale_factor;
         let y_offset_scaled = ScaledPixels(y_offset.0 * scale);
+        let mask = self.content_mask();
+        let viewport_mask = ContentMask {
+            bounds: Bounds::new(
+                point(
+                    ScaledPixels(mask.bounds.origin.x.0 * scale),
+                    ScaledPixels(mask.bounds.origin.y.0 * scale),
+                ),
+                size(
+                    ScaledPixels(mask.bounds.size.width.0 * scale),
+                    ScaledPixels(mask.bounds.size.height.0 * scale),
+                ),
+            ),
+        };
         let fates = self.next_frame.scene.replay_with_y_offset_debug(
             range,
             &self.rendered_frame.scene,
             y_offset_scaled,
+            Some(viewport_mask),
         );
         let end = self.next_frame.scene.len();
         (start..end, fates)

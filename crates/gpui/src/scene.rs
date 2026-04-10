@@ -142,8 +142,9 @@ impl Scene {
         range: Range<usize>,
         prev_scene: &Scene,
         y_offset: ScaledPixels,
+        viewport_mask: Option<ContentMask<ScaledPixels>>,
     ) {
-        if y_offset == ScaledPixels(0.0) {
+        if y_offset == ScaledPixels(0.0) && viewport_mask.is_none() {
             return self.replay(range, prev_scene);
         }
         let offset = point(ScaledPixels(0.0), y_offset);
@@ -152,6 +153,9 @@ impl Scene {
                 PaintOperation::Primitive(primitive) => {
                     let mut translated = primitive.clone();
                     translated.translate(offset);
+                    if let Some(ref mask) = viewport_mask {
+                        translated.set_content_mask(mask.clone());
+                    }
                     self.insert_primitive(translated);
                 }
                 PaintOperation::StartLayer(bounds) => {
@@ -171,6 +175,7 @@ impl Scene {
         range: Range<usize>,
         prev_scene: &Scene,
         y_offset: ScaledPixels,
+        viewport_mask: Option<ContentMask<ScaledPixels>>,
     ) -> Vec<(
         &'static str,           // type_name
         (f32, f32, f32, f32),   // bounds_before
@@ -194,6 +199,9 @@ impl Scene {
 
                     let mut translated = primitive.clone();
                     translated.translate(offset);
+                    if let Some(ref mask) = viewport_mask {
+                        translated.set_content_mask(mask.clone());
+                    }
 
                     let bt = translated.bounds();
                     let bounds_after = (bt.origin.x.0, bt.origin.y.0, bt.size.width.0, bt.size.height.0);
@@ -400,6 +408,23 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+        }
+    }
+
+    /// Replace the baked content_mask with a new viewport mask.
+    /// Used during cached replay to substitute the capture-time mask
+    /// with the current viewport mask, preventing GPU-level clipping
+    /// from stale card-level masks.
+    pub fn set_content_mask(&mut self, mask: ContentMask<ScaledPixels>) {
+        match self {
+            Primitive::Shadow(s) => s.content_mask = mask,
+            Primitive::Quad(q) => q.content_mask = mask,
+            Primitive::Path(p) => p.content_mask = mask,
+            Primitive::Underline(u) => u.content_mask = mask,
+            Primitive::MonochromeSprite(s) => s.content_mask = mask,
+            Primitive::SubpixelSprite(s) => s.content_mask = mask,
+            Primitive::PolychromeSprite(s) => s.content_mask = mask,
+            Primitive::Surface(s) => s.content_mask = mask,
         }
     }
 }
