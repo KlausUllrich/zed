@@ -590,6 +590,11 @@ pub struct RequestFrameOptions {
     pub require_presentation: bool,
     /// Force refresh of all rendering states when true.
     pub force_render: bool,
+    /// Actual presentation timestamp from wp_presentation_time (monotonic nanos).
+    /// When available, provides the exact VSync time of the previous frame,
+    /// enabling accurate animation dt computation instead of wall-clock estimation.
+    /// None when the compositor doesn't support wp_presentation_time or on non-Wayland.
+    pub presentation_time_nanos: Option<u64>,
 }
 
 #[expect(missing_docs)]

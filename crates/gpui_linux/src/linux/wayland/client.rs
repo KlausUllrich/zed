@@ -52,6 +52,9 @@ use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::{
 use wayland_protocols::wp::text_input::zv3::client::{
     zwp_text_input_manager_v3, zwp_text_input_v3,
 };
+use wayland_protocols::wp::presentation_time::client::{
+    wp_presentation, wp_presentation_feedback,
+};
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 use wayland_protocols::xdg::activation::v1::client::{xdg_activation_token_v1, xdg_activation_v1};
 use wayland_protocols::xdg::decoration::zv1::client::{
@@ -129,6 +132,7 @@ pub struct Globals {
     pub text_input_manager: Option<zwp_text_input_manager_v3::ZwpTextInputManagerV3>,
     pub gesture_manager: Option<zwp_pointer_gestures_v1::ZwpPointerGesturesV1>,
     pub dialog: Option<xdg_wm_dialog_v1::XdgWmDialogV1>,
+    pub presentation: Option<wp_presentation::WpPresentation>,
     pub executor: ForegroundExecutor,
 }
 
@@ -170,6 +174,7 @@ impl Globals {
             text_input_manager: globals.bind(&qh, 1..=1, ()).ok(),
             gesture_manager: globals.bind(&qh, 1..=3, ()).ok(),
             dialog: globals.bind(&qh, dialog_v..=dialog_v, ()).ok(),
+            presentation: globals.bind(&qh, 1..=1, ()).ok(),
             executor,
             qh,
         }
@@ -1078,6 +1083,7 @@ delegate_noop!(WaylandClientStatePtr: ignore wl_shm::WlShm);
 delegate_noop!(WaylandClientStatePtr: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(WaylandClientStatePtr: ignore wl_buffer::WlBuffer);
 delegate_noop!(WaylandClientStatePtr: ignore wl_region::WlRegion);
+delegate_noop!(WaylandClientStatePtr: ignore wp_presentation::WpPresentation);
 delegate_noop!(WaylandClientStatePtr: ignore wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1);
 delegate_noop!(WaylandClientStatePtr: ignore zxdg_decoration_manager_v1::ZxdgDecorationManagerV1);
 delegate_noop!(WaylandClientStatePtr: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
@@ -1086,6 +1092,39 @@ delegate_noop!(WaylandClientStatePtr: ignore zwp_text_input_manager_v3::ZwpTextI
 delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_blur::OrgKdeKwinBlur);
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewporter::WpViewporter);
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewport::WpViewport);
+
+impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, ObjectId>
+    for WaylandClientStatePtr
+{
+    fn event(
+        state: &mut WaylandClientStatePtr,
+        _: &wp_presentation_feedback::WpPresentationFeedback,
+        event: wp_presentation_feedback::Event,
+        surface_id: &ObjectId,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wp_presentation_feedback::Event::Presented {
+            tv_sec_hi,
+            tv_sec_lo,
+            tv_nsec,
+            ..
+        } = event
+        {
+            // wp_presentation_time splits seconds into two 32-bit fields to avoid
+            // Year 2038 overflow in 32-bit compositors. Reconstruct the full 64-bit value.
+            let secs = (tv_sec_hi as u64) << 32 | tv_sec_lo as u64;
+            let nanos = secs * 1_000_000_000 + tv_nsec as u64;
+
+            let client = state.get_client();
+            let mut state = client.borrow_mut();
+            if let Some(window) = get_window(&mut state, surface_id) {
+                drop(state);
+                window.set_presentation_time(nanos);
+            }
+        }
+    }
+}
 
 impl Dispatch<WlCallback, ObjectId> for WaylandClientStatePtr {
     fn event(

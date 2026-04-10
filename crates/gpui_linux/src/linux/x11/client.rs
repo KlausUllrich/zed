@@ -1891,6 +1891,7 @@ impl X11ClientState {
                             window.refresh(RequestFrameOptions {
                                 require_presentation: expose_event_received,
                                 force_render,
+                                presentation_time_nanos: None,
                             });
                         }
                         xcb_connection
