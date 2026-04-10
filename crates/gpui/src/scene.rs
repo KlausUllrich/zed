@@ -287,14 +287,13 @@ impl Primitive {
             Primitive::MonochromeSprite(s) => {
                 s.bounds.origin += offset;
                 s.content_mask.bounds.origin += offset;
-                s.transformation.translation[0] += offset.x.0;
-                s.transformation.translation[1] += offset.y.0;
+                // Do NOT update transformation.translation — the GPU shader
+                // computes position = bounds.origin + transformation.translation.
+                // Updating both would double the offset for text glyphs.
             }
             Primitive::SubpixelSprite(s) => {
                 s.bounds.origin += offset;
                 s.content_mask.bounds.origin += offset;
-                s.transformation.translation[0] += offset.x.0;
-                s.transformation.translation[1] += offset.y.0;
             }
             Primitive::PolychromeSprite(s) => {
                 s.bounds.origin += offset;
