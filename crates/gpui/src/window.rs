@@ -2742,6 +2742,37 @@ impl Window {
         start..end
     }
 
+    /// Like `replay_cached_scene_with_y_offset` but also captures per-primitive fate data.
+    /// Only called when render cache debug callback is active.
+    pub fn replay_cached_scene_with_y_offset_debug(
+        &mut self,
+        range: Range<usize>,
+        y_offset: Pixels,
+    ) -> (
+        Range<usize>,
+        Vec<(
+            &'static str,
+            (f32, f32, f32, f32),
+            (f32, f32, f32, f32),
+            (f32, f32, f32, f32),
+            (f32, f32, f32, f32),
+            (f32, f32, f32, f32),
+            bool,
+            Option<(f32, f32)>,
+        )>,
+    ) {
+        let start = self.next_frame.scene.len();
+        let scale = self.scale_factor;
+        let y_offset_scaled = ScaledPixels(y_offset.0 * scale);
+        let fates = self.next_frame.scene.replay_with_y_offset_debug(
+            range,
+            &self.rendered_frame.scene,
+            y_offset_scaled,
+        );
+        let end = self.next_frame.scene.len();
+        (start..end, fates)
+    }
+
     /// Push a text style onto the stack, and call a function with that style active.
     /// Use [`Window::text_style`] to get the current, combined text style. This method
     /// should only be called as part of element drawing.

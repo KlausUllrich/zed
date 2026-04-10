@@ -164,6 +164,63 @@ impl Scene {
         }
     }
 
+    /// Like `replay_with_y_offset` but also captures per-primitive fate data for debugging.
+    /// Returns (new_range, fate_data). Only called when render cache debug is active.
+    pub fn replay_with_y_offset_debug(
+        &mut self,
+        range: Range<usize>,
+        prev_scene: &Scene,
+        y_offset: ScaledPixels,
+    ) -> Vec<(
+        &'static str,           // type_name
+        (f32, f32, f32, f32),   // bounds_before
+        (f32, f32, f32, f32),   // bounds_after
+        (f32, f32, f32, f32),   // mask_before
+        (f32, f32, f32, f32),   // mask_after
+        (f32, f32, f32, f32),   // intersection
+        bool,                    // survived
+        Option<(f32, f32)>,     // transform_translation
+    )> {
+        let offset = point(ScaledPixels(0.0), y_offset);
+        let mut fates = Vec::new();
+        for operation in &prev_scene.paint_operations[range.clone()] {
+            match operation {
+                PaintOperation::Primitive(primitive) => {
+                    let type_name = primitive.type_name();
+                    let b = primitive.bounds();
+                    let bounds_before = (b.origin.x.0, b.origin.y.0, b.size.width.0, b.size.height.0);
+                    let m = &primitive.content_mask().bounds;
+                    let mask_before = (m.origin.x.0, m.origin.y.0, m.size.width.0, m.size.height.0);
+
+                    let mut translated = primitive.clone();
+                    translated.translate(offset);
+
+                    let bt = translated.bounds();
+                    let bounds_after = (bt.origin.x.0, bt.origin.y.0, bt.size.width.0, bt.size.height.0);
+                    let mt = &translated.content_mask().bounds;
+                    let mask_after = (mt.origin.x.0, mt.origin.y.0, mt.size.width.0, mt.size.height.0);
+
+                    let clipped = bt.intersect(&mt);
+                    let intersection = (clipped.origin.x.0, clipped.origin.y.0, clipped.size.width.0, clipped.size.height.0);
+                    let survived = !clipped.is_empty();
+
+                    let transform_translation = translated.transform_translation();
+
+                    fates.push((type_name, bounds_before, bounds_after, mask_before, mask_after, intersection, survived, transform_translation));
+
+                    self.insert_primitive(translated);
+                }
+                PaintOperation::StartLayer(bounds) => {
+                    let mut translated_bounds = *bounds;
+                    translated_bounds.origin += offset;
+                    self.push_layer(translated_bounds);
+                }
+                PaintOperation::EndLayer => self.pop_layer(),
+            }
+        }
+        fates
+    }
+
     pub fn finish(&mut self) {
         self.shadows.sort_by_key(|shadow| shadow.order);
         self.quads.sort_by_key(|quad| quad.order);
@@ -258,6 +315,33 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+        }
+    }
+
+    /// Human-readable name for debug display.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Primitive::Shadow(_) => "Shadow",
+            Primitive::Quad(_) => "Quad",
+            Primitive::Path(_) => "Path",
+            Primitive::Underline(_) => "Underline",
+            Primitive::MonochromeSprite(_) => "MonochromeSprite",
+            Primitive::SubpixelSprite(_) => "SubpixelSprite",
+            Primitive::PolychromeSprite(_) => "PolychromeSprite",
+            Primitive::Surface(_) => "Surface",
+        }
+    }
+
+    /// Return transformation.translation for sprite types, None for others.
+    pub fn transform_translation(&self) -> Option<(f32, f32)> {
+        match self {
+            Primitive::MonochromeSprite(s) => {
+                Some((s.transformation.translation[0], s.transformation.translation[1]))
+            }
+            Primitive::SubpixelSprite(s) => {
+                Some((s.transformation.translation[0], s.transformation.translation[1]))
+            }
+            _ => None,
         }
     }
 

@@ -107,6 +107,106 @@ fn emit_layout_perf(telemetry: &LayoutPerfTelemetry) {
     });
 }
 
+// ── Render Cache Debug Telemetry ────────────────────────────────────────────
+
+/// Per-frame summary of render cache behavior.
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct RenderCacheFrameData {
+    pub caching_enabled: bool,
+    pub fresh_count: u32,
+    pub cached_count: u32,
+    pub total_scene_ops: usize,
+    pub fresh_scene_ops: usize,
+    pub replay_scene_ops: usize,
+}
+
+/// Per-item render cache data for one visible list item.
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct RenderCacheItemData {
+    pub item_index: usize,
+    pub render_mode: &'static str,
+    pub y_origin: f32,
+    pub cached_y: f32,
+    pub y_delta: f32,
+    pub scene_range_start: usize,
+    pub scene_range_end: usize,
+    pub measured_height: f32,
+}
+
+/// Fate of a single primitive during replay (from scene.rs replay_with_y_offset).
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct PrimitiveFateData {
+    pub item_index: usize,
+    pub primitive_type: &'static str,
+    pub bounds_before: (f32, f32, f32, f32),
+    pub bounds_after: (f32, f32, f32, f32),
+    pub mask_before: (f32, f32, f32, f32),
+    pub mask_after: (f32, f32, f32, f32),
+    pub intersection: (f32, f32, f32, f32),
+    pub survived: bool,
+    pub transform_translation: Option<(f32, f32)>,
+}
+
+/// Data emitted when render caches are invalidated (scroll stop).
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct CacheTransitionData {
+    pub trigger: &'static str,
+    pub items: Vec<TransitionItemData>,
+}
+
+/// Per-item comparison when transitioning from Cached → Fresh.
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct TransitionItemData {
+    pub item_index: usize,
+    pub cached_height: f32,
+    pub fresh_height: f32,
+    pub height_delta: f32,
+    pub height_collapsed: bool,
+}
+
+/// Aggregate event emitted to the debug callback.
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub enum RenderCacheDebugEvent {
+    Frame {
+        summary: RenderCacheFrameData,
+        items: Vec<RenderCacheItemData>,
+        primitive_fates: Vec<PrimitiveFateData>,
+    },
+    Transition(CacheTransitionData),
+}
+
+type RenderCacheDebugCallback = Box<dyn Fn(&RenderCacheDebugEvent) + 'static>;
+
+thread_local! {
+    static RENDER_CACHE_DEBUG_CB: Cell<Option<*const RenderCacheDebugCallback>> = const { Cell::new(None) };
+}
+
+/// Register a callback for render cache debug telemetry.
+/// Call once at app startup. Gate behind debug.render_cache_debug config.
+pub fn set_render_cache_debug_callback(callback: RenderCacheDebugCallback) {
+    let leaked = Box::leak(Box::new(callback));
+    RENDER_CACHE_DEBUG_CB.with(|cell| cell.set(Some(leaked as *const RenderCacheDebugCallback)));
+}
+
+fn render_cache_debug_active() -> bool {
+    RENDER_CACHE_DEBUG_CB.with(|cell| cell.get().is_some())
+}
+
+fn emit_render_cache_debug(event: &RenderCacheDebugEvent) {
+    RENDER_CACHE_DEBUG_CB.with(|cell| {
+        if let Some(ptr) = cell.get() {
+            let cb = unsafe { &*ptr };
+            cb(event);
+        }
+    });
+}
+
 /// Minimum velocity threshold for Tail mode inertia (px/s).
 /// Below this, movement is imperceptible and we snap to scroll_max.
 /// Referenced by both `layout_items()` and `is_smooth_scrolling()`.
@@ -458,7 +558,29 @@ impl ListState {
     /// re-render of every visible item on the next frame. Call when scroll stops,
     /// viewport resizes, or any event transitions from "scrolling" to "interactive".
     pub fn invalidate_all_item_caches(&self) {
+        self.invalidate_all_item_caches_with_trigger("unknown");
+    }
+
+    /// Invalidate with a named trigger for debug tracking.
+    pub fn invalidate_all_item_caches_with_trigger(&self, trigger: &'static str) {
         let mut state = self.0.borrow_mut();
+        if render_cache_debug_active() && !state.item_scene_cache.is_empty() {
+            let items: Vec<TransitionItemData> = state
+                .item_scene_cache
+                .iter()
+                .map(|(index, _cached)| TransitionItemData {
+                    item_index: *index,
+                    cached_height: 0.0, // height not tracked in scene cache
+                    fresh_height: 0.0,  // will be known on next Fresh frame
+                    height_delta: 0.0,
+                    height_collapsed: false,
+                })
+                .collect();
+            emit_render_cache_debug(&RenderCacheDebugEvent::Transition(CacheTransitionData {
+                trigger,
+                items,
+            }));
+        }
         state.item_scene_cache.clear();
         state.caching_enabled = false;
     }
@@ -2026,6 +2148,15 @@ impl Element for List {
         // Updated after the paint loop to avoid borrow conflicts with ListState.
         let mut scene_updates: Vec<(usize, Range<usize>, Pixels, Range<PrepaintStateIndex>)> =
             Vec::new();
+        let debug_active = render_cache_debug_active();
+        let mut debug_items: Vec<RenderCacheItemData> = Vec::new();
+        let mut debug_fates: Vec<PrimitiveFateData> = Vec::new();
+        let mut fresh_scene_ops: usize = 0;
+        let mut replay_scene_ops: usize = 0;
+        let mut fresh_count: u32 = 0;
+        let mut cached_count: u32 = 0;
+        // Only capture primitive fates for the first cached item (to limit noise).
+        let mut first_cached_debug_done = false;
 
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             for item in &mut prepaint.layout.item_layouts {
@@ -2034,6 +2165,21 @@ impl Element for List {
                         let start = window.scene_len();
                         element.paint(window, cx);
                         let end = window.scene_len();
+                        let ops = end - start;
+                        fresh_scene_ops += ops;
+                        fresh_count += 1;
+                        if debug_active {
+                            debug_items.push(RenderCacheItemData {
+                                item_index: item.index,
+                                render_mode: "Fresh",
+                                y_origin: item.y_origin.0,
+                                cached_y: 0.0,
+                                y_delta: 0.0,
+                                scene_range_start: start,
+                                scene_range_end: end,
+                                measured_height: item.size.height.0,
+                            });
+                        }
                         scene_updates.push((
                             item.index,
                             start..end,
@@ -2047,18 +2193,93 @@ impl Element for List {
                         ..
                     } => {
                         let y_delta = item.y_origin - *cached_y;
-                        let new_range = window
-                            .replay_cached_scene_with_y_offset(scene_range.clone(), y_delta);
-                        scene_updates.push((
-                            item.index,
-                            new_range,
-                            item.y_origin,
-                            item.prepaint_range.clone(),
-                        ));
+                        cached_count += 1;
+
+                        // Use debug replay for first cached item when debug is active.
+                        if debug_active && !first_cached_debug_done {
+                            first_cached_debug_done = true;
+                            let (new_range, fates) = window
+                                .replay_cached_scene_with_y_offset_debug(
+                                    scene_range.clone(),
+                                    y_delta,
+                                );
+                            let ops = new_range.end - new_range.start;
+                            replay_scene_ops += ops;
+                            for (ptype, bb, ba, mb, ma, inter, surv, tt) in fates {
+                                debug_fates.push(PrimitiveFateData {
+                                    item_index: item.index,
+                                    primitive_type: ptype,
+                                    bounds_before: bb,
+                                    bounds_after: ba,
+                                    mask_before: mb,
+                                    mask_after: ma,
+                                    intersection: inter,
+                                    survived: surv,
+                                    transform_translation: tt,
+                                });
+                            }
+                            debug_items.push(RenderCacheItemData {
+                                item_index: item.index,
+                                render_mode: "Cached",
+                                y_origin: item.y_origin.0,
+                                cached_y: cached_y.0,
+                                y_delta: y_delta.0,
+                                scene_range_start: scene_range.start,
+                                scene_range_end: scene_range.end,
+                                measured_height: item.size.height.0,
+                            });
+                            scene_updates.push((
+                                item.index,
+                                new_range,
+                                item.y_origin,
+                                item.prepaint_range.clone(),
+                            ));
+                        } else {
+                            let new_range = window
+                                .replay_cached_scene_with_y_offset(scene_range.clone(), y_delta);
+                            let ops = new_range.end - new_range.start;
+                            replay_scene_ops += ops;
+                            if debug_active {
+                                debug_items.push(RenderCacheItemData {
+                                    item_index: item.index,
+                                    render_mode: "Cached",
+                                    y_origin: item.y_origin.0,
+                                    cached_y: cached_y.0,
+                                    y_delta: y_delta.0,
+                                    scene_range_start: scene_range.start,
+                                    scene_range_end: scene_range.end,
+                                    measured_height: item.size.height.0,
+                                });
+                            }
+                            scene_updates.push((
+                                item.index,
+                                new_range,
+                                item.y_origin,
+                                item.prepaint_range.clone(),
+                            ));
+                        }
                     }
                 }
             }
         });
+
+        // Emit render cache debug event.
+        if debug_active {
+            let caching_enabled = self.state.0.borrow().caching_enabled;
+            let total_scene_ops = window.scene_len();
+            emit_render_cache_debug(&RenderCacheDebugEvent::Frame {
+                summary: RenderCacheFrameData {
+                    caching_enabled,
+                    fresh_count,
+                    cached_count,
+                    total_scene_ops,
+                    fresh_scene_ops,
+                    replay_scene_ops,
+                },
+                items: debug_items,
+                primitive_fates: debug_fates,
+            });
+        }
 
         // Update scene cache with new ranges from this frame (only when caching is active).
         {
