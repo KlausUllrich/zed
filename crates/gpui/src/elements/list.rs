@@ -10,8 +10,8 @@
 use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Edges, Element, EntityId,
     FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
-    Overflow, Pixels, Point, ScrollDelta, ScrollWheelEvent, Size, Style, StyleRefinement, Styled,
-    Window, point, px, size,
+    LineLayoutIndex, Overflow, Pixels, Point, ScrollDelta, ScrollWheelEvent, Size, Style,
+    StyleRefinement, Styled, Window, point, px, size,
 };
 use collections::{HashMap, HashSet, VecDeque};
 use refineable::Refineable as _;
@@ -210,6 +210,9 @@ struct CachedItemScene {
     scene_range: Range<usize>,
     /// The Y position (logical Pixels) where this scene was last captured/replayed.
     y_origin: Pixels,
+    /// Range of text layouts used by this item (prepaint + paint combined).
+    /// Must be reused each frame to prevent the text system from evicting them.
+    line_layout_range: Range<LineLayoutIndex>,
 }
 
 /// Whether a list item should be rendered fresh or replayed from scene cache.
@@ -220,6 +223,7 @@ enum ItemRender {
     Cached {
         scene_range: Range<usize>,
         cached_y: Pixels,
+        line_layout_range: Range<LineLayoutIndex>,
     },
 }
 
@@ -326,6 +330,10 @@ struct ItemLayout {
     size: Size<Pixels>,
     /// Absolute Y position on screen, set during prepaint.
     y_origin: Pixels,
+    /// Text layout index at the start of this item's prepaint.
+    /// Combined with the end index (captured after paint) to form the
+    /// line_layout_range stored in the scene cache.
+    text_layout_start: LineLayoutIndex,
 }
 
 /// Frame state used by the [List] element after layout.
@@ -1390,9 +1398,11 @@ impl StateInner {
                     render: ItemRender::Cached {
                         scene_range: cached.scene_range.clone(),
                         cached_y: cached.y_origin,
+                        line_layout_range: cached.line_layout_range.clone(),
                     },
                     size: measured_size,
                     y_origin: px(0.), // set during prepaint
+                    text_layout_start: LineLayoutIndex::default(), // not used for Cached
                 });
             } else if in_viewport || size.is_none() {
                 let item_start = Instant::now();
@@ -1442,6 +1452,7 @@ impl StateInner {
                         render: ItemRender::Fresh { element },
                         size: element_size,
                         y_origin: px(0.), // set during prepaint
+                        text_layout_start: LineLayoutIndex::default(), // set during prepaint
                     });
                     if item.contains_focused(window, cx) {
                         rendered_focused_item = true;
@@ -1498,6 +1509,7 @@ impl StateInner {
                         render: ItemRender::Fresh { element },
                         size: element_size,
                         y_origin: px(0.), // set during prepaint
+                        text_layout_start: LineLayoutIndex::default(), // set during prepaint
                     });
                     if item.contains_focused(window, cx) {
                         rendered_focused_item = true;
@@ -1581,6 +1593,7 @@ impl StateInner {
                         render: ItemRender::Fresh { element },
                         size,
                         y_origin: px(0.), // set during prepaint
+                        text_layout_start: LineLayoutIndex::default(), // set during prepaint
                     });
                     break;
                 }
@@ -1666,6 +1679,7 @@ impl StateInner {
 
                     match &mut item.render {
                         ItemRender::Fresh { element } => {
+                            item.text_layout_start = window.text_layout_index();
                             let prepaint_item_start = Instant::now();
                             window.with_content_mask(Some(ContentMask { bounds }), |window| {
                                 element.prepaint_at(item_origin, window, cx);
@@ -1676,9 +1690,13 @@ impl StateInner {
                                 prepaint_slowest_ix = item.index;
                             }
                         }
-                        ItemRender::Cached { .. } => {
-                            // Skip prepaint — no hitboxes or dispatch nodes for cached items.
-                            // Interactivity restored when caches are invalidated on scroll stop.
+                        ItemRender::Cached {
+                            line_layout_range, ..
+                        } => {
+                            // Preserve text layouts from the previous frame so glyph atlas
+                            // entries survive. Without this, cached text sprites reference
+                            // stale atlas tiles and render as invisible.
+                            window.reuse_text_layouts(line_layout_range.clone());
                         }
                     }
 
@@ -2004,9 +2022,10 @@ impl Element for List {
     ) {
         let current_view = window.current_view();
 
-        // Collect scene ranges for fresh items and replay cached items.
+        // Collect scene ranges + text layout ranges for fresh items and replay cached items.
         // Updated after the paint loop to avoid borrow conflicts with ListState.
-        let mut scene_updates: Vec<(usize, Range<usize>, Pixels)> = Vec::new();
+        let mut scene_updates: Vec<(usize, Range<usize>, Pixels, Range<LineLayoutIndex>)> =
+            Vec::new();
 
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             for item in &mut prepaint.layout.item_layouts {
@@ -2015,16 +2034,30 @@ impl Element for List {
                         let start = window.scene_len();
                         element.paint(window, cx);
                         let end = window.scene_len();
-                        scene_updates.push((item.index, start..end, item.y_origin));
+                        let text_end = window.text_layout_index();
+                        scene_updates.push((
+                            item.index,
+                            start..end,
+                            item.y_origin,
+                            item.text_layout_start.clone()..text_end,
+                        ));
                     }
                     ItemRender::Cached {
                         scene_range,
                         cached_y,
+                        line_layout_range,
                     } => {
+                        // Reuse text layouts during paint too (matching View-level pattern).
+                        window.reuse_text_layouts(line_layout_range.clone());
                         let y_delta = item.y_origin - *cached_y;
                         let new_range = window
                             .replay_cached_scene_with_y_offset(scene_range.clone(), y_delta);
-                        scene_updates.push((item.index, new_range, item.y_origin));
+                        scene_updates.push((
+                            item.index,
+                            new_range,
+                            item.y_origin,
+                            line_layout_range.clone(),
+                        ));
                     }
                 }
             }
@@ -2037,16 +2070,21 @@ impl Element for List {
                 // Evict entries for items no longer visible.
                 let visible_indices: HashSet<usize> = scene_updates
                     .iter()
-                    .map(|(index, _, _)| *index)
+                    .map(|(index, _, _, _)| *index)
                     .collect();
                 state
                     .item_scene_cache
                     .retain(|index, _| visible_indices.contains(index));
                 // Insert/update entries for currently visible items.
-                for (index, range, y_origin) in scene_updates {
-                    state
-                        .item_scene_cache
-                        .insert(index, CachedItemScene { scene_range: range, y_origin });
+                for (index, range, y_origin, line_layout_range) in scene_updates {
+                    state.item_scene_cache.insert(
+                        index,
+                        CachedItemScene {
+                            scene_range: range,
+                            y_origin,
+                            line_layout_range,
+                        },
+                    );
                 }
             }
         }
