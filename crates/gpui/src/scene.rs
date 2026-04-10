@@ -138,10 +138,11 @@ impl Scene {
     /// Used by list render caching: items that haven't changed content can have
     /// their paint commands replayed at a different scroll position.
     ///
-    /// `current_content_mask` is the list's current viewport clip rect. Each replayed
-    /// primitive's baked content_mask is replaced with this value so that clipping
-    /// reflects the current viewport rather than the stale intersection from the
-    /// original paint frame.
+    /// `viewport_mask` is the list's current viewport clip rect. After translating
+    /// each primitive (which moves both bounds AND content_mask), the translated
+    /// content_mask is intersected with the viewport. This preserves inner
+    /// overflow_hidden clipping (moves with content) while restoring viewport-
+    /// level clipping (intersect with current viewport bounds).
     pub fn replay_with_y_offset(
         &mut self,
         range: Range<usize>,
@@ -155,13 +156,20 @@ impl Scene {
             match operation {
                 PaintOperation::Primitive(primitive) => {
                     let mut translated = primitive.clone();
+                    // Translate moves bounds, content_mask, vertices, transforms.
                     translated.translate(offset);
-                    translated.set_content_mask(viewport_mask.clone());
+                    // Intersect translated mask with viewport: preserves inner
+                    // overflow_hidden clipping while adding viewport clipping.
+                    let intersected = ContentMask {
+                        bounds: translated
+                            .content_mask()
+                            .bounds
+                            .intersect(&viewport_mask.bounds),
+                    };
+                    translated.set_content_mask(intersected);
                     self.insert_primitive(translated);
                 }
                 PaintOperation::StartLayer(bounds) => {
-                    // Layer bounds only affect draw ordering — content_mask
-                    // replacement is handled per-primitive above.
                     let mut translated = *bounds;
                     translated.origin += offset;
                     self.push_layer(translated);
@@ -268,34 +276,54 @@ impl Primitive {
         }
     }
 
-    /// Translate all position data by the given offset.
-    /// Does NOT modify `content_mask` — the caller (`replay_with_y_offset`)
-    /// replaces the baked mask wholesale after translation.
-    ///
+    /// Translate all position data by the given offset, including content_mask.
     /// Used by list render caching to replay paint operations at a new scroll position.
+    ///
+    /// content_mask is translated alongside content so that inner overflow_hidden
+    /// clipping moves with the item. The caller (`replay_with_y_offset`) then
+    /// intersects the translated mask with the current viewport to restore
+    /// viewport-level clipping.
     pub fn translate(&mut self, offset: Point<ScaledPixels>) {
         match self {
-            Primitive::Shadow(s) => s.bounds.origin += offset,
-            Primitive::Quad(q) => q.bounds.origin += offset,
+            Primitive::Shadow(s) => {
+                s.bounds.origin += offset;
+                s.content_mask.bounds.origin += offset;
+            }
+            Primitive::Quad(q) => {
+                q.bounds.origin += offset;
+                q.content_mask.bounds.origin += offset;
+            }
             Primitive::Path(p) => {
                 p.bounds.origin += offset;
+                p.content_mask.bounds.origin += offset;
                 for vertex in &mut p.vertices {
                     vertex.xy_position += offset;
                 }
             }
-            Primitive::Underline(u) => u.bounds.origin += offset,
+            Primitive::Underline(u) => {
+                u.bounds.origin += offset;
+                u.content_mask.bounds.origin += offset;
+            }
             Primitive::MonochromeSprite(s) => {
                 s.bounds.origin += offset;
+                s.content_mask.bounds.origin += offset;
                 s.transformation.translation[0] += offset.x.0;
                 s.transformation.translation[1] += offset.y.0;
             }
             Primitive::SubpixelSprite(s) => {
                 s.bounds.origin += offset;
+                s.content_mask.bounds.origin += offset;
                 s.transformation.translation[0] += offset.x.0;
                 s.transformation.translation[1] += offset.y.0;
             }
-            Primitive::PolychromeSprite(s) => s.bounds.origin += offset,
-            Primitive::Surface(s) => s.bounds.origin += offset,
+            Primitive::PolychromeSprite(s) => {
+                s.bounds.origin += offset;
+                s.content_mask.bounds.origin += offset;
+            }
+            Primitive::Surface(s) => {
+                s.bounds.origin += offset;
+                s.content_mask.bounds.origin += offset;
+            }
         }
     }
 

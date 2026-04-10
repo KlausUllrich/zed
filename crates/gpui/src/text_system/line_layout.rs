@@ -445,6 +445,17 @@ impl LineLayoutCache {
         let mut previous_frame = &mut *self.previous_frame.lock();
         let mut current_frame = &mut *self.current_frame.write();
 
+        // Defensive: if the range is stale (e.g., rapid cache invalidation during
+        // fast scrolling causes frame indices to shift), skip reuse rather than panic.
+        if range.end.lines_index > previous_frame.used_lines.len()
+            || range.end.wrapped_lines_index > previous_frame.used_wrapped_lines.len()
+            || range.end.lines_by_hash_index > previous_frame.used_lines_by_hash.len()
+            || range.end.wrapped_lines_by_hash_index
+                > previous_frame.used_wrapped_lines_by_hash.len()
+        {
+            return;
+        }
+
         for key in &previous_frame.used_lines[range.start.lines_index..range.end.lines_index] {
             if let Some((key, line)) = previous_frame.lines.remove_entry(key) {
                 current_frame.lines.insert(key, line);
