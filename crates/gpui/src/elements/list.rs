@@ -2015,6 +2015,10 @@ impl Element for List {
                         let start = window.scene_len();
                         element.paint(window, cx);
                         let end = window.scene_len();
+                        eprintln!(
+                            "[CACHE] item={} mode=Fresh scene_range={}..{} ({}ops) y_origin={:.1}",
+                            item.index, start, end, end - start, item.y_origin.0
+                        );
                         scene_updates.push((item.index, start..end, item.y_origin));
                     }
                     ItemRender::Cached {
@@ -2024,6 +2028,12 @@ impl Element for List {
                         let y_delta = item.y_origin - *cached_y;
                         let new_range = window
                             .replay_cached_scene_with_y_offset(scene_range.clone(), y_delta);
+                        eprintln!(
+                            "[CACHE] item={} mode=Cached scene_range={}..{} ({}ops) src={}..{} y_delta={:.1}",
+                            item.index,
+                            new_range.start, new_range.end, new_range.end - new_range.start,
+                            scene_range.start, scene_range.end, y_delta.0
+                        );
                         scene_updates.push((item.index, new_range, item.y_origin));
                     }
                 }
