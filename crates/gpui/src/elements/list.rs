@@ -213,6 +213,9 @@ struct CachedItemScene {
     /// Range of text layouts used by this item (prepaint + paint combined).
     /// Must be reused each frame to prevent the text system from evicting them.
     line_layout_range: Range<LineLayoutIndex>,
+    /// Range of element states accessed during this item's prepaint + paint.
+    /// Must be reused each frame to prevent Frame::finish from GC'ing them.
+    element_states_range: Range<usize>,
 }
 
 /// Whether a list item should be rendered fresh or replayed from scene cache.
@@ -224,6 +227,7 @@ enum ItemRender {
         scene_range: Range<usize>,
         cached_y: Pixels,
         line_layout_range: Range<LineLayoutIndex>,
+        element_states_range: Range<usize>,
     },
 }
 
@@ -334,6 +338,10 @@ struct ItemLayout {
     /// Combined with the end index (captured after paint) to form the
     /// line_layout_range stored in the scene cache.
     text_layout_start: LineLayoutIndex,
+    /// Element state index at the start of this item's prepaint.
+    /// Combined with the end index (captured after paint) to form the
+    /// element_states_range stored in the scene cache.
+    element_states_start: usize,
 }
 
 /// Frame state used by the [List] element after layout.
@@ -1404,10 +1412,12 @@ impl StateInner {
                         scene_range: cached.scene_range.clone(),
                         cached_y: cached.y_origin,
                         line_layout_range: cached.line_layout_range.clone(),
+                        element_states_range: cached.element_states_range.clone(),
                     },
                     size: measured_size,
                     y_origin: px(0.), // set during prepaint
                     text_layout_start: LineLayoutIndex::default(), // not used for Cached
+                    element_states_start: 0, // not used for Cached
                 });
             } else if in_viewport || size.is_none() {
                 let item_start = Instant::now();
@@ -1462,6 +1472,7 @@ impl StateInner {
                         size: element_size,
                         y_origin: px(0.), // set during prepaint
                         text_layout_start: LineLayoutIndex::default(), // set during prepaint
+                        element_states_start: 0, // set during prepaint
                     });
                     if item.contains_focused(window, cx) {
                         rendered_focused_item = true;
@@ -1519,6 +1530,7 @@ impl StateInner {
                         size: element_size,
                         y_origin: px(0.), // set during prepaint
                         text_layout_start: LineLayoutIndex::default(), // set during prepaint
+                        element_states_start: 0, // set during prepaint
                     });
                     if item.contains_focused(window, cx) {
                         rendered_focused_item = true;
@@ -1603,6 +1615,7 @@ impl StateInner {
                         size,
                         y_origin: px(0.), // set during prepaint
                         text_layout_start: LineLayoutIndex::default(), // set during prepaint
+                        element_states_start: 0, // set during prepaint
                     });
                     break;
                 }
@@ -1689,6 +1702,7 @@ impl StateInner {
                     match &mut item.render {
                         ItemRender::Fresh { element } => {
                             item.text_layout_start = window.text_layout_index();
+                            item.element_states_start = window.element_state_index();
                             let prepaint_item_start = Instant::now();
                             window.with_content_mask(Some(ContentMask { bounds }), |window| {
                                 element.prepaint_at(item_origin, window, cx);
@@ -2028,10 +2042,11 @@ impl Element for List {
     ) {
         let current_view = window.current_view();
 
-        // Collect scene ranges + text layout ranges for fresh items and replay cached items.
-        // Updated after the paint loop to avoid borrow conflicts with ListState.
-        // Tuple: (index, scene_range, y_origin, line_layout_range, fully_visible)
-        let mut scene_updates: Vec<(usize, Range<usize>, Pixels, Range<LineLayoutIndex>, bool)> =
+        // Collect scene ranges, text layout ranges, and element state ranges for fresh
+        // items and replay cached items. Updated after the paint loop to avoid borrow
+        // conflicts with ListState.
+        // Tuple: (index, scene_range, y_origin, line_layout_range, element_states_range, fully_visible)
+        let mut scene_updates: Vec<(usize, Range<usize>, Pixels, Range<LineLayoutIndex>, Range<usize>, bool)> =
             Vec::new();
 
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
@@ -2042,6 +2057,7 @@ impl Element for List {
                         element.paint(window, cx);
                         let end = window.scene_len();
                         let text_end = window.text_layout_index();
+                        let element_states_end = window.element_state_index();
                         // Only cache items fully within the viewport — edge items
                         // have incomplete scene_ranges (glyphs culled at paint time).
                         let fully_visible = item.y_origin >= bounds.origin.y
@@ -2052,6 +2068,7 @@ impl Element for List {
                             start..end,
                             item.y_origin,
                             item.text_layout_start.clone()..text_end,
+                            item.element_states_start..element_states_end,
                             fully_visible,
                         ));
                     }
@@ -2059,6 +2076,7 @@ impl Element for List {
                         scene_range,
                         cached_y,
                         line_layout_range,
+                        element_states_range,
                     } => {
                         // Reuse text layouts — preserves glyph atlas entries.
                         // Capture new indices so the cache stays valid for the next frame
@@ -2066,6 +2084,11 @@ impl Element for List {
                         let new_text_start = window.text_layout_index();
                         window.reuse_text_layouts(line_layout_range.clone());
                         let new_text_end = window.text_layout_index();
+                        // Reuse element states — prevents Frame::finish from GC'ing
+                        // states for cached items that skip prepaint/paint.
+                        let new_es_start = window.element_state_index();
+                        window.reuse_element_states(element_states_range.clone());
+                        let new_es_end = window.element_state_index();
                         let y_delta = item.y_origin - *cached_y;
                         let new_range = window
                             .replay_cached_scene_with_y_offset(scene_range.clone(), y_delta);
@@ -2074,6 +2097,7 @@ impl Element for List {
                             new_range,
                             item.y_origin,
                             new_text_start..new_text_end,
+                            new_es_start..new_es_end,
                             true, // Cached items passed fully_visible check at layout time
                         ));
                     }
@@ -2088,7 +2112,7 @@ impl Element for List {
                 // Evict entries for items no longer visible.
                 let visible_indices: HashSet<usize> = scene_updates
                     .iter()
-                    .map(|(index, _, _, _, _)| *index)
+                    .map(|(index, _, _, _, _, _)| *index)
                     .collect();
                 state
                     .item_scene_cache
@@ -2096,7 +2120,7 @@ impl Element for List {
                 // Insert/update entries for fully visible items only.
                 // Edge items (partially clipped) are excluded to prevent
                 // caching incomplete scene_ranges with missing glyphs.
-                for (index, range, y_origin, line_layout_range, fully_visible) in scene_updates {
+                for (index, range, y_origin, line_layout_range, element_states_range, fully_visible) in scene_updates {
                     if !fully_visible {
                         continue;
                     }
@@ -2106,6 +2130,7 @@ impl Element for List {
                             scene_range: range,
                             y_origin,
                             line_layout_range,
+                            element_states_range,
                         },
                     );
                 }

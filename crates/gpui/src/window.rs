@@ -2727,6 +2727,29 @@ impl Window {
         self.text_system.reuse_layouts(range);
     }
 
+    /// Returns the current element state access index for tracking which
+    /// element states belong to a given item. Used by List render caching
+    /// to record per-item element state ranges.
+    pub(crate) fn element_state_index(&self) -> usize {
+        self.next_frame.accessed_element_states.len()
+    }
+
+    /// Declare element states from the previous frame as still accessed,
+    /// preventing them from being GC'd at frame transition. Without this,
+    /// cached items that skip prepaint lose their element states (via
+    /// Frame::finish), causing wrong layout heights on the first Fresh
+    /// frame after cache invalidation.
+    pub(crate) fn reuse_element_states(&mut self, range: Range<usize>) {
+        if range.end > self.rendered_frame.accessed_element_states.len() {
+            return; // Defensive: stale range after rapid invalidation
+        }
+        self.next_frame.accessed_element_states.extend(
+            self.rendered_frame.accessed_element_states[range]
+                .iter()
+                .cloned(),
+        );
+    }
+
     /// Replay cached scene primitives from the previous frame with a Y offset.
     /// Used by List to skip relayout for unchanged items during scroll.
     /// The `range` indexes into the previous frame's scene paint operations.
