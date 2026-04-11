@@ -38,6 +38,7 @@ screen-capture = [
     "scap",
 ]
 windows-manifest = ["dep:embed-resource"]
+texture-cache = []
 
 [lib]
 path = "src/gpui.rs"

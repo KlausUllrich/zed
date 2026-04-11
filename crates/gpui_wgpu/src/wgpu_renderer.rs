@@ -13,6 +13,10 @@ use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "texture-cache")]
+#[path = "texture_cache.rs"]
+mod texture_cache;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GlobalParams {
@@ -138,6 +142,8 @@ pub struct WgpuRenderer {
     last_error: Arc<Mutex<Option<String>>>,
     failed_frame_count: u32,
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(feature = "texture-cache")]
+    texture_pool: Option<texture_cache::TexturePool>,
 }
 
 impl WgpuRenderer {
@@ -481,6 +487,8 @@ impl WgpuRenderer {
             last_error,
             failed_frame_count: 0,
             device_lost: context.device_lost_flag(),
+            #[cfg(feature = "texture-cache")]
+            texture_pool: None,
         })
     }
 
@@ -1160,6 +1168,14 @@ impl WgpuRenderer {
                         label: Some("main_encoder"),
                     });
 
+            // Pre-pass: render dirty cache regions to offscreen textures
+            #[cfg(feature = "texture-cache")]
+            if !scene.cache_regions().is_empty() {
+                if !self.process_cache_regions(&mut encoder, scene, &mut instance_offset) {
+                    overflow = true;
+                }
+            }
+
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("main_pass"),
@@ -1260,6 +1276,14 @@ impl WgpuRenderer {
                     if !ok {
                         overflow = true;
                         break;
+                    }
+                }
+
+                // Post-batch: composite cached textures as quads over the main pass
+                #[cfg(feature = "texture-cache")]
+                if !overflow {
+                    if !self.draw_cached_regions(scene, &mut instance_offset, &mut pass) {
+                        overflow = true;
                     }
                 }
             }

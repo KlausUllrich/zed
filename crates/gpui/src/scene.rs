@@ -4,6 +4,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "texture-cache")]
+use crate::{CacheRegion, CacheRegionId};
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
     Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
@@ -36,6 +38,10 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    #[cfg(feature = "texture-cache")]
+    cache_regions_data: Vec<CacheRegion>,
+    #[cfg(feature = "texture-cache")]
+    active_cache_region: Option<(CacheRegionId, Bounds<ScaledPixels>, Hsla, usize)>,
 }
 
 #[expect(missing_docs)]
@@ -52,6 +58,11 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        #[cfg(feature = "texture-cache")]
+        {
+            self.cache_regions_data.clear();
+            self.active_cache_region = None;
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -130,6 +141,8 @@ impl Scene {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
+                #[cfg(feature = "texture-cache")]
+                PaintOperation::BeginCacheRegion(_) | PaintOperation::EndCacheRegion(_) => {}
             }
         }
     }
@@ -160,8 +173,49 @@ impl Scene {
                     self.push_layer(translated);
                 }
                 PaintOperation::EndLayer => self.pop_layer(),
+                #[cfg(feature = "texture-cache")]
+                PaintOperation::BeginCacheRegion(_) | PaintOperation::EndCacheRegion(_) => {}
             }
         }
+    }
+
+    /// Mark the start of a cacheable region in the scene.
+    /// All primitives painted between begin and end are captured as a group.
+    /// The renderer may render them to an offscreen texture for reuse.
+    #[cfg(feature = "texture-cache")]
+    pub fn begin_cache_region(
+        &mut self,
+        id: CacheRegionId,
+        bounds: Bounds<ScaledPixels>,
+        clear_color: Hsla,
+    ) {
+        self.paint_operations
+            .push(PaintOperation::BeginCacheRegion(id));
+        let start = self.paint_operations.len();
+        self.active_cache_region = Some((id, bounds, clear_color, start));
+    }
+
+    /// Mark the end of the current cache region.
+    #[cfg(feature = "texture-cache")]
+    pub fn end_cache_region(&mut self, id: CacheRegionId) {
+        let end = self.paint_operations.len();
+        self.paint_operations
+            .push(PaintOperation::EndCacheRegion(id));
+        if let Some((region_id, bounds, clear_color, start)) = self.active_cache_region.take() {
+            debug_assert_eq!(region_id, id, "Mismatched cache region begin/end");
+            self.cache_regions_data.push(CacheRegion {
+                id: region_id,
+                bounds,
+                clear_color,
+                paint_op_range: start..end,
+            });
+        }
+    }
+
+    /// Iterate over completed cache regions in the scene.
+    #[cfg(feature = "texture-cache")]
+    pub fn cache_regions(&self) -> &[CacheRegion] {
+        &self.cache_regions_data
     }
 
     pub fn finish(&mut self) {
@@ -231,6 +285,12 @@ pub(crate) enum PaintOperation {
     Primitive(Primitive),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
+    #[cfg(feature = "texture-cache")]
+    #[allow(dead_code)]
+    BeginCacheRegion(CacheRegionId),
+    #[cfg(feature = "texture-cache")]
+    #[allow(dead_code)]
+    EndCacheRegion(CacheRegionId),
 }
 
 #[derive(Clone)]

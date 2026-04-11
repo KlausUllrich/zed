@@ -13,6 +13,8 @@ use crate::{
     Overflow, Pixels, Point, ScrollDelta, ScrollWheelEvent, Size, Style, StyleRefinement, Styled,
     Window, point, px, size,
 };
+#[cfg(feature = "texture-cache")]
+use crate::{CacheRegionId, Hsla};
 use collections::VecDeque;
 use refineable::Refineable as _;
 use std::{cell::Cell, cell::RefCell, ops::Range, rc::Rc, time::Instant};
@@ -182,6 +184,12 @@ struct StateInner {
     prev_tail_scroll_max: Pixels,
     /// Timestamp of the last inertia physics update. Used for delta-time calculation.
     last_inertia_time: Option<Instant>,
+    /// When true, items are annotated for GPU texture caching during paint.
+    #[cfg(feature = "texture-cache")]
+    caching_enabled: bool,
+    /// Background color for offscreen texture clear (subpixel text needs opaque bg).
+    #[cfg(feature = "texture-cache")]
+    cache_clear_color: Hsla,
 }
 
 /// Keeps track of a fractional scroll position within an item for restoration
@@ -289,6 +297,8 @@ struct ItemLayout {
     index: usize,
     element: AnyElement,
     size: Size<Pixels>,
+    #[cfg(feature = "texture-cache")]
+    origin: Point<Pixels>,
 }
 
 /// Frame state used by the [List] element after layout.
@@ -390,6 +400,10 @@ impl ListState {
             prev_tail_item_count: 0,
             prev_tail_scroll_max: px(0.),
             last_inertia_time: None,
+            #[cfg(feature = "texture-cache")]
+            caching_enabled: false,
+            #[cfg(feature = "texture-cache")]
+            cache_clear_color: Hsla::default(),
         })));
         this.splice(0..0, item_count);
         this
@@ -1001,6 +1015,29 @@ impl ListState {
         let state = &mut *self.0.borrow_mut();
         state.tail_scroll_velocity = 0.0;
     }
+
+    /// Enable or disable GPU texture caching for list items during scroll.
+    /// When enabled, items are annotated for render-to-texture capture.
+    /// `clear_color` should be the card's opaque background color (for subpixel text).
+    #[cfg(feature = "texture-cache")]
+    pub fn set_item_caching_enabled(&self, enabled: bool, clear_color: Hsla) {
+        let mut inner = self.0.borrow_mut();
+        inner.caching_enabled = enabled;
+        inner.cache_clear_color = clear_color;
+    }
+
+    /// Check if item caching is currently enabled.
+    #[cfg(feature = "texture-cache")]
+    pub fn is_item_caching_enabled(&self) -> bool {
+        self.0.borrow().caching_enabled
+    }
+
+    /// Disable caching and let items render Fresh (interactive).
+    /// Called on scroll stop to restore full interactivity.
+    #[cfg(feature = "texture-cache")]
+    pub fn invalidate_all_item_caches(&self) {
+        self.0.borrow_mut().caching_enabled = false;
+    }
 }
 
 impl StateInner {
@@ -1344,6 +1381,8 @@ impl StateInner {
                         index: item_index,
                         element,
                         size: element_size,
+                        #[cfg(feature = "texture-cache")]
+                        origin: Point::default(),
                     });
                     if item.contains_focused(window, cx) {
                         rendered_focused_item = true;
@@ -1399,6 +1438,8 @@ impl StateInner {
                         index: item_index,
                         element,
                         size: element_size,
+                        #[cfg(feature = "texture-cache")]
+                        origin: Point::default(),
                     });
                     if item.contains_focused(window, cx) {
                         rendered_focused_item = true;
@@ -1481,6 +1522,8 @@ impl StateInner {
                         index: item_index,
                         element,
                         size,
+                        #[cfg(feature = "texture-cache")]
+                        origin: Point::default(),
                     });
                     break;
                 }
@@ -1613,6 +1656,10 @@ impl StateInner {
                         }
                     }
 
+                    #[cfg(feature = "texture-cache")]
+                    {
+                        item.origin = item_origin;
+                    }
                     item_origin.y += item.size.height;
                 }
 
@@ -1891,9 +1938,29 @@ impl Element for List {
         cx: &mut App,
     ) {
         let current_view = window.current_view();
+        #[cfg(feature = "texture-cache")]
+        let caching_enabled = self.state.0.borrow().caching_enabled;
+        #[cfg(feature = "texture-cache")]
+        let cache_clear_color = self.state.0.borrow().cache_clear_color;
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             for item in &mut prepaint.layout.item_layouts {
+                #[cfg(feature = "texture-cache")]
+                if caching_enabled {
+                    let region_id = CacheRegionId(item.index as u64);
+                    let item_bounds = Bounds {
+                        origin: item.origin,
+                        size: item.size,
+                    };
+                    window.begin_cache_region(region_id, item_bounds, cache_clear_color);
+                }
+
                 item.element.paint(window, cx);
+
+                #[cfg(feature = "texture-cache")]
+                if caching_enabled {
+                    let region_id = CacheRegionId(item.index as u64);
+                    window.end_cache_region(region_id);
+                }
             }
         });
 

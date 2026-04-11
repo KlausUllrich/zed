@@ -38,6 +38,8 @@ pub mod profiler;
 #[cfg(any(target_os = "windows", target_os = "linux", target_family = "wasm"))]
 #[expect(missing_docs)]
 pub mod queue;
+#[cfg(feature = "texture-cache")]
+mod cache_region;
 mod scene;
 mod shared_string;
 mod shared_uri;
@@ -105,6 +107,8 @@ pub use profiler::*;
 #[cfg(any(target_os = "windows", target_os = "linux", target_family = "wasm"))]
 pub use queue::{PriorityQueueReceiver, PriorityQueueSender};
 pub use refineable::*;
+#[cfg(feature = "texture-cache")]
+pub use cache_region::*;
 pub use scene::*;
 pub use shared_string::*;
 pub use shared_uri::*;

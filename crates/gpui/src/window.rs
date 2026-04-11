@@ -19,6 +19,8 @@ use crate::{
     WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
     point, prelude::*, px, rems, size, transparent_black,
 };
+#[cfg(feature = "texture-cache")]
+use crate::CacheRegionId;
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
 #[cfg(target_os = "macos")]
@@ -3156,6 +3158,35 @@ impl Window {
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
         });
+    }
+
+    /// Mark the start of a cacheable region in the scene.
+    /// The renderer may capture all primitives between begin and end to an offscreen
+    /// GPU texture for reuse during scroll. The `clear_color` is used to clear the
+    /// offscreen texture before rendering (required for correct subpixel text).
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    #[cfg(feature = "texture-cache")]
+    pub fn begin_cache_region(
+        &mut self,
+        id: CacheRegionId,
+        bounds: Bounds<Pixels>,
+        clear_color: Hsla,
+    ) {
+        self.invalidator.debug_assert_paint();
+        let scale_factor = self.scale_factor();
+        self.next_frame
+            .scene
+            .begin_cache_region(id, bounds.scale(scale_factor), clear_color);
+    }
+
+    /// Mark the end of the current cache region.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    #[cfg(feature = "texture-cache")]
+    pub fn end_cache_region(&mut self, id: CacheRegionId) {
+        self.invalidator.debug_assert_paint();
+        self.next_frame.scene.end_cache_region(id);
     }
 
     /// Creates a new painting layer for the specified bounds. A "layer" is a batch
