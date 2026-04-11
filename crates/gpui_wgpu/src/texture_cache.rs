@@ -5,7 +5,103 @@
 
 use super::*;
 use gpui::Hsla;
-use std::collections::HashMap;
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
+
+// ── Debug callback types ─────────────────────────────────────────────────────
+
+/// Per-frame debug data emitted by the texture cache for the F9 Cache tab.
+/// Constructed after process_cache_regions + draw_cached_regions complete.
+pub struct TextureCacheDebugFrame {
+    /// Items rendered fresh this frame (cache miss).
+    pub fresh_count: u32,
+    /// Items composited from cached textures (cache hit).
+    pub cached_count: u32,
+    /// Total textures currently in the pool.
+    pub texture_count: u32,
+    /// Estimated GPU memory used by texture pool (MB).
+    pub memory_mb: f32,
+    /// Time spent compositing cached textures in draw_cached_regions (ms).
+    pub composite_ms: f32,
+    /// Time spent rendering fresh items in process_cache_regions (ms).
+    pub fresh_ms: f32,
+    /// Per-item cache state for all visible regions.
+    pub items: Vec<TextureCacheDebugItem>,
+    /// Texture pool statistics.
+    pub pool: TextureCacheDebugPool,
+    /// Lifecycle events this frame (create only in Phase A).
+    pub events: Vec<TextureCacheDebugLifecycle>,
+}
+
+/// Per-item cache state within a frame.
+pub struct TextureCacheDebugItem {
+    /// CacheRegionId value.
+    pub index: u32,
+    /// Cache state: "cached", "fresh", "too_large", "pool_full".
+    pub state: &'static str,
+    /// Texture width (0 if no texture).
+    pub texture_width: u32,
+    /// Texture height (0 if no texture).
+    pub texture_height: u32,
+    /// Frames since capture. Phase A: always 0.
+    pub age_frames: u32,
+    /// Per-item render time (ms). Phase A: 0.0.
+    pub last_render_ms: f32,
+    /// Reason for state (e.g. "first_appearance", "size_change").
+    pub reason: Option<String>,
+}
+
+/// Texture pool statistics.
+pub struct TextureCacheDebugPool {
+    pub allocated: u32,
+    pub free: u32,
+    pub total: u32,
+    pub memory_mb: f32,
+    pub budget_mb: f32,
+    pub eviction_count: u32,
+}
+
+/// Texture lifecycle event.
+pub struct TextureCacheDebugLifecycle {
+    /// "create", "evict", "invalidate".
+    pub event_type: &'static str,
+    pub index: u32,
+    pub width: u32,
+    pub height: u32,
+    pub render_ms: f32,
+    pub age_frames: u32,
+    pub pool_bucket: Option<String>,
+    pub reason: Option<String>,
+}
+
+// ── Debug callback registration ──────────────────────────────────────────────
+
+type TextureCacheDebugCallback = Box<dyn Fn(TextureCacheDebugFrame) + Send + 'static>;
+
+thread_local! {
+    static TEXTURE_CACHE_DEBUG_CB: Cell<Option<*const TextureCacheDebugCallback>> = const { Cell::new(None) };
+}
+
+/// Register a callback to receive per-frame GPU texture cache debug data.
+/// Call once at app startup. Formats data for the F9 Cache tab in cs-debug.
+pub fn set_texture_cache_debug_callback(callback: TextureCacheDebugCallback) {
+    let leaked = Box::leak(Box::new(callback));
+    TEXTURE_CACHE_DEBUG_CB.with(|cell| cell.set(Some(leaked as *const TextureCacheDebugCallback)));
+}
+
+fn has_debug_callback() -> bool {
+    TEXTURE_CACHE_DEBUG_CB.with(|cell| cell.get().is_some())
+}
+
+fn emit_texture_cache_debug(frame: TextureCacheDebugFrame) {
+    TEXTURE_CACHE_DEBUG_CB.with(|cell| {
+        if let Some(ptr) = cell.get() {
+            let cb = unsafe { &*ptr };
+            cb(frame);
+        }
+    });
+}
 
 /// A cached offscreen texture for a list item.
 pub(crate) struct CachedItemTexture {
@@ -233,6 +329,11 @@ impl WgpuRenderer {
             );
             render_idx += 1;
         }
+
+        // Report all cached region IDs back to the list for skip-paint decisions
+        let pool = self.texture_pool.as_ref().unwrap();
+        let cached_ids: HashSet<u64> = pool.textures.keys().cloned().collect();
+        gpui::set_cached_region_ids(cached_ids);
 
         true
     }

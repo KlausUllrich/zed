@@ -14,7 +14,7 @@ use crate::{
     Window, point, px, size,
 };
 #[cfg(feature = "texture-cache")]
-use crate::{CacheRegionId, Hsla};
+use crate::{CacheRegionId, Hsla, has_cached_region};
 use collections::VecDeque;
 use refineable::Refineable as _;
 use std::{cell::Cell, cell::RefCell, ops::Range, rc::Rc, time::Instant};
@@ -1951,16 +1951,23 @@ impl Element for List {
                         origin: item.origin,
                         size: item.size,
                     };
+
+                    if has_cached_region(region_id) {
+                        // Cache HIT — annotate empty region, skip paint.
+                        // Renderer composites from cached texture.
+                        window.begin_cache_region(region_id, item_bounds, cache_clear_color);
+                        window.end_cache_region(region_id);
+                        continue;
+                    }
+
+                    // Cache MISS — paint normally, annotate for texture capture.
                     window.begin_cache_region(region_id, item_bounds, cache_clear_color);
+                    item.element.paint(window, cx);
+                    window.end_cache_region(region_id);
+                    continue;
                 }
 
                 item.element.paint(window, cx);
-
-                #[cfg(feature = "texture-cache")]
-                if caching_enabled {
-                    let region_id = CacheRegionId(item.index as u64);
-                    window.end_cache_region(region_id);
-                }
             }
         });
 

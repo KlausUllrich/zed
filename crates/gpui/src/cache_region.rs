@@ -8,11 +8,35 @@ use crate::{
     point,
     scene::PaintOperation,
 };
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::ops::Range;
 
 /// Unique identifier for a cache region (typically a list item index).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CacheRegionId(pub u64);
+
+// --- Renderer → List feedback path ---
+// The renderer sets which region IDs have valid textures after each frame.
+// The list queries this during paint to decide skip-paint vs Fresh.
+
+thread_local! {
+    static CACHED_REGION_IDS: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
+}
+
+/// Called by the renderer after processing cache regions to report
+/// which region IDs have valid cached textures.
+pub fn set_cached_region_ids(ids: HashSet<u64>) {
+    CACHED_REGION_IDS.with(|cell| {
+        *cell.borrow_mut() = ids;
+    });
+}
+
+/// Check if the renderer has a valid cached texture for a region.
+/// Used by list.rs to decide whether to skip paint (cache hit).
+pub fn has_cached_region(id: CacheRegionId) -> bool {
+    CACHED_REGION_IDS.with(|cell| cell.borrow().contains(&id.0))
+}
 
 /// A completed cache region annotation in the scene.
 /// Identifies a contiguous range of paint operations that can be rendered
