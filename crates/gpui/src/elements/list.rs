@@ -214,19 +214,14 @@ pub enum FollowMode {
 }
 
 /// Internal state tracking for follow mode.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 enum FollowState {
     /// Not following — user controls scroll position.
+    #[default]
     Normal,
     /// Following the tail of the list.
     /// `is_following` is false when the user has scrolled away (suspended).
     Tail { is_following: bool },
-}
-
-impl Default for FollowState {
-    fn default() -> Self {
-        FollowState::Normal
-    }
 }
 
 /// A scroll event that has been converted to be in terms of the list's items.
@@ -775,7 +770,7 @@ impl ListState {
         //
         // Only case needing care: if we were pinned to bottom (logical_scroll_top = None)
         // during drag, keep it pinned — the bottom-alignment semantics handle this.
-        if let (Some(frozen_h), Some(scroll_top)) = (frozen, state.logical_scroll_top) {
+        if let (Some(_frozen_h), Some(scroll_top)) = (frozen, state.logical_scroll_top) {
             let live_h = state.items.summary().height;
             // If heights differ significantly and we were near the bottom,
             // re-pin to bottom to avoid appearing stuck above new content.

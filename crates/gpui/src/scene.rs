@@ -147,7 +147,7 @@ impl Scene {
             return self.replay(range, prev_scene);
         }
         let offset = point(ScaledPixels(0.0), y_offset);
-        for operation in &prev_scene.paint_operations[range.clone()] {
+        for operation in &prev_scene.paint_operations[range] {
             match operation {
                 PaintOperation::Primitive(primitive) => {
                     let mut translated = primitive.clone();
