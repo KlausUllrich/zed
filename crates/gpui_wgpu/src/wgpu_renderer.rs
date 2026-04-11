@@ -16,6 +16,11 @@ use std::sync::{Arc, Mutex};
 #[cfg(feature = "texture-cache")]
 #[path = "texture_cache.rs"]
 mod texture_cache;
+#[cfg(feature = "texture-cache")]
+pub use texture_cache::{
+    set_texture_cache_debug_callback, TextureCacheDebugFrame, TextureCacheDebugItem,
+    TextureCacheDebugLifecycle, TextureCacheDebugPool,
+};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]

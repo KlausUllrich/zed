@@ -79,12 +79,17 @@ pub struct TextureCacheDebugLifecycle {
 
 type TextureCacheDebugCallback = Box<dyn Fn(TextureCacheDebugFrame) + Send + 'static>;
 
+// Single-producer, single-consumer: registered from the main thread before
+// the render thread starts; called only from the render thread.
+// Cell<Option<*const _>> is sufficient — no lock needed, no Arc overhead.
+// Box::leak ensures the callback lives for the program's lifetime.
 thread_local! {
     static TEXTURE_CACHE_DEBUG_CB: Cell<Option<*const TextureCacheDebugCallback>> = const { Cell::new(None) };
 }
 
 /// Register a callback to receive per-frame GPU texture cache debug data.
 /// Call once at app startup. Formats data for the F9 Cache tab in cs-debug.
+/// Calling twice leaks the first callback (intentional: avoids a global lock).
 pub fn set_texture_cache_debug_callback(callback: TextureCacheDebugCallback) {
     let leaked = Box::leak(Box::new(callback));
     TEXTURE_CACHE_DEBUG_CB.with(|cell| cell.set(Some(leaked as *const TextureCacheDebugCallback)));
@@ -227,6 +232,14 @@ impl WgpuRenderer {
 
         self.ensure_texture_pool();
 
+        let debug = has_debug_callback();
+        let start = if debug { Some(Instant::now()) } else { None };
+        // Vec::new() is zero-alloc — heap allocates only on first push (guarded by `if debug`).
+        let mut debug_items: Vec<TextureCacheDebugItem> = Vec::new();
+        let mut debug_events: Vec<TextureCacheDebugLifecycle> = Vec::new();
+        let mut fresh_count: u32 = 0;
+        let mut cached_count: u32 = 0;
+
         let globals_size = std::mem::size_of::<GlobalParams>() as u64;
         let max_renders_per_frame: usize = 16;
         let mut render_idx: usize = 0;
@@ -234,9 +247,16 @@ impl WgpuRenderer {
         for region in &regions {
             let tex_width = (region.bounds.size.width.0.ceil() as u32).max(1);
             let tex_height = (region.bounds.size.height.0.ceil() as u32).max(1);
+            let region_id = region.id.0 as u32;
 
             // Skip items too large for a single texture
             if tex_width > self.max_texture_size || tex_height > self.max_texture_size {
+                if debug {
+                    debug_items.push(TextureCacheDebugItem {
+                        index: region_id, state: "fresh", texture_width: 0, texture_height: 0,
+                        age_frames: 0, last_render_ms: 0.0, reason: Some("too_large".into()),
+                    });
+                }
                 continue;
             }
 
@@ -244,12 +264,26 @@ impl WgpuRenderer {
             let pool = self.texture_pool.as_ref().unwrap();
             if let Some(cached) = pool.textures.get(&region.id.0) {
                 if cached.width == tex_width && cached.height == tex_height {
+                    cached_count += 1;
+                    if debug {
+                        debug_items.push(TextureCacheDebugItem {
+                            index: region_id, state: "cached",
+                            texture_width: cached.width, texture_height: cached.height,
+                            age_frames: 0, last_render_ms: 0.0, reason: None,
+                        });
+                    }
                     continue;
                 }
             }
 
             // Cap renders per frame to globals buffer capacity
             if render_idx >= max_renders_per_frame {
+                if debug {
+                    debug_items.push(TextureCacheDebugItem {
+                        index: region_id, state: "fresh", texture_width: 0, texture_height: 0,
+                        age_frames: 0, last_render_ms: 0.0, reason: Some("pool_full".into()),
+                    });
+                }
                 continue; // Remaining items render Fresh (no texture)
             }
 
@@ -327,6 +361,21 @@ impl WgpuRenderer {
                     height: tex_height,
                 },
             );
+            fresh_count += 1;
+            if debug {
+                debug_items.push(TextureCacheDebugItem {
+                    index: region_id, state: "fresh",
+                    texture_width: tex_width, texture_height: tex_height,
+                    age_frames: 0, last_render_ms: 0.0,
+                    reason: Some("first_appearance".into()),
+                });
+                debug_events.push(TextureCacheDebugLifecycle {
+                    event_type: "create", index: region_id,
+                    width: tex_width, height: tex_height,
+                    render_ms: 0.0, age_frames: 0,
+                    pool_bucket: None, reason: None,
+                });
+            }
             render_idx += 1;
         }
 
@@ -334,6 +383,35 @@ impl WgpuRenderer {
         let pool = self.texture_pool.as_ref().unwrap();
         let cached_ids: HashSet<u64> = pool.textures.keys().cloned().collect();
         gpui::set_cached_region_ids(cached_ids);
+
+        // Emit debug callback with per-frame stats
+        if debug {
+            let fresh_ms = start.map(|s| s.elapsed().as_secs_f32() * 1000.0).unwrap_or(0.0);
+            let pool = self.texture_pool.as_ref().unwrap();
+            let texture_count = pool.textures.len() as u32;
+            let memory_mb = pool.textures.values()
+                .map(|t| (t.width as f64) * (t.height as f64) * 4.0) // RGBA8 assumed (4 bytes/px). Actual: surface_config.format. May undercount on HDR.
+                .sum::<f64>() / (1024.0 * 1024.0);
+
+            emit_texture_cache_debug(TextureCacheDebugFrame {
+                fresh_count,
+                cached_count,
+                texture_count,
+                memory_mb: memory_mb as f32,
+                composite_ms: 0.0, // Not measured here — draw_cached_regions is separate
+                fresh_ms,
+                items: debug_items,
+                pool: TextureCacheDebugPool {
+                    allocated: texture_count,
+                    free: 0,   // Phase A: no pre-allocation
+                    total: texture_count,
+                    memory_mb: memory_mb as f32,
+                    budget_mb: 0.0, // Phase A: no limit
+                    eviction_count: 0,
+                },
+                events: debug_events,
+            });
+        }
 
         true
     }
