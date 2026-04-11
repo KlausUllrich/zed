@@ -67,9 +67,31 @@ pub struct LayoutPerfTelemetry {
 
 type LayoutPerfCallback = Box<dyn Fn(&LayoutPerfTelemetry) + 'static>;
 
+/// Telemetry emitted when scroll offset compensation fires.
+/// Tracks hidden scroll adjustments caused by item re-measurement.
+#[derive(Clone, Debug)]
+pub struct OffsetCompensationEvent {
+    /// Index of the item that triggered compensation.
+    pub item_ix: usize,
+    /// Old height from size_hint (estimated or previously measured).
+    pub old_height: f32,
+    /// New measured height.
+    pub new_height: f32,
+    /// Height delta applied to scroll offset (positive = item grew, negative = shrank).
+    /// Equal to `new_height - old_height`.
+    pub height_delta: f32,
+    /// offset_in_item before adjustment.
+    pub offset_before: f32,
+    /// offset_in_item after adjustment.
+    pub offset_after: f32,
+}
+
+type OffsetCompensationCallback = Box<dyn Fn(&OffsetCompensationEvent) + 'static>;
+
 thread_local! {
     static SCROLL_TELEMETRY_CB: Cell<Option<*const ScrollTelemetryCallback>> = const { Cell::new(None) };
     static LAYOUT_PERF_CB: Cell<Option<*const LayoutPerfCallback>> = const { Cell::new(None) };
+    static OFFSET_COMP_CB: Cell<Option<*const OffsetCompensationCallback>> = const { Cell::new(None) };
 }
 
 /// Register a callback to receive scroll telemetry during Tail mode inertia.
@@ -105,6 +127,22 @@ fn emit_layout_perf(telemetry: &LayoutPerfTelemetry) {
         if let Some(ptr) = cell.get() {
             let cb = unsafe { &*ptr };
             cb(telemetry);
+        }
+    });
+}
+
+/// Register a callback to receive offset compensation events.
+/// Fires when item re-measurement adjusts the scroll offset.
+pub fn set_offset_compensation_callback(callback: OffsetCompensationCallback) {
+    let leaked = Box::leak(Box::new(callback));
+    OFFSET_COMP_CB.with(|cell| cell.set(Some(leaked as *const OffsetCompensationCallback)));
+}
+
+fn emit_offset_compensation(event: &OffsetCompensationEvent) {
+    OFFSET_COMP_CB.with(|cell| {
+        if let Some(ptr) = cell.get() {
+            let cb = unsafe { &*ptr };
+            cb(event);
         }
     });
 }
@@ -846,13 +884,14 @@ impl ListState {
                 // jumps when items are re-measured with large height deltas
                 // (e.g., scroll-up through items with estimated heights).
                 // The lerp (30%) tracks streaming growth well for small deltas.
-                // The cap (5px/frame) prevents visible jumps on large one-time
-                // deltas: 5px in total-height space ≈ <0.1px in thumb size.
+                // Proportional cap (0.5% of live height) scales with content size:
+                //   5000px content → 25px/frame cap (tracks 5× faster than old 5px cap)
+                //   50000px content → 250px/frame cap
                 let smoothed = match state.smoothed_scrollbar_height {
                     Some(prev) => {
                         let delta = live_height - prev;
                         let lerp_step = delta * 0.3;
-                        let max_step = px(5.0);
+                        let max_step = Pixels(live_height.0 * 0.005);
                         let step = if lerp_step.0.abs() > max_step.0 {
                             Pixels(max_step.0 * lerp_step.0.signum())
                         } else {
@@ -1357,10 +1396,19 @@ impl StateInner {
                             .unwrap_or(px(0.));
                         let height_delta = element_size.height - old_height;
                         if height_delta != px(0.) && scroll_top.offset_in_item > px(0.) {
+                            let offset_before = f32::from(scroll_top.offset_in_item);
                             scroll_top.offset_in_item = (scroll_top.offset_in_item + height_delta)
                                 .max(px(0.))
                                 .min(element_size.height);
                             self.logical_scroll_top = Some(scroll_top);
+                            emit_offset_compensation(&OffsetCompensationEvent {
+                                item_ix: scroll_top.item_ix,
+                                old_height: f32::from(old_height),
+                                new_height: f32::from(element_size.height),
+                                height_delta: f32::from(height_delta),
+                                offset_before,
+                                offset_after: f32::from(scroll_top.offset_in_item),
+                            });
                         }
                     }
 
