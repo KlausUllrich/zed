@@ -396,16 +396,44 @@ impl TexturePool {
         );
     }
 
+    /// Insert a reused free-list texture into the active map.
+    /// Memory accounting: no change — texture was already counted when in the free list.
+    fn reactivate(
+        &mut self,
+        region_id: u64,
+        texture: wgpu::Texture,
+        view: wgpu::TextureView,
+        width: u32,
+        height: u32,
+    ) {
+        let size_class = SizeClass::from_height(height);
+        let memory_bytes = texture_memory_bytes(width, height);
+        self.active.insert(
+            region_id,
+            CacheEntry {
+                texture,
+                view,
+                width,
+                height,
+                size_class,
+                last_used_frame: self.current_frame,
+                memory_bytes,
+            },
+        );
+    }
+
     // ── Public API (for flux, axle, obedi) ───────────────────────────────────
 
     /// Invalidate a specific cached region. Moves the texture to the free list
     /// for potential reuse (does not destroy GPU resources).
+    #[allow(dead_code)] // Public API for Stream 2 (flux) and Stream 4 (axle)
     pub fn invalidate(&mut self, region_id: u64) {
         self.release_to_free_list(region_id);
     }
 
     /// Evict all textures for items not in the visible set.
     /// Moves evicted textures to the free list. Returns the number evicted.
+    #[allow(dead_code)] // Public API for Stream 2 (flux) and Stream 4 (axle)
     pub fn evict_offscreen(&mut self, visible_ids: &HashSet<u64>) -> u32 {
         let to_evict: Vec<u64> = self
             .active
@@ -421,6 +449,7 @@ impl TexturePool {
     }
 
     /// Return current memory statistics.
+    #[allow(dead_code)] // Public API for Stream 2 (flux) and Stream 4 (axle)
     pub fn memory_stats(&self) -> TextureCacheMemoryStats {
         let free_count: u32 = self
             .free_list
@@ -663,17 +692,25 @@ impl WgpuRenderer {
             let tex_height = (region.bounds.size.height.0.ceil() as u32).max(1);
             let region_id = region.id.0 as u32;
 
-            // Skip items too large for a single texture
+            // FR-5.1/EC-14: Skip items exceeding GPU max texture dimension.
+            // Falls back to Fresh rendering (no caching attempt).
             if tex_width > self.max_texture_size || tex_height > self.max_texture_size {
+                log::debug!(
+                    "texture cache: item {} ({}x{}) exceeds max texture dimension {} — fallback to Fresh",
+                    region_id, tex_width, tex_height, self.max_texture_size
+                );
                 if debug {
                     debug_items.push(TextureCacheDebugItem {
                         index: region_id,
                         state: "too_large",
-                        texture_width: 0,
-                        texture_height: 0,
+                        texture_width: tex_width,
+                        texture_height: tex_height,
                         age_frames: 0,
                         last_render_ms: 0.0,
-                        reason: Some("too_large".into()),
+                        reason: Some(format!(
+                            "exceeds max_texture_dimension_2d ({})",
+                            self.max_texture_size
+                        )),
                     });
                 }
                 continue;
@@ -722,7 +759,7 @@ impl WgpuRenderer {
                 }
             }
 
-            // Try reusing a free-list texture with matching dimensions
+            // Scope: release &mut pool before create_item_texture borrows &self
             let (texture, view, reused) = {
                 let pool = self.texture_pool.as_mut().unwrap();
                 if let Some(free) = pool.try_reuse(tex_width, tex_height) {
@@ -794,6 +831,18 @@ impl WgpuRenderer {
                 &item_bind_group,
                 instance_offset,
             ) {
+                // Return reused texture to free list to avoid orphaning GPU resource
+                if reused {
+                    let sc = SizeClass::from_height(tex_height);
+                    let pool = self.texture_pool.as_mut().unwrap();
+                    pool.free_list.entry(sc).or_default().push(FreeTexture {
+                        texture,
+                        view,
+                        width: tex_width,
+                        height: tex_height,
+                        memory_bytes: texture_memory_bytes(tex_width, tex_height),
+                    });
+                }
                 return false;
             }
 
@@ -808,20 +857,7 @@ impl WgpuRenderer {
             };
             let pool = self.texture_pool.as_mut().unwrap();
             if reused {
-                let mem = texture_memory_bytes(tex_width, tex_height);
-                let sc = SizeClass::from_height(tex_height);
-                pool.active.insert(
-                    region.id.0,
-                    CacheEntry {
-                        texture,
-                        view,
-                        width: tex_width,
-                        height: tex_height,
-                        size_class: sc,
-                        last_used_frame: pool.current_frame,
-                        memory_bytes: mem,
-                    },
-                );
+                pool.reactivate(region.id.0, texture, view, tex_width, tex_height);
             } else {
                 pool.insert(region.id.0, texture, view, tex_width, tex_height);
             }
@@ -931,9 +967,70 @@ impl WgpuRenderer {
                         &mut pass,
                     )
                 }
-                PrimitiveBatch::Paths(_range) => {
-                    // Phase A: skip paths in item textures (uncommon in card content).
-                    true
+                PrimitiveBatch::Paths(range) => {
+                    let paths = &mini_scene.paths[range];
+                    if paths.is_empty() {
+                        true
+                    } else {
+                        // Two-pass path rendering: rasterize to intermediate,
+                        // then composite onto item texture.
+                        drop(pass);
+
+                        let did_rasterize = self.render_paths_to_intermediate_with_globals(
+                            encoder,
+                            paths,
+                            globals_bind_group,
+                            instance_offset,
+                        );
+
+                        // Restart item texture pass (LoadOp::Load preserves content)
+                        pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("item_texture_render_continued"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: target_view,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Load,
+                                    store: wgpu::StoreOp::Store,
+                                },
+                                depth_slice: None,
+                            })],
+                            depth_stencil_attachment: None,
+                            ..Default::default()
+                        });
+
+                        if did_rasterize {
+                            let first_path = &paths[0];
+                            let sprites: Vec<PathSprite> =
+                                if paths.last().map(|p| &p.order) == Some(&first_path.order) {
+                                    paths.iter().map(|p| PathSprite { bounds: p.clipped_bounds() }).collect()
+                                } else {
+                                    let mut bounds = first_path.clipped_bounds();
+                                    for path in &paths[1..] {
+                                        bounds = bounds.union(&path.clipped_bounds());
+                                    }
+                                    vec![PathSprite { bounds }]
+                                };
+                            let sprite_data = unsafe { Self::instance_bytes(&sprites) };
+                            if let Some(intermediate_view) =
+                                self.resources().path_intermediate_view.as_ref()
+                            {
+                                self.draw_instances_with_texture_and_globals(
+                                    sprite_data,
+                                    sprites.len() as u32,
+                                    intermediate_view,
+                                    &self.resources().pipelines.paths,
+                                    globals_bind_group,
+                                    instance_offset,
+                                    &mut pass,
+                                )
+                            } else {
+                                true
+                            }
+                        } else {
+                            false
+                        }
+                    }
                 }
                 PrimitiveBatch::Underlines(range) => {
                     let items = &mini_scene.underlines[range];
@@ -1000,6 +1097,87 @@ impl WgpuRenderer {
             if !ok {
                 return false;
             }
+        }
+
+        true
+    }
+
+    /// Rasterize path triangles to the intermediate texture using custom globals.
+    /// Used by render_mini_scene_to_texture for path rendering in offscreen items.
+    /// The custom globals set viewport_size to item dimensions so path vertices
+    /// (in item-local coordinates) map correctly to NDC.
+    fn render_paths_to_intermediate_with_globals(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        paths: &[Path<ScaledPixels>],
+        globals_bind_group: &wgpu::BindGroup,
+        instance_offset: &mut u64,
+    ) -> bool {
+        let mut vertices = Vec::new();
+        for path in paths {
+            let bounds = path.clipped_bounds();
+            vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
+                xy_position: v.xy_position,
+                st_position: v.st_position,
+                color: path.color,
+                bounds,
+            }));
+        }
+
+        if vertices.is_empty() {
+            return true;
+        }
+
+        let vertex_data = unsafe { Self::instance_bytes(&vertices) };
+        let Some((vertex_offset, vertex_size)) =
+            self.write_to_instance_buffer(instance_offset, vertex_data)
+        else {
+            return false;
+        };
+
+        let resources = self.resources();
+        let data_bind_group =
+            resources
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("item_path_rasterization_bind_group"),
+                    layout: &resources.bind_group_layouts.instances,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.instance_binding(vertex_offset, vertex_size),
+                    }],
+                });
+
+        let Some(path_intermediate_view) = resources.path_intermediate_view.as_ref() else {
+            return true;
+        };
+
+        let (target_view, resolve_target) = if let Some(ref msaa_view) = resources.path_msaa_view {
+            (msaa_view, Some(path_intermediate_view))
+        } else {
+            (path_intermediate_view, None)
+        };
+
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("item_path_rasterization_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target_view,
+                    resolve_target,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+
+            pass.set_pipeline(&resources.pipelines.path_rasterization);
+            pass.set_bind_group(0, globals_bind_group, &[]);
+            pass.set_bind_group(1, &data_bind_group, &[]);
+            pass.draw(0..vertices.len() as u32, 0..1);
         }
 
         true
