@@ -191,14 +191,10 @@ impl Scene {
         bounds: Bounds<ScaledPixels>,
         clear_color: Hsla,
     ) {
-        // Reserve a draw order for this region. For cache-HIT items that
-        // skip paint, this ensures the composite z-position is correct
-        // relative to surrounding content and overlay layers.
-        let order = if let Some(&layer_order) = self.layer_stack.last() {
-            layer_order
-        } else {
-            self.primitive_bounds.insert(bounds)
-        };
+        // Each cache region gets its own draw order via primitive_bounds.insert(),
+        // same as every other primitive. This ensures correct z-position for
+        // inline composite triggering in the renderer's batch loop.
+        let order = self.primitive_bounds.insert(bounds);
         self.paint_operations
             .push(PaintOperation::BeginCacheRegion(id));
         let start = self.paint_operations.len();
