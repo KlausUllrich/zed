@@ -1221,7 +1221,51 @@ impl WgpuRenderer {
                     ..Default::default()
                 });
 
+                // Z-ordering: compute insertion point for cached texture compositing.
+                // Cached textures composite after all content batches at or below the
+                // cache regions' z-position, before any batch with a higher draw order
+                // (e.g., overlay layers, tooltips, popups).
+                #[cfg(feature = "texture-cache")]
+                let cache_regions_max_order = scene.cache_composite_max_order();
+                #[cfg(feature = "texture-cache")]
+                let mut cache_composited = false;
+
                 for batch in scene.batches() {
+                    // Composite cached textures before the first batch whose draw
+                    // order exceeds all cache regions' composite orders.
+                    // Safety: batches() only yields ranges with ≥1 element.
+                    #[cfg(feature = "texture-cache")]
+                    if !cache_composited && !overflow {
+                        if let Some(max_order) = cache_regions_max_order {
+                            let batch_order = match &batch {
+                                PrimitiveBatch::Shadows(r) => scene.shadows[r.start].order,
+                                PrimitiveBatch::Quads(r) => scene.quads[r.start].order,
+                                PrimitiveBatch::Paths(r) => scene.paths[r.start].order,
+                                PrimitiveBatch::Underlines(r) => scene.underlines[r.start].order,
+                                PrimitiveBatch::MonochromeSprites { range, .. } => {
+                                    scene.monochrome_sprites[range.start].order
+                                }
+                                PrimitiveBatch::SubpixelSprites { range, .. } => {
+                                    scene.subpixel_sprites[range.start].order
+                                }
+                                PrimitiveBatch::PolychromeSprites { range, .. } => {
+                                    scene.polychrome_sprites[range.start].order
+                                }
+                                PrimitiveBatch::Surfaces(r) => scene.surfaces[r.start].order,
+                            };
+                            if batch_order > max_order {
+                                if !self.draw_cached_regions(
+                                    scene,
+                                    &mut instance_offset,
+                                    &mut pass,
+                                ) {
+                                    overflow = true;
+                                }
+                                cache_composited = true;
+                            }
+                        }
+                    }
+
                     let ok = match batch {
                         PrimitiveBatch::Quads(range) => {
                             self.draw_quads(&scene.quads[range], &mut instance_offset, &mut pass)
@@ -1308,9 +1352,11 @@ impl WgpuRenderer {
                     }
                 }
 
-                // Post-batch: composite cached textures as quads over the main pass
+                // Fallback: composite if the batch loop ended without finding a batch
+                // with order > max_order (all content at or below cache z-position,
+                // e.g., no overlay layers present).
                 #[cfg(feature = "texture-cache")]
-                if !overflow {
+                if !cache_composited && !overflow {
                     if !self.draw_cached_regions(scene, &mut instance_offset, &mut pass) {
                         overflow = true;
                     }

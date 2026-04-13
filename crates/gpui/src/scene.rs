@@ -41,7 +41,7 @@ pub struct Scene {
     #[cfg(feature = "texture-cache")]
     cache_regions_data: Vec<CacheRegion>,
     #[cfg(feature = "texture-cache")]
-    active_cache_region: Option<(CacheRegionId, Bounds<ScaledPixels>, Hsla, usize)>,
+    active_cache_region: Option<(CacheRegionId, Bounds<ScaledPixels>, Hsla, usize, DrawOrder)>,
 }
 
 #[expect(missing_docs)]
@@ -182,6 +182,8 @@ impl Scene {
     /// Mark the start of a cacheable region in the scene.
     /// All primitives painted between begin and end are captured as a group.
     /// The renderer may render them to an offscreen texture for reuse.
+    /// Inserts bounds into the draw-order tree so cache-HIT items (which emit
+    /// no primitives) still reserve a z-position for correct compositing.
     #[cfg(feature = "texture-cache")]
     pub fn begin_cache_region(
         &mut self,
@@ -189,10 +191,18 @@ impl Scene {
         bounds: Bounds<ScaledPixels>,
         clear_color: Hsla,
     ) {
+        // Reserve a draw order for this region. For cache-HIT items that
+        // skip paint, this ensures the composite z-position is correct
+        // relative to surrounding content and overlay layers.
+        let order = if let Some(&layer_order) = self.layer_stack.last() {
+            layer_order
+        } else {
+            self.primitive_bounds.insert(bounds)
+        };
         self.paint_operations
             .push(PaintOperation::BeginCacheRegion(id));
         let start = self.paint_operations.len();
-        self.active_cache_region = Some((id, bounds, clear_color, start));
+        self.active_cache_region = Some((id, bounds, clear_color, start, order));
     }
 
     /// Mark the end of the current cache region.
@@ -201,13 +211,14 @@ impl Scene {
         let end = self.paint_operations.len();
         self.paint_operations
             .push(PaintOperation::EndCacheRegion(id));
-        if let Some((region_id, bounds, clear_color, start)) = self.active_cache_region.take() {
+        if let Some((region_id, bounds, clear_color, start, order)) = self.active_cache_region.take() {
             debug_assert_eq!(region_id, id, "Mismatched cache region begin/end");
             self.cache_regions_data.push(CacheRegion {
                 id: region_id,
                 bounds,
                 clear_color,
                 paint_op_range: start..end,
+                composite_order: order,
             });
         }
     }
@@ -216,6 +227,18 @@ impl Scene {
     #[cfg(feature = "texture-cache")]
     pub fn cache_regions(&self) -> &[CacheRegion] {
         &self.cache_regions_data
+    }
+
+    /// Maximum composite draw order across all cache regions.
+    /// Returns `None` if no cache regions exist. Used by the renderer
+    /// to insert cached texture compositing at the correct z-position
+    /// in the batch loop (after content, before overlays).
+    #[cfg(feature = "texture-cache")]
+    pub fn cache_composite_max_order(&self) -> Option<DrawOrder> {
+        self.cache_regions_data
+            .iter()
+            .map(|r| r.composite_order)
+            .max()
     }
 
     pub fn finish(&mut self) {

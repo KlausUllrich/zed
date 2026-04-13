@@ -74,6 +74,10 @@ pub struct CacheRegion {
     /// Range of indices in `paint_operations` belonging to this region
     /// (excludes the Begin/End markers themselves).
     pub paint_op_range: Range<usize>,
+    /// Draw order assigned during scene construction. Used by the renderer
+    /// to composite cached textures at the correct z-position (after content
+    /// batches, before overlay layers).
+    pub composite_order: u32,
 }
 
 impl Primitive {
