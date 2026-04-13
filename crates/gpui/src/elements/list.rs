@@ -2254,11 +2254,9 @@ impl Element for List {
                                 f32::from(item.size.width), f32::from(item.size.height),
                                 cache_clear_color.h, cache_clear_color.s, cache_clear_color.l, cache_clear_color.a);
                         }
-                        // Cache HIT — paint anyway so renderer has fresh primitives
-                        // if it needs to re-capture (dimension change, eviction).
-                        // Renderer ignores these primitives when texture is valid.
+                        // Cache HIT — annotate empty region, skip paint.
+                        // Renderer composites from cached texture.
                         window.begin_cache_region(region_id, item_bounds, cache_clear_color);
-                        item.element.paint(window, cx);
                         window.end_cache_region(region_id);
                         continue;
                     }

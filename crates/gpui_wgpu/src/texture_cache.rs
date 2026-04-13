@@ -874,6 +874,31 @@ impl WgpuRenderer {
                     }
                 }
             }
+
+            // Guard: reject empty mini-scenes caused by stale HIT feedback.
+            // When list.rs skips paint (cache HIT) but the renderer evicted the texture,
+            // we get total=0. Don't create a blank texture — remove the stale feedback
+            // so list.rs paints on the next frame (self-healing in 1 frame).
+            if total == 0 && tex_height > 16 {
+                log::warn!(
+                    "event=empty_recapture ix={} size={}x{} — stale HIT feedback, skipping",
+                    region_id, tex_width, tex_height
+                );
+                // Return the reused texture to free list if we grabbed one
+                if reused {
+                    let sc = SizeClass::from_height(tex_height);
+                    let pool = self.texture_pool.as_mut().unwrap();
+                    pool.free_list.entry(sc).or_default().push(FreeTexture {
+                        texture, view, width: tex_width, height: tex_height,
+                        memory_bytes: texture_memory_bytes(tex_width, tex_height),
+                    });
+                }
+                // Ensure this region is NOT in active pool — on next frame,
+                // has_cached_region() returns false → list.rs paints fresh
+                self.texture_pool.as_mut().unwrap().active.remove(&region.id.0);
+                continue;
+            }
+
             // Capture counts for F9 debug item (available to debug callback below).
             let (prim_quads, prim_mono, prim_subpixel, prim_paths) = (q, m, s, p);
 
