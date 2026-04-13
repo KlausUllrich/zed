@@ -851,10 +851,12 @@ impl WgpuRenderer {
             {
                 use std::io::Write;
                 if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/cs-mini-scene-log.txt") {
-                    writeln!(f, "event=mini_scene ix={} region_y={:.1} region_h={:.1} quads={} shadows={} mono={} subpixel={} poly={} underlines={} paths={} total={}",
+                    writeln!(f, "event=mini_scene ix={} region_y={:.1} region_h={:.1} op_range={}..{} quads={} shadows={} mono={} subpixel={} poly={} underlines={} paths={} total={}",
                         region_id,
                         region.bounds.origin.y.0,
                         region.bounds.size.height.0,
+                        region.paint_op_range.start,
+                        region.paint_op_range.end,
                         mini_scene.quads.len(),
                         mini_scene.shadows.len(),
                         mini_scene.monochrome_sprites.len(),
