@@ -38,6 +38,20 @@ pub fn has_cached_region(id: CacheRegionId) -> bool {
     CACHED_REGION_IDS.with(|cell| cell.borrow().contains(&id.0))
 }
 
+/// FR-2.2: Remove a single region from the cached set.
+/// On the next paint, `has_cached_region()` returns false for this ID,
+/// causing a cache MISS and a Fresh re-render of the item.
+pub fn clear_cached_region(id: CacheRegionId) {
+    CACHED_REGION_IDS.with(|cell| cell.borrow_mut().remove(&id.0));
+}
+
+/// Clear all cached region IDs. Called on GPU device lost recovery
+/// and on global invalidation (theme/font/DPI changes) to prevent
+/// stale IDs from causing skip-paint on items without textures.
+pub fn clear_cached_region_ids() {
+    CACHED_REGION_IDS.with(|cell| cell.borrow_mut().clear());
+}
+
 /// A completed cache region annotation in the scene.
 /// Identifies a contiguous range of paint operations that can be rendered
 /// to an offscreen GPU texture and composited as a single quad.

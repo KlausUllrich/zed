@@ -15,6 +15,8 @@ use crate::{
 };
 #[cfg(feature = "texture-cache")]
 use crate::{CacheRegionId, Hsla, has_cached_region};
+#[cfg(feature = "texture-cache")]
+use std::collections::{HashMap, HashSet};
 use collections::VecDeque;
 use refineable::Refineable as _;
 use std::{cell::Cell, cell::RefCell, ops::Range, rc::Rc, time::Instant};
@@ -152,6 +154,12 @@ fn emit_offset_compensation(event: &OffsetCompensationEvent) {
 /// Referenced by both `layout_items()` and `is_smooth_scrolling()`.
 const MIN_VELOCITY_PX_PER_SEC: f32 = 12.0;
 
+/// EC-6: Minimum frames an item must be visible before texture creation.
+/// Items visible for fewer frames during rapid scroll skip texture capture
+/// to avoid wasting GPU budget on imperceptible items.
+#[cfg(feature = "texture-cache")]
+const TRANSIENT_SKIP_FRAMES: u8 = 2;
+
 /// Construct a new list element
 pub fn list(
     state: ListState,
@@ -228,6 +236,16 @@ struct StateInner {
     /// Background color for offscreen texture clear (subpixel text needs opaque bg).
     #[cfg(feature = "texture-cache")]
     cache_clear_color: Hsla,
+    /// EC-6: Per-item frame visibility counter. Items visible for fewer than
+    /// TRANSIENT_SKIP_FRAMES frames skip texture creation during rapid scroll.
+    /// Key: item index, Value: consecutive frames visible.
+    #[cfg(feature = "texture-cache")]
+    visible_frames: HashMap<usize, u8>,
+    /// FR-4: Item indices that are actively streaming content and must NOT be cached.
+    /// These items render Fresh every frame. Set by the host app via
+    /// `set_streaming_items()`. Cleared when streaming stops.
+    #[cfg(feature = "texture-cache")]
+    streaming_items: HashSet<usize>,
 }
 
 /// Keeps track of a fractional scroll position within an item for restoration
@@ -337,6 +355,11 @@ struct ItemLayout {
     size: Size<Pixels>,
     #[cfg(feature = "texture-cache")]
     origin: Point<Pixels>,
+    /// EC-12: True for items in the overdraw zone (outside viewport).
+    /// These are included in layout only when texture caching is active,
+    /// so their textures are ready when scrolled into view.
+    #[cfg(feature = "texture-cache")]
+    is_overdraw: bool,
 }
 
 /// Frame state used by the [List] element after layout.
@@ -442,6 +465,10 @@ impl ListState {
             caching_enabled: false,
             #[cfg(feature = "texture-cache")]
             cache_clear_color: Hsla::default(),
+            #[cfg(feature = "texture-cache")]
+            visible_frames: HashMap::new(),
+            #[cfg(feature = "texture-cache")]
+            streaming_items: HashSet::new(),
         })));
         this.splice(0..0, item_count);
         this
@@ -725,6 +752,12 @@ impl ListState {
             scroll_top.offset_in_item = px(0.);
         }
 
+        // EC-13: Clear frame counters on programmatic scroll jump.
+        // All visible items change at once — transient skip (EC-6) will spread
+        // texture creation across subsequent frames.
+        #[cfg(feature = "texture-cache")]
+        state.visible_frames.clear();
+
         state.logical_scroll_top = Some(scroll_top);
 
         // Explicit scroll-to suspends follow-tail
@@ -736,6 +769,9 @@ impl ListState {
     /// Scroll the list to the given item, such that the item is fully visible.
     pub fn scroll_to_reveal_item(&self, ix: usize) {
         let state = &mut *self.0.borrow_mut();
+        // EC-13: Clear frame counters — programmatic jump resets visibility.
+        #[cfg(feature = "texture-cache")]
+        state.visible_frames.clear();
 
         let mut scroll_top = state.logical_scroll_top();
         let height = state
@@ -916,6 +952,9 @@ impl ListState {
     /// this computes the actual scroll position. Works with any ListAlignment.
     pub fn scroll_to_max(&self) {
         let state = &mut *self.0.borrow_mut();
+        // EC-13: Clear frame counters — programmatic jump resets visibility.
+        #[cfg(feature = "texture-cache")]
+        state.visible_frames.clear();
         let bounds = state.last_layout_bounds.unwrap_or_default();
         let padding = state.last_padding.unwrap_or_default();
         let total_height = state.items.summary().height;
@@ -1075,7 +1114,50 @@ impl ListState {
     /// Called on scroll stop to restore full interactivity.
     #[cfg(feature = "texture-cache")]
     pub fn invalidate_all_item_caches(&self) {
-        self.0.borrow_mut().caching_enabled = false;
+        let mut inner = self.0.borrow_mut();
+        inner.caching_enabled = false;
+        inner.visible_frames.clear();
+    }
+
+    // --- Phase B: Per-item invalidation + streaming exclusion ---
+
+    /// FR-2.2: Invalidate the cached GPU texture for a single item.
+    /// The item re-renders Fresh on the next frame. Does NOT disable caching globally.
+    /// Used for: card collapse/expand (EC-1), search highlight changes (EC-2),
+    /// explicit content changes.
+    #[cfg(feature = "texture-cache")]
+    pub fn invalidate_item_cache(&self, index: usize) {
+        // Remove this item from the renderer's "valid cache" feedback set.
+        // On the next paint, has_cached_region() returns false → cache MISS → re-render.
+        crate::clear_cached_region(CacheRegionId(index as u64));
+        // Reset frame visibility counter so the item goes through the transient
+        // skip check again (avoids caching a single-frame flash).
+        self.0.borrow_mut().visible_frames.remove(&index);
+    }
+
+    /// EC-3/4/5: Invalidate ALL cached GPU textures and clear the renderer feedback set.
+    /// Used for global visual changes: theme, font size, DPI, scale factor.
+    /// Unlike `invalidate_all_item_caches()`, this also purges renderer-side state
+    /// so stale textures are never composited.
+    #[cfg(feature = "texture-cache")]
+    pub fn invalidate_all_caches(&self) {
+        let mut inner = self.0.borrow_mut();
+        inner.caching_enabled = false;
+        inner.visible_frames.clear();
+        inner.streaming_items.clear();
+        // Clear the renderer feedback set — all cached textures become stale.
+        crate::clear_cached_region_ids();
+        // TODO(bolt): When TexturePool lands, call pool.invalidate_all() here
+        // to actually release GPU memory.
+    }
+
+    /// FR-4: Set the indices of items that are actively streaming content.
+    /// Streaming items are excluded from GPU texture caching in the paint loop —
+    /// they render Fresh every frame because their content changes each chunk.
+    /// Call with an empty set when no items are streaming.
+    #[cfg(feature = "texture-cache")]
+    pub fn set_streaming_items(&self, items: HashSet<usize>) {
+        self.0.borrow_mut().streaming_items = items;
     }
 }
 
@@ -1371,8 +1453,15 @@ impl StateInner {
             // Use the previously cached height and focus handle if available
             let mut size = item.size();
 
-            // If we're within the visible area or the height wasn't cached, render and measure the item's element
-            if visible_height < available_height || size.is_none() {
+            // If we're within the visible area or the height wasn't cached, render and measure the item's element.
+            // EC-12: When caching is active, also render overdraw items so they can be texture-cached.
+            #[cfg(feature = "texture-cache")]
+            let should_render = visible_height < available_height
+                || size.is_none()
+                || (self.caching_enabled && visible_height < available_height + self.overdraw);
+            #[cfg(not(feature = "texture-cache"))]
+            let should_render = visible_height < available_height || size.is_none();
+            if should_render {
                 let item_index = scroll_top.item_ix + ix;
                 let item_start = Instant::now();
                 let mut element = render_item(item_index, window, cx);
@@ -1424,13 +1513,24 @@ impl StateInner {
                     }
                 }
 
-                if visible_height < available_height {
+                // EC-12: When texture caching is active, include overdraw items
+                // in item_layouts so they get prepainted/painted and cached.
+                // Their textures will be ready when they scroll into the viewport.
+                #[cfg(feature = "texture-cache")]
+                let include_in_layout = visible_height < available_height
+                    || (self.caching_enabled && visible_height < available_height + self.overdraw);
+                #[cfg(not(feature = "texture-cache"))]
+                let include_in_layout = visible_height < available_height;
+
+                if include_in_layout {
                     item_layouts.push_back(ItemLayout {
                         index: item_index,
                         element,
                         size: element_size,
                         #[cfg(feature = "texture-cache")]
                         origin: Point::default(),
+                        #[cfg(feature = "texture-cache")]
+                        is_overdraw: visible_height >= available_height,
                     });
                     if item.contains_focused(window, cx) {
                         rendered_focused_item = true;
@@ -1488,6 +1588,8 @@ impl StateInner {
                         size: element_size,
                         #[cfg(feature = "texture-cache")]
                         origin: Point::default(),
+                        #[cfg(feature = "texture-cache")]
+                        is_overdraw: false,
                     });
                     if item.contains_focused(window, cx) {
                         rendered_focused_item = true;
@@ -1572,6 +1674,8 @@ impl StateInner {
                         size,
                         #[cfg(feature = "texture-cache")]
                         origin: Point::default(),
+                        #[cfg(feature = "texture-cache")]
+                        is_overdraw: false,
                     });
                     break;
                 }
@@ -1709,6 +1813,19 @@ impl StateInner {
                         item.origin = item_origin;
                     }
                     item_origin.y += item.size.height;
+                }
+
+                // EC-6: Update per-item visibility frame counters.
+                // Increment for items in this frame's layout, remove items no longer visible.
+                #[cfg(feature = "texture-cache")]
+                if self.caching_enabled {
+                    let current_indices: std::collections::HashSet<usize> =
+                        layout_response.item_layouts.iter().map(|i| i.index).collect();
+                    self.visible_frames.retain(|ix, _| current_indices.contains(ix));
+                    for ix in &current_indices {
+                        let count = self.visible_frames.entry(*ix).or_insert(0);
+                        *count = count.saturating_add(1);
+                    }
                 }
 
                 // Emit prepaint perf telemetry when slow (> 8ms).
@@ -1987,18 +2104,49 @@ impl Element for List {
     ) {
         let current_view = window.current_view();
         #[cfg(feature = "texture-cache")]
-        let caching_enabled = self.state.0.borrow().caching_enabled;
+        let caching_enabled;
         #[cfg(feature = "texture-cache")]
-        let cache_clear_color = self.state.0.borrow().cache_clear_color;
+        let cache_clear_color;
+        #[cfg(feature = "texture-cache")]
+        let visible_frames_snapshot;
+        #[cfg(feature = "texture-cache")]
+        let streaming_items_snapshot;
+        #[cfg(feature = "texture-cache")]
+        {
+            let state = self.state.0.borrow();
+            caching_enabled = state.caching_enabled;
+            cache_clear_color = state.cache_clear_color;
+            visible_frames_snapshot = state.visible_frames.clone();
+            streaming_items_snapshot = state.streaming_items.clone();
+        }
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             for item in &mut prepaint.layout.item_layouts {
                 #[cfg(feature = "texture-cache")]
                 if caching_enabled {
+                    // FR-4: Streaming items render Fresh every frame — content is
+                    // still changing, so any cached texture would be immediately stale.
+                    if streaming_items_snapshot.contains(&item.index) {
+                        item.element.paint(window, cx);
+                        continue;
+                    }
+
                     let region_id = CacheRegionId(item.index as u64);
                     let item_bounds = Bounds {
                         origin: item.origin,
                         size: item.size,
                     };
+
+                    // EC-6: Skip texture creation for transient items (visible < 2 frames).
+                    // Items already cached still get composited (cache HIT path).
+                    let frames_visible = visible_frames_snapshot
+                        .get(&item.index)
+                        .copied()
+                        .unwrap_or(0);
+                    if frames_visible < TRANSIENT_SKIP_FRAMES && !has_cached_region(region_id) {
+                        // Transient item — render Fresh without texture annotation.
+                        item.element.paint(window, cx);
+                        continue;
+                    }
 
                     if has_cached_region(region_id) {
                         // Cache HIT — annotate empty region, skip paint.
