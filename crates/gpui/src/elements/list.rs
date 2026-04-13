@@ -2281,17 +2281,12 @@ impl Element for List {
         // primitives at viewport edges (bounds ∩ content_mask = empty at capture time).
         #[cfg(feature = "texture-cache")]
         let paint_bounds = if caching_enabled {
-            let max_item_height = prepaint
-                .layout
-                .item_layouts
-                .iter()
-                .map(|item| item.size.height)
-                .fold(px(0.), |a, b| if b > a { b } else { a });
+            let expansion = px(5000.);
             Bounds::new(
-                point(bounds.origin.x, bounds.origin.y - max_item_height),
+                point(bounds.origin.x, bounds.origin.y - expansion),
                 size(
                     bounds.size.width,
-                    bounds.size.height + max_item_height * 2.0,
+                    bounds.size.height + expansion * 2.0,
                 ),
             )
         } else {
