@@ -830,6 +830,23 @@ impl WgpuRenderer {
                 "event=capture_detail ix={} texture={}x{} total={} quads={} mono={} subpixel={} paths={} polychrome={} shadows={} underlines={} reused={}",
                 region_id, tex_width, tex_height, total, q, m, s, p, poly, shadows, underlines, reused
             );
+            // Mini-scene diagnostic: region bounds + primitive counts for blank-texture debugging.
+            log::info!(
+                "event=mini_scene ix={} region_y={:.1} region_h={:.1} quads={} shadows={} mono={} subpixel={} poly={} underlines={} paths={} total={}",
+                region_id,
+                region.bounds.origin.y.0,
+                region.bounds.size.height.0,
+                q, shadows, m, s, poly, underlines, p, total,
+            );
+            // Per-sprite-type first Y position: reveals if primitives land outside texture bounds.
+            if let Some(first_mono) = mini_scene.monochrome_sprites.first() {
+                log::info!("event=mini_scene_sprite ix={} type=mono first_y={:.1} trans_y={:.1}",
+                    region_id, first_mono.bounds.origin.y.0, first_mono.transformation.translation[1]);
+            }
+            if let Some(first_quad) = mini_scene.quads.first() {
+                log::info!("event=mini_scene_sprite ix={} type=quad first_y={:.1}",
+                    region_id, first_quad.bounds.origin.y.0);
+            }
             // Capture counts for F9 debug item (available to debug callback below).
             let (prim_quads, prim_mono, prim_subpixel, prim_paths) = (q, m, s, p);
 
