@@ -90,10 +90,33 @@ pub struct OffsetCompensationEvent {
 
 type OffsetCompensationCallback = Box<dyn Fn(&OffsetCompensationEvent) + 'static>;
 
+/// Telemetry emitted when a visible item's measured height changes between frames
+/// during active scroll with texture caching enabled. Used to diagnose height
+/// oscillation that causes perpetual cache MISSes and blank cards.
+#[cfg(feature = "texture-cache")]
+#[derive(Clone, Debug)]
+pub struct HeightChangeEvent {
+    /// Absolute list index of the item whose height changed.
+    pub item_index: usize,
+    /// Height from the previous frame (px). Zero if first observation.
+    pub old_height: f32,
+    /// Height measured this frame (px).
+    pub new_height: f32,
+    /// Cache path for this item this frame: "HIT", "MISS", "STREAMING", or "TRANSIENT".
+    pub cache_path: &'static str,
+    /// Monotonic frame counter (incremented each paint pass).
+    pub frame_count: u64,
+}
+
+#[cfg(feature = "texture-cache")]
+type HeightChangeCallback = Box<dyn Fn(&HeightChangeEvent) + 'static>;
+
 thread_local! {
     static SCROLL_TELEMETRY_CB: Cell<Option<*const ScrollTelemetryCallback>> = const { Cell::new(None) };
     static LAYOUT_PERF_CB: Cell<Option<*const LayoutPerfCallback>> = const { Cell::new(None) };
     static OFFSET_COMP_CB: Cell<Option<*const OffsetCompensationCallback>> = const { Cell::new(None) };
+    #[cfg(feature = "texture-cache")]
+    static HEIGHT_CHANGE_CB: Cell<Option<*const HeightChangeCallback>> = const { Cell::new(None) };
 }
 
 /// Register a callback to receive scroll telemetry during Tail mode inertia.
@@ -142,6 +165,25 @@ pub fn set_offset_compensation_callback(callback: OffsetCompensationCallback) {
 
 fn emit_offset_compensation(event: &OffsetCompensationEvent) {
     OFFSET_COMP_CB.with(|cell| {
+        if let Some(ptr) = cell.get() {
+            let cb = unsafe { &*ptr };
+            cb(event);
+        }
+    });
+}
+
+/// Register a callback to receive height change events during cached scroll.
+/// Fires when a visible item's measured height differs from its previous frame height
+/// while texture caching is active. Used to diagnose height oscillation.
+#[cfg(feature = "texture-cache")]
+pub fn set_height_change_callback(callback: HeightChangeCallback) {
+    let leaked = Box::leak(Box::new(callback));
+    HEIGHT_CHANGE_CB.with(|cell| cell.set(Some(leaked as *const HeightChangeCallback)));
+}
+
+#[cfg(feature = "texture-cache")]
+fn emit_height_change(event: &HeightChangeEvent) {
+    HEIGHT_CHANGE_CB.with(|cell| {
         if let Some(ptr) = cell.get() {
             let cb = unsafe { &*ptr };
             cb(event);
@@ -258,6 +300,13 @@ struct StateInner {
     /// `set_trace_items()` to diagnose card-specific rendering issues.
     #[cfg(feature = "texture-cache")]
     trace_items: HashSet<usize>,
+    /// Per-item height from the previous paint frame. Compared against current
+    /// frame to detect height oscillation during cached scroll.
+    #[cfg(feature = "texture-cache")]
+    prev_item_heights: HashMap<usize, Pixels>,
+    /// Monotonic paint frame counter for height change event timestamps.
+    #[cfg(feature = "texture-cache")]
+    paint_frame_count: u64,
 }
 
 /// Keeps track of a fractional scroll position within an item for restoration
@@ -483,6 +532,10 @@ impl ListState {
             streaming_items: HashSet::new(),
             #[cfg(feature = "texture-cache")]
             trace_items: HashSet::new(),
+            #[cfg(feature = "texture-cache")]
+            prev_item_heights: HashMap::new(),
+            #[cfg(feature = "texture-cache")]
+            paint_frame_count: 0,
         })));
         this.splice(0..0, item_count);
         this
@@ -1145,6 +1198,12 @@ impl ListState {
         let prev = inner.caching_enabled;
         inner.caching_enabled = enabled;
         inner.cache_clear_color = clear_color;
+        // Clear stale height tracking on disable so re-enable starts with a clean slate.
+        // Prevents spurious height_change events from stale index→height associations
+        // after splice/invalidation changes item ordering.
+        if prev && !enabled {
+            inner.prev_item_heights.clear();
+        }
         if prev != enabled {
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1172,6 +1231,7 @@ impl ListState {
         let prev = inner.caching_enabled;
         inner.caching_enabled = false;
         inner.visible_frames.clear();
+        inner.prev_item_heights.clear();
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1212,6 +1272,7 @@ impl ListState {
         inner.caching_enabled = false;
         inner.visible_frames.clear();
         inner.streaming_items.clear();
+        inner.prev_item_heights.clear();
         // Clear the renderer feedback set — all cached textures become stale.
         crate::clear_cached_region_ids();
         // Signal the renderer to flush all GPU texture pool resources on the next frame.
@@ -2198,14 +2259,23 @@ impl Element for List {
         #[cfg(feature = "texture-cache")]
         let trace_items_snapshot;
         #[cfg(feature = "texture-cache")]
+        let prev_item_heights_snapshot;
+        #[cfg(feature = "texture-cache")]
+        let frame_count;
+        #[cfg(feature = "texture-cache")]
         {
-            let state = self.state.0.borrow();
+            let mut state = self.state.0.borrow_mut();
             caching_enabled = state.caching_enabled;
             cache_clear_color = state.cache_clear_color;
             visible_frames_snapshot = state.visible_frames.clone();
             streaming_items_snapshot = state.streaming_items.clone();
             trace_items_snapshot = state.trace_items.clone();
+            prev_item_heights_snapshot = state.prev_item_heights.clone();
+            state.paint_frame_count += 1;
+            frame_count = state.paint_frame_count;
         }
+        #[cfg(feature = "texture-cache")]
+        let mut current_frame_heights: HashMap<usize, Pixels> = HashMap::new();
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             for item in &mut prepaint.layout.item_layouts {
                 #[cfg(feature = "texture-cache")]
@@ -2220,6 +2290,19 @@ impl Element for List {
                                 item.index, f32::from(item.origin.x), f32::from(item.origin.y),
                                 f32::from(item.size.width), f32::from(item.size.height));
                         }
+                        // Height change detection: STREAMING path
+                        if let Some(&prev_h) = prev_item_heights_snapshot.get(&item.index) {
+                            if prev_h != item.size.height {
+                                emit_height_change(&HeightChangeEvent {
+                                    item_index: item.index,
+                                    old_height: f32::from(prev_h),
+                                    new_height: f32::from(item.size.height),
+                                    cache_path: "STREAMING",
+                                    frame_count,
+                                });
+                            }
+                        }
+                        current_frame_heights.insert(item.index, item.size.height);
                         item.element.paint(window, cx);
                         continue;
                     }
@@ -2242,10 +2325,38 @@ impl Element for List {
                                 item.index, frames_visible, f32::from(item.origin.x), f32::from(item.origin.y),
                                 f32::from(item.size.width), f32::from(item.size.height));
                         }
+                        // Height change detection: TRANSIENT path
+                        if let Some(&prev_h) = prev_item_heights_snapshot.get(&item.index) {
+                            if prev_h != item.size.height {
+                                emit_height_change(&HeightChangeEvent {
+                                    item_index: item.index,
+                                    old_height: f32::from(prev_h),
+                                    new_height: f32::from(item.size.height),
+                                    cache_path: "TRANSIENT",
+                                    frame_count,
+                                });
+                            }
+                        }
+                        current_frame_heights.insert(item.index, item.size.height);
                         // Transient item — render Fresh without texture annotation.
                         item.element.paint(window, cx);
                         continue;
                     }
+
+                    // Determine cache path and detect height changes
+                    let cache_path = if has_cached_region(region_id) { "HIT" } else { "MISS" };
+                    if let Some(&prev_h) = prev_item_heights_snapshot.get(&item.index) {
+                        if prev_h != item.size.height {
+                            emit_height_change(&HeightChangeEvent {
+                                item_index: item.index,
+                                old_height: f32::from(prev_h),
+                                new_height: f32::from(item.size.height),
+                                cache_path,
+                                frame_count,
+                            });
+                        }
+                    }
+                    current_frame_heights.insert(item.index, item.size.height);
 
                     if has_cached_region(region_id) {
                         if is_traced {
@@ -2277,6 +2388,11 @@ impl Element for List {
                 item.element.paint(window, cx);
             }
         });
+        // Update prev_item_heights for next frame comparison
+        #[cfg(feature = "texture-cache")]
+        if caching_enabled {
+            self.state.0.borrow_mut().prev_item_heights = current_frame_heights;
+        }
 
         let list_state = self.state.clone();
         let height = bounds.size.height;
