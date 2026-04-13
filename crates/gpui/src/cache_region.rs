@@ -12,7 +12,7 @@ use crate::{
     point,
     scene::PaintOperation,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::ops::Range;
 
@@ -57,6 +57,28 @@ pub fn clear_cached_region(id: CacheRegionId) {
 ///   - `WgpuRenderer::recover()` — GPU device lost (EC-11)
 pub fn clear_cached_region_ids() {
     CACHED_REGION_IDS.with(|cell| cell.borrow_mut().clear());
+}
+
+// --- List → Renderer invalidation signal ---
+// The list sets a flag when all cached textures should be released (DPI, theme, font).
+// The renderer checks this at the start of each frame and flushes the texture pool.
+// This keeps gpui (list.rs) decoupled from gpui_wgpu (TexturePool).
+
+thread_local! {
+    static PENDING_POOL_INVALIDATION: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Signal the renderer to flush all GPU texture pool resources on the next frame.
+/// Called by `ListState::invalidate_all_caches()` for global visual changes
+/// (DPI, theme, font size). The renderer checks this via `take_pending_pool_invalidation()`.
+pub fn request_pool_invalidation() {
+    PENDING_POOL_INVALIDATION.with(|cell| cell.set(true));
+}
+
+/// Check and clear the pool invalidation flag. Returns `true` if invalidation
+/// was requested since the last call. Called by the renderer at frame start.
+pub fn take_pending_pool_invalidation() -> bool {
+    PENDING_POOL_INVALIDATION.with(|cell| cell.replace(false))
 }
 
 /// A completed cache region annotation in the scene.

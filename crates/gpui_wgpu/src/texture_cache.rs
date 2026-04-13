@@ -433,6 +433,11 @@ impl TexturePool {
 
     /// Evict all textures for items not in the visible set.
     /// Moves evicted textures to the free list. Returns the number evicted.
+    ///
+    /// Callers should include BOTH viewport AND overdraw item IDs in `visible_ids`.
+    /// Overdraw items (those just outside the viewport, tracked by `ItemLayout.is_overdraw`
+    /// in list.rs) should be kept cached for scroll readiness — they are lower priority
+    /// than viewport items but higher than fully off-screen items.
     #[allow(dead_code)] // Public API for Stream 2 (flux) and Stream 4 (axle)
     pub fn evict_offscreen(&mut self, visible_ids: &HashSet<u64>) -> u32 {
         let to_evict: Vec<u64> = self
@@ -670,6 +675,11 @@ impl WgpuRenderer {
         }
 
         self.ensure_texture_pool();
+
+        // Check if list.rs requested a full pool flush (DPI, theme, font change)
+        if gpui::take_pending_pool_invalidation() {
+            self.invalidate_texture_cache();
+        }
 
         // Advance frame counter for LRU tracking
         self.texture_pool.as_mut().unwrap().begin_frame();

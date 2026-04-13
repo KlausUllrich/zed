@@ -1166,8 +1166,8 @@ impl ListState {
         inner.streaming_items.clear();
         // Clear the renderer feedback set — all cached textures become stale.
         crate::clear_cached_region_ids();
-        // TODO(bolt): When TexturePool lands, call pool.invalidate_all() here
-        // to actually release GPU memory.
+        // Signal the renderer to flush all GPU texture pool resources on the next frame.
+        crate::request_pool_invalidation();
     }
 
     /// FR-4: Set the indices of items that are actively streaming content.
