@@ -70,14 +70,20 @@ thread_local! {
 
 /// Request a one-shot dump of all active cached textures to PNG files.
 /// The renderer will write images to `/tmp/cs-texture-dump/` on the next frame
-/// and clear the flag automatically. Safe to call from any thread-local context
-/// (app hotkey handler, debug callback, etc.).
+/// and clear the flag automatically.
+///
+/// IMPORTANT: Must be called from the main UI thread. The flag is thread-local;
+/// calling from a background thread sets a flag the renderer will never see.
+///
+/// Called by: CS app hotkey handler (Ctrl+Shift+D) in cs-app/src/app.rs
 pub fn request_texture_dump() {
     TEXTURE_DUMP_REQUESTED.with(|cell| cell.set(true));
 }
 
 /// Check and clear the texture dump request flag. Returns `true` if a dump
-/// was requested since the last call. Called by the renderer at frame start.
+/// was requested since the last call.
+///
+/// Consumed by: `WgpuRenderer::dump_active_textures_if_requested()` in gpui_wgpu
 pub fn take_texture_dump_request() -> bool {
     TEXTURE_DUMP_REQUESTED.with(|cell| cell.replace(false))
 }

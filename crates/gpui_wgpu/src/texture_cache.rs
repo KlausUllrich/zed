@@ -33,7 +33,10 @@ const INITIAL_GLOBALS_CAPACITY: u32 = 64;
 // ── Debug callback types ─────────────────────────────────────────────────────
 
 /// Per-frame debug data emitted by the texture cache for the F9 Cache tab.
-/// Constructed after process_cache_regions + draw_cached_regions complete.
+/// Emitted during process_cache_regions (pre-pass). Fields:
+/// - `fresh_ms`: this frame's texture rendering cost
+/// - `composite_ms`: PREVIOUS frame's compositing cost (one-frame delay;
+///   compositing happens after this callback fires)
 pub struct TextureCacheDebugFrame {
     /// Items rendered fresh this frame (cache miss).
     pub fresh_count: u32,
@@ -259,10 +262,11 @@ pub(crate) struct TexturePool {
     /// When true, composited textures get a subtle red tint overlay (5% opacity)
     /// so users can visually distinguish cached items from fresh-rendered ones.
     debug_tint: bool,
-    /// Wall-clock time spent in draw_cached_regions last frame (ms).
-    /// Reported in the debug callback one frame delayed (composite happens after
-    /// process_cache_regions emits the report).
-    last_composite_ms: f32,
+    /// Composite GPU pass duration from the previous frame (ms).
+    /// Always zero until draw_cached_regions completes at least once.
+    /// Debug callback reads this value one frame after it is written
+    /// (process_cache_regions emits the report before draw_cached_regions runs).
+    prev_composite_ms: f32,
     /// Uniform buffer for per-item viewport globals (one entry per fresh render).
     item_globals_buffer: wgpu::Buffer,
     /// Stride between entries in item_globals_buffer (alignment-padded).
@@ -614,7 +618,7 @@ impl WgpuRenderer {
             budget_bytes: DEFAULT_BUDGET_BYTES,
             eviction_count: 0,
             debug_tint: false,
-            last_composite_ms: 0.0,
+            prev_composite_ms: 0.0,
             item_globals_buffer,
             globals_entry_stride: entry_stride,
             globals_capacity: capacity,
@@ -945,7 +949,7 @@ impl WgpuRenderer {
                 cached_count,
                 texture_count: pool_stats.total,
                 memory_mb: pool_stats.memory_mb,
-                composite_ms: pool.last_composite_ms,
+                composite_ms: pool.prev_composite_ms,
                 fresh_ms,
                 items: debug_items,
                 pool: pool_stats,
@@ -1310,7 +1314,10 @@ impl WgpuRenderer {
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
-        let start = Instant::now();
+        // Time the full compositing pass. Written to pool.prev_composite_ms via
+        // record_composite_elapsed() at every exit point — including early returns.
+        // This value is read by process_cache_regions on the NEXT frame.
+        let started_at = Instant::now();
         let pool = match &self.texture_pool {
             Some(p) => p,
             None => return true,
@@ -1335,7 +1342,7 @@ impl WgpuRenderer {
                 instance_offset,
                 pass,
             ) {
-                self.store_composite_ms(start);
+                self.record_composite_elapsed(started_at);
                 return false;
             }
 
@@ -1357,20 +1364,22 @@ impl WgpuRenderer {
                     instance_offset,
                     pass,
                 ) {
-                    self.store_composite_ms(start);
+                    self.record_composite_elapsed(started_at);
                     return false;
                 }
             }
         }
 
-        self.store_composite_ms(start);
+        self.record_composite_elapsed(started_at);
         true
     }
 
-    /// Store the elapsed composite time for the debug callback (reported next frame).
-    fn store_composite_ms(&mut self, start: Instant) {
+    /// Record the elapsed composite time from the given start instant.
+    /// Called at every exit point of draw_cached_regions. The stored value
+    /// is read by process_cache_regions on the NEXT frame's debug callback.
+    fn record_composite_elapsed(&mut self, started_at: Instant) {
         if let Some(pool) = &mut self.texture_pool {
-            pool.last_composite_ms = start.elapsed().as_secs_f32() * 1000.0;
+            pool.prev_composite_ms = started_at.elapsed().as_secs_f32() * 1000.0;
         }
     }
 
@@ -1395,8 +1404,10 @@ impl WgpuRenderer {
 
     /// Dump all active cached textures to PNG files in `/tmp/cs-texture-dump/`.
     /// Reads back GPU textures synchronously via staging buffer + map_async.
-    /// Intended as a one-shot debug tool triggered by hotkey — causes a brief
-    /// GPU stall (acceptable for diagnostics, not for production rendering).
+    /// Performs one synchronous GPU readback per active texture. Each readback
+    /// creates a staging buffer and blocks the main thread until the GPU copy
+    /// completes. With 40 cached items this may stall for ~40-100ms total —
+    /// acceptable for one-shot diagnostics triggered by hotkey.
     ///
     /// Each file is named `item-{region_id}-{width}x{height}.png`.
     /// If text is missing from the PNG, the capture is broken.
@@ -1410,7 +1421,7 @@ impl WgpuRenderer {
         let pool = match &self.texture_pool {
             Some(p) => p,
             None => {
-                log::info!("event=texture_dump status=no_pool");
+                log::info!("event=texture_dump status=no_pool hint=no_list_items_rendered_yet");
                 return;
             }
         };
@@ -1428,7 +1439,18 @@ impl WgpuRenderer {
 
         let resources = self.resources();
         let format = self.surface_config.format;
-        let bytes_per_pixel = 4u32; // RGBA8/BGRA8
+        debug_assert!(
+            matches!(
+                format,
+                wgpu::TextureFormat::Bgra8Unorm
+                    | wgpu::TextureFormat::Bgra8UnormSrgb
+                    | wgpu::TextureFormat::Rgba8Unorm
+                    | wgpu::TextureFormat::Rgba8UnormSrgb
+            ),
+            "texture dump assumes 4-byte format, got {:?}",
+            format
+        );
+        let bytes_per_pixel = 4u32;
 
         log::info!(
             "event=texture_dump status=start count={} format={:?}",
@@ -1481,20 +1503,26 @@ impl WgpuRenderer {
                 },
             );
 
-            resources
+            let sub_index = resources
                 .queue
                 .submit(std::iter::once(encoder.finish()));
 
-            // Synchronous readback — blocks until GPU is done
+            // Synchronous readback — blocks until this specific copy completes
             let slice = staging.slice(..);
             let (tx, rx) = std::sync::mpsc::channel();
             slice.map_async(wgpu::MapMode::Read, move |result| {
                 let _ = tx.send(result);
             });
-            let _ = resources.device.poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: None,
-            });
+            if let Err(e) = resources.device.poll(wgpu::PollType::Wait {
+                submission_index: Some(sub_index),
+                timeout: Some(std::time::Duration::from_secs(5)),
+            }) {
+                log::error!(
+                    "event=texture_dump status=gpu_timeout region={} error={:?}",
+                    region_id, e
+                );
+                continue;
+            }
 
             match rx.recv() {
                 Ok(Ok(())) => {}
@@ -1514,6 +1542,7 @@ impl WgpuRenderer {
                 }
             }
 
+            // SAFETY: Both error arms above `continue`; reaching here guarantees map succeeded.
             let mapped = slice.get_mapped_range();
 
             // Convert BGRA→RGBA if needed, strip row padding
@@ -1535,6 +1564,8 @@ impl WgpuRenderer {
                         rgba_data.push(pixel[3]); // A
                     }
                 } else {
+                    // Assumes RGBA byte order (Rgba8Unorm, Rgba8UnormSrgb).
+                    // If a new surface format produces corrupt colours in PNGs, add a conversion here.
                     rgba_data.extend_from_slice(row_data);
                 }
             }
@@ -1546,24 +1577,21 @@ impl WgpuRenderer {
             let filename = format!("item-{}-{}x{}.png", region_id, width, height);
             let path = dump_dir.join(&filename);
 
-            #[cfg(feature = "texture-cache")]
-            {
-                match write_png(&path, width, height, &rgba_data) {
-                    Ok(()) => {
-                        log::info!(
-                            "event=texture_dump status=ok region={} file={} size={}x{}",
-                            region_id,
-                            path.display(),
-                            width,
-                            height
-                        );
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "event=texture_dump status=write_failed region={} error={}",
-                            region_id, e
-                        );
-                    }
+            match write_png(&path, width, height, &rgba_data) {
+                Ok(()) => {
+                    log::info!(
+                        "event=texture_dump status=ok region={} file={} size={}x{}",
+                        region_id,
+                        path.display(),
+                        width,
+                        height
+                    );
+                }
+                Err(e) => {
+                    log::error!(
+                        "event=texture_dump status=write_failed region={} error={}",
+                        region_id, e
+                    );
                 }
             }
         }
