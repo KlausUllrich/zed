@@ -2276,27 +2276,18 @@ impl Element for List {
         }
         #[cfg(feature = "texture-cache")]
         let mut current_frame_heights: HashMap<usize, Pixels> = HashMap::new();
-        // When caching is active, expand the content_mask vertically so edge items
-        // get full scene captures. Without expansion, insert_primitive culls
-        // primitives at viewport edges (bounds ∩ content_mask = empty at capture time).
+        // When caching is active, bypass content_mask entirely — textures have their
+        // own bounds and the list-level mask was culling edge-item primitives during
+        // texture capture (bounds ∩ content_mask = empty).
         #[cfg(feature = "texture-cache")]
-        let paint_bounds = if caching_enabled {
-            let expansion = px(5000.);
-            Bounds::new(
-                point(bounds.origin.x, bounds.origin.y - expansion),
-                size(
-                    bounds.size.width,
-                    bounds.size.height + expansion * 2.0,
-                ),
-            )
+        let content_mask = if caching_enabled {
+            None  // No clipping during texture capture — textures have their own bounds
         } else {
-            bounds
+            Some(ContentMask { bounds })
         };
-        #[cfg(feature = "texture-cache")]
-        let mask_bounds = paint_bounds;
         #[cfg(not(feature = "texture-cache"))]
-        let mask_bounds = bounds;
-        window.with_content_mask(Some(ContentMask { bounds: mask_bounds }), |window| {
+        let content_mask = Some(ContentMask { bounds });
+        window.with_content_mask(content_mask, |window| {
             for item in &mut prepaint.layout.item_layouts {
                 #[cfg(feature = "texture-cache")]
                 if caching_enabled {
