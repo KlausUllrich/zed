@@ -622,6 +622,13 @@ impl ListState {
         focus_handles: impl IntoIterator<Item = Option<FocusHandle>>,
     ) {
         let state = &mut *self.0.borrow_mut();
+        // CacheRegionId is index-based — splicing shifts indices and would corrupt
+        // the texture cache mapping. Caching must be disabled before splice.
+        #[cfg(feature = "texture-cache")]
+        debug_assert!(
+            !state.caching_enabled,
+            "splice while caching enabled would corrupt texture cache index mapping"
+        );
 
         let mut old_items = state.items.cursor::<Count>(());
         let mut new_items = old_items.slice(&Count(old_range.start), Bias::Right);
@@ -662,6 +669,11 @@ impl ListState {
         items: impl IntoIterator<Item = (Option<FocusHandle>, Pixels)>,
     ) {
         let state = &mut *self.0.borrow_mut();
+        #[cfg(feature = "texture-cache")]
+        debug_assert!(
+            !state.caching_enabled,
+            "splice while caching enabled would corrupt texture cache index mapping"
+        );
 
         let mut old_items = state.items.cursor::<Count>(());
         let mut new_items = old_items.slice(&Count(old_range.start), Bias::Right);

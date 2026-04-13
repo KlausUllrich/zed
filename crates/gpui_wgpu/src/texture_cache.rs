@@ -119,8 +119,8 @@ pub struct TextureCacheDebugLifecycle {
 
 type TextureCacheDebugCallback = Box<dyn Fn(TextureCacheDebugFrame) + Send + 'static>;
 
-// Single-producer, single-consumer: registered from the main thread before
-// the render thread starts; called only from the render thread.
+// Registration and usage both happen on the main thread — GPUI's renderer
+// (WgpuRenderer::draw) runs on the main event loop, not a separate render thread.
 // Cell<Option<*const _>> is sufficient — no lock needed, no Arc overhead.
 // Box::leak ensures the callback lives for the program's lifetime.
 thread_local! {
@@ -749,32 +749,31 @@ impl WgpuRenderer {
                 }
             }
 
-            // Check memory budget before allocating
-            let needed_bytes = texture_memory_bytes(tex_width, tex_height);
-            {
-                let pool = self.texture_pool.as_mut().unwrap();
-                if !pool.ensure_budget(needed_bytes) {
-                    if debug {
-                        debug_items.push(TextureCacheDebugItem {
-                            index: region_id,
-                            state: "over_budget",
-                            texture_width: 0,
-                            texture_height: 0,
-                            age_frames: 0,
-                            last_render_ms: 0.0,
-                            reason: Some("over_budget".into()),
-                        });
-                    }
-                    continue;
-                }
-            }
-
-            // Scope: release &mut pool before create_item_texture borrows &self
+            // Try reusing a free-list texture BEFORE checking budget.
+            // Reuse costs zero new memory — ensure_budget might needlessly evict
+            // the very texture we'd reuse if called first.
             let (texture, view, reused) = {
                 let pool = self.texture_pool.as_mut().unwrap();
                 if let Some(free) = pool.try_reuse(tex_width, tex_height) {
                     (free.texture, free.view, true)
                 } else {
+                    // No reusable texture — check memory budget before allocating new
+                    let needed_bytes = texture_memory_bytes(tex_width, tex_height);
+                    if !pool.ensure_budget(needed_bytes) {
+                        if debug {
+                            debug_items.push(TextureCacheDebugItem {
+                                index: region_id,
+                                state: "over_budget",
+                                texture_width: 0,
+                                texture_height: 0,
+                                age_frames: 0,
+                                last_render_ms: 0.0,
+                                reason: Some("over_budget".into()),
+                            });
+                        }
+                        continue;
+                    }
+                    // NLL ends the &mut pool borrow here — create_item_texture can borrow &self
                     let (t, v) = self.create_item_texture(tex_width, tex_height);
                     (t, v, false)
                 }
