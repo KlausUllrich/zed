@@ -622,13 +622,16 @@ impl ListState {
         focus_handles: impl IntoIterator<Item = Option<FocusHandle>>,
     ) {
         let state = &mut *self.0.borrow_mut();
-        // CacheRegionId is index-based — splicing shifts indices and would corrupt
-        // the texture cache mapping. Caching must be disabled before splice.
+        // Splice shifts item indices — all CacheRegionIds after splice point become stale.
+        // Invalidate entire cache to prevent compositing wrong textures.
         #[cfg(feature = "texture-cache")]
-        debug_assert!(
-            !state.caching_enabled,
-            "splice while caching enabled would corrupt texture cache index mapping"
-        );
+        if state.caching_enabled {
+            log::debug!("splice during caching — invalidating texture cache");
+            state.caching_enabled = false;
+            state.visible_frames.clear();
+            crate::clear_cached_region_ids();
+            crate::request_pool_invalidation();
+        }
 
         let mut old_items = state.items.cursor::<Count>(());
         let mut new_items = old_items.slice(&Count(old_range.start), Bias::Right);
@@ -670,10 +673,13 @@ impl ListState {
     ) {
         let state = &mut *self.0.borrow_mut();
         #[cfg(feature = "texture-cache")]
-        debug_assert!(
-            !state.caching_enabled,
-            "splice while caching enabled would corrupt texture cache index mapping"
-        );
+        if state.caching_enabled {
+            log::debug!("splice during caching — invalidating texture cache");
+            state.caching_enabled = false;
+            state.visible_frames.clear();
+            crate::clear_cached_region_ids();
+            crate::request_pool_invalidation();
+        }
 
         let mut old_items = state.items.cursor::<Count>(());
         let mut new_items = old_items.slice(&Count(old_range.start), Bias::Right);
