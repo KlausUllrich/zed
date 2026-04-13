@@ -1119,8 +1119,12 @@ impl ListState {
         self.0.borrow().caching_enabled
     }
 
-    /// Disable caching and let items render Fresh (interactive).
-    /// Called on scroll stop to restore full interactivity.
+    /// Disable GPU texture caching and reset per-item frame counters.
+    /// Called on scroll stop to restore full hit-test interactivity.
+    ///
+    /// NOTE: This does NOT purge the renderer feedback set. Textures already
+    /// cached remain valid and will be composited if caching is re-enabled.
+    /// For full purge (DPI change, theme change), use `invalidate_all_caches()`.
     #[cfg(feature = "texture-cache")]
     pub fn invalidate_all_item_caches(&self) {
         let mut inner = self.0.borrow_mut();
@@ -1128,12 +1132,18 @@ impl ListState {
         inner.visible_frames.clear();
     }
 
-    // --- Phase B: Per-item invalidation + streaming exclusion ---
+    // --- Selective cache invalidation ---
+    // Use `invalidate_item_cache` for single-item changes (content update, collapse).
+    // Use `invalidate_all_caches` for global changes (DPI, font, theme).
+    // Use `set_streaming_items` to exclude live-updating items from caching.
 
     /// FR-2.2: Invalidate the cached GPU texture for a single item.
     /// The item re-renders Fresh on the next frame. Does NOT disable caching globally.
     /// Used for: card collapse/expand (EC-1), search highlight changes (EC-2),
     /// explicit content changes.
+    ///
+    /// `index` must be the list index (including any spacer offsets), not the
+    /// items-array index — this is what the paint loop uses as `CacheRegionId`.
     #[cfg(feature = "texture-cache")]
     pub fn invalidate_item_cache(&self, index: usize) {
         // Remove this item from the renderer's "valid cache" feedback set.

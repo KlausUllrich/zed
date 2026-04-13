@@ -1,7 +1,11 @@
 //! GPU texture cache region types and scene extraction.
 //!
-//! Defines cache region annotations that the renderer uses to capture
-//! list items to offscreen GPU textures for scroll compositing.
+//! Two responsibilities:
+//! 1. Cache region annotations — `CacheRegion`, `CacheRegionId`, and scene helpers
+//!    used by the renderer to capture list items to GPU textures.
+//! 2. Renderer feedback state — `CACHED_REGION_IDS` thread-local tracks which
+//!    regions have valid textures. `has_cached_region` / `clear_cached_region` /
+//!    `clear_cached_region_ids` let the list query and invalidate this state.
 
 use crate::{
     Bounds, ContentMask, Hsla, Point, Primitive, ScaledPixels, Scene,
