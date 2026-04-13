@@ -1071,17 +1071,14 @@ impl WgpuRenderer {
                     let items = &mini_scene.subpixel_sprites[range];
                     let tex_info = self.atlas.get_texture_info(texture_id);
                     let data = unsafe { Self::instance_bytes(items) };
-                    let resources = self.resources();
-                    let pipeline = resources
-                        .pipelines
-                        .subpixel_sprites
-                        .as_ref()
-                        .unwrap_or(&resources.pipelines.mono_sprites);
+                    // Subpixel rendering uses dual-source blending that cannot round-trip
+                    // through an RGBA texture. Fall back to monochrome AA for cached items.
+                    // Imperceptible on HiDPI. See S487 analysis.
                     self.draw_instances_with_texture_and_globals(
                         data,
                         items.len() as u32,
                         &tex_info.view,
-                        pipeline,
+                        &self.resources().pipelines.mono_sprites,
                         globals_bind_group,
                         instance_offset,
                         &mut pass,
