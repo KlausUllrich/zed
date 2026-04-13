@@ -10,7 +10,7 @@
 //! for fast lookup; reuse requires exact (width, height) match.
 
 use super::*;
-use gpui::Hsla;
+use gpui::{CacheRegionId, Hsla, clear_cached_region};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -229,6 +229,10 @@ struct CacheEntry {
     size_class: SizeClass,
     last_used_frame: u64,
     memory_bytes: u64,
+    /// True when the texture was captured with actual primitives (total > 0).
+    /// False for blank captures. HIT path rejects entries with has_content=false
+    /// to break the stale-feedback → blank-texture cycle.
+    has_content: bool,
 }
 
 /// A recycled texture in the free list, available for reuse.
@@ -264,6 +268,10 @@ pub(crate) struct TexturePool {
     budget_bytes: u64,
     /// Cumulative eviction count (for debug reporting).
     eviction_count: u32,
+    /// Region IDs that had blank textures rejected by the guard.
+    /// Used for proof logging: when a guarded ID gets a successful recapture,
+    /// we log `event=guard_heal` to confirm the self-heal cycle works.
+    guarded_ids: HashSet<u64>,
     // Debug tint moved to thread-local in gpui::cache_region (set_debug_tint / is_debug_tint_enabled).
     /// Composite GPU pass duration from the previous frame (ms).
     /// Always zero until draw_cached_regions completes at least once.
@@ -388,6 +396,7 @@ impl TexturePool {
         view: wgpu::TextureView,
         width: u32,
         height: u32,
+        has_content: bool,
     ) {
         let memory_bytes = texture_memory_bytes(width, height);
         let size_class = SizeClass::from_height(height);
@@ -409,6 +418,7 @@ impl TexturePool {
                 size_class,
                 last_used_frame: self.current_frame,
                 memory_bytes,
+                has_content,
             },
         );
     }
@@ -422,6 +432,7 @@ impl TexturePool {
         view: wgpu::TextureView,
         width: u32,
         height: u32,
+        has_content: bool,
     ) {
         let size_class = SizeClass::from_height(height);
         let memory_bytes = texture_memory_bytes(width, height);
@@ -435,6 +446,7 @@ impl TexturePool {
                 size_class,
                 last_used_frame: self.current_frame,
                 memory_bytes,
+                has_content,
             },
         );
     }
@@ -620,6 +632,7 @@ impl WgpuRenderer {
             total_memory_bytes: 0,
             budget_bytes: DEFAULT_BUDGET_BYTES,
             eviction_count: 0,
+            guarded_ids: HashSet::new(),
             prev_composite_ms: 0.0,
             item_globals_buffer,
             globals_entry_stride: entry_stride,
@@ -754,7 +767,7 @@ impl WgpuRenderer {
             {
                 let pool = self.texture_pool.as_mut().unwrap();
                 if let Some(cached) = pool.active.get_mut(&region.id.0) {
-                    if cached.width == tex_width && cached.height == tex_height {
+                    if cached.width == tex_width && cached.height == tex_height && cached.has_content {
                         cached.last_used_frame = pool.current_frame;
                         cached_count += 1;
                         if debug {
@@ -884,6 +897,13 @@ impl WgpuRenderer {
                     "event=empty_recapture ix={} size={}x{} — stale HIT feedback, skipping",
                     region_id, tex_width, tex_height
                 );
+                // Proof logging: persist guard fire to file
+                {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/cs-mini-scene-log.txt") {
+                        writeln!(f, "event=guard_fire ix={} region_h={:.1} action=remove_from_pool", region_id, tex_height as f32).ok();
+                    }
+                }
                 // Return the reused texture to free list if we grabbed one
                 if reused {
                     let sc = SizeClass::from_height(tex_height);
@@ -895,7 +915,11 @@ impl WgpuRenderer {
                 }
                 // Ensure this region is NOT in active pool — on next frame,
                 // has_cached_region() returns false → list.rs paints fresh
-                self.texture_pool.as_mut().unwrap().active.remove(&region.id.0);
+                let pool = self.texture_pool.as_mut().unwrap();
+                pool.active.remove(&region.id.0);
+                pool.guarded_ids.insert(region.id.0);
+                // Also clear the thread-local feedback so list.rs sees MISS immediately
+                clear_cached_region(CacheRegionId(region.id.0));
                 continue;
             }
 
@@ -984,10 +1008,18 @@ impl WgpuRenderer {
                 "first_appearance"
             };
             let pool = self.texture_pool.as_mut().unwrap();
+            let has_content = total > 0;
             if reused {
-                pool.reactivate(region.id.0, texture, view, tex_width, tex_height);
+                pool.reactivate(region.id.0, texture, view, tex_width, tex_height, has_content);
             } else {
-                pool.insert(region.id.0, texture, view, tex_width, tex_height);
+                pool.insert(region.id.0, texture, view, tex_width, tex_height, has_content);
+            }
+            // Proof logging: guard self-heal confirmation
+            if has_content && pool.guarded_ids.remove(&region.id.0) {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/cs-mini-scene-log.txt") {
+                    writeln!(f, "event=guard_heal ix={} total={} action=fresh_capture_success", region_id, total).ok();
+                }
             }
             fresh_count += 1;
             if debug {
