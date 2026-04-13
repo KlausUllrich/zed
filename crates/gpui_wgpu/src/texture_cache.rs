@@ -847,6 +847,31 @@ impl WgpuRenderer {
                 log::info!("event=mini_scene_sprite ix={} type=quad first_y={:.1}",
                     region_id, first_quad.bounds.origin.y.0);
             }
+            // Persist mini-scene data to file (ring buffer loses these on scroll flood).
+            {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/cs-mini-scene-log.txt") {
+                    writeln!(f, "event=mini_scene ix={} region_y={:.1} region_h={:.1} quads={} shadows={} mono={} subpixel={} poly={} underlines={} paths={} total={}",
+                        region_id,
+                        region.bounds.origin.y.0,
+                        region.bounds.size.height.0,
+                        mini_scene.quads.len(),
+                        mini_scene.shadows.len(),
+                        mini_scene.monochrome_sprites.len(),
+                        mini_scene.subpixel_sprites.len(),
+                        mini_scene.polychrome_sprites.len(),
+                        mini_scene.underlines.len(),
+                        mini_scene.paths.len(),
+                        mini_scene.quads.len() + mini_scene.shadows.len() + mini_scene.monochrome_sprites.len() + mini_scene.subpixel_sprites.len() + mini_scene.polychrome_sprites.len() + mini_scene.underlines.len() + mini_scene.paths.len(),
+                    ).ok();
+                    if let Some(m) = mini_scene.monochrome_sprites.first() {
+                        writeln!(f, "  sprite ix={} type=mono first_y={:.1} trans_y={:.1}", region_id, m.bounds.origin.y.0, m.transformation.translation[1]).ok();
+                    }
+                    if let Some(q) = mini_scene.quads.first() {
+                        writeln!(f, "  sprite ix={} type=quad first_y={:.1}", region_id, q.bounds.origin.y.0).ok();
+                    }
+                }
+            }
             // Capture counts for F9 debug item (available to debug callback below).
             let (prim_quads, prim_mono, prim_subpixel, prim_paths) = (q, m, s, p);
 
