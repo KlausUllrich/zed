@@ -158,9 +158,18 @@ pub struct CacheRegion {
 
 impl Primitive {
     /// Translate bounds for texture capture (window→local coordinates).
-    /// Unlike `translate()`, this skips `transformation.translation` for
-    /// MonochromeSprite/SubpixelSprite to avoid the GPU double-offset bug
-    /// (shader computes: position = bounds.origin + transformation.translation).
+    ///
+    /// The GPU shader for MonochromeSprite/SubpixelSprite computes:
+    ///   `final_pos = rotation_scale * (unit_vertex * size + bounds.origin) + translation`
+    ///
+    /// For items that were replayed via `replay_with_y_offset`, `Primitive::translate()`
+    /// updates BOTH `bounds.origin` AND `transformation.translation`. This means
+    /// translation may be non-zero (containing accumulated scroll offsets).
+    ///
+    /// To produce correct texture-local coordinates, we must:
+    /// 1. Apply the capture offset to bounds.origin (window→texture space)
+    /// 2. Zero out transformation.translation so the shader doesn't add the
+    ///    stale scroll offset on top of the already-translated bounds.origin.
     pub fn translate_for_capture(&mut self, offset: Point<ScaledPixels>) {
         match self {
             Primitive::Shadow(s) => s.bounds.origin += offset,
@@ -174,12 +183,14 @@ impl Primitive {
             Primitive::Underline(u) => u.bounds.origin += offset,
             Primitive::MonochromeSprite(s) => {
                 s.bounds.origin += offset;
-                // CRITICAL: Do NOT update transformation.translation.
-                // GPU shader double-counts: position = bounds.origin + transformation.translation.
+                // Zero translation: the shader adds it to the already-translated
+                // bounds.origin. Leaving a stale scroll offset here causes text
+                // to render outside the texture bounds (invisible cards bug).
+                s.transformation.translation = [0.0, 0.0];
             }
             Primitive::SubpixelSprite(s) => {
                 s.bounds.origin += offset;
-                // CRITICAL: Same double-offset fix as MonochromeSprite.
+                s.transformation.translation = [0.0, 0.0];
             }
             Primitive::PolychromeSprite(s) => s.bounds.origin += offset,
             Primitive::Surface(s) => s.bounds.origin += offset,
@@ -225,10 +236,41 @@ impl Scene {
             bounds: local_bounds,
         };
 
+        log::info!(
+            "event=extract ix={} region_origin=({:.1},{:.1}) region_size=({:.1},{:.1}) ops={}",
+            region.id.0,
+            region.bounds.origin.x.0,
+            region.bounds.origin.y.0,
+            region.bounds.size.width.0,
+            region.bounds.size.height.0,
+            region.paint_op_range.len(),
+        );
+
         for op in &self.paint_operations[region.paint_op_range.clone()] {
             match op {
                 PaintOperation::Primitive(prim) => {
                     let mut translated = prim.clone();
+                    // Log sprite positions before/after translation for diagnostics.
+                    // Only log sprites (text) — they're the ones affected by the Y-offset bug.
+                    match &translated {
+                        Primitive::MonochromeSprite(s) => {
+                            let pre_y = s.bounds.origin.y.0;
+                            let trans_y = s.transformation.translation[1];
+                            log::debug!(
+                                "event=sprite_translate ix={} type=mono pre_y={:.1} trans_y={:.1} offset_y={:.1}",
+                                region.id.0, pre_y, trans_y, offset.y.0,
+                            );
+                        }
+                        Primitive::SubpixelSprite(s) => {
+                            let pre_y = s.bounds.origin.y.0;
+                            let trans_y = s.transformation.translation[1];
+                            log::debug!(
+                                "event=sprite_translate ix={} type=subpixel pre_y={:.1} trans_y={:.1} offset_y={:.1}",
+                                region.id.0, pre_y, trans_y, offset.y.0,
+                            );
+                        }
+                        _ => {}
+                    }
                     translated.translate_for_capture(offset);
                     translated.set_content_mask(expanded_mask.clone());
                     mini.insert_primitive(translated);
