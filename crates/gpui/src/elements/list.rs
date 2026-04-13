@@ -633,11 +633,15 @@ impl ListState {
         // Invalidate entire cache to prevent compositing wrong textures.
         #[cfg(feature = "texture-cache")]
         if state.caching_enabled {
-            log::debug!("splice during caching — invalidating texture cache");
             state.caching_enabled = false;
             state.visible_frames.clear();
             crate::clear_cached_region_ids();
             crate::request_pool_invalidation();
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            log::info!("event=caching_state enabled=false prev=true source=splice_focusable range={}..{} timestamp_ms={}", old_range.start, old_range.end, ts);
         }
 
         let mut old_items = state.items.cursor::<Count>(());
@@ -681,11 +685,15 @@ impl ListState {
         let state = &mut *self.0.borrow_mut();
         #[cfg(feature = "texture-cache")]
         if state.caching_enabled {
-            log::debug!("splice during caching — invalidating texture cache");
             state.caching_enabled = false;
             state.visible_frames.clear();
             crate::clear_cached_region_ids();
             crate::request_pool_invalidation();
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            log::info!("event=caching_state enabled=false prev=true source=splice_with_heights range={}..{} timestamp_ms={}", old_range.start, old_range.end, ts);
         }
 
         let mut old_items = state.items.cursor::<Count>(());
@@ -1134,8 +1142,16 @@ impl ListState {
     #[cfg(feature = "texture-cache")]
     pub fn set_item_caching_enabled(&self, enabled: bool, clear_color: Hsla) {
         let mut inner = self.0.borrow_mut();
+        let prev = inner.caching_enabled;
         inner.caching_enabled = enabled;
         inner.cache_clear_color = clear_color;
+        if prev != enabled {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            log::info!("event=caching_state enabled={} prev={} source=set_item_caching_enabled timestamp_ms={}", enabled, prev, ts);
+        }
     }
 
     /// Check if item caching is currently enabled.
@@ -1153,8 +1169,14 @@ impl ListState {
     #[cfg(feature = "texture-cache")]
     pub fn invalidate_all_item_caches(&self) {
         let mut inner = self.0.borrow_mut();
+        let prev = inner.caching_enabled;
         inner.caching_enabled = false;
         inner.visible_frames.clear();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        log::info!("event=caching_state enabled=false prev={} source=invalidate_all_item_caches timestamp_ms={}", prev, ts);
     }
 
     // --- Selective cache invalidation ---
@@ -1186,6 +1208,7 @@ impl ListState {
     #[cfg(feature = "texture-cache")]
     pub fn invalidate_all_caches(&self) {
         let mut inner = self.0.borrow_mut();
+        let prev = inner.caching_enabled;
         inner.caching_enabled = false;
         inner.visible_frames.clear();
         inner.streaming_items.clear();
@@ -1193,6 +1216,11 @@ impl ListState {
         crate::clear_cached_region_ids();
         // Signal the renderer to flush all GPU texture pool resources on the next frame.
         crate::request_pool_invalidation();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        log::info!("event=caching_state enabled=false prev={} source=invalidate_all_caches timestamp_ms={}", prev, ts);
     }
 
     /// FR-4: Set the indices of items that are actively streaming content.
