@@ -253,6 +253,11 @@ struct StateInner {
     /// `set_streaming_items()`. Cleared when streaming stops.
     #[cfg(feature = "texture-cache")]
     streaming_items: HashSet<usize>,
+    /// Debug: item indices that should emit detailed trace logs during the cache
+    /// pipeline (paint → capture → composite). Set by the host app via
+    /// `set_trace_items()` to diagnose card-specific rendering issues.
+    #[cfg(feature = "texture-cache")]
+    trace_items: HashSet<usize>,
 }
 
 /// Keeps track of a fractional scroll position within an item for restoration
@@ -476,6 +481,8 @@ impl ListState {
             visible_frames: HashMap::new(),
             #[cfg(feature = "texture-cache")]
             streaming_items: HashSet::new(),
+            #[cfg(feature = "texture-cache")]
+            trace_items: HashSet::new(),
         })));
         this.splice(0..0, item_count);
         this
@@ -1195,6 +1202,14 @@ impl ListState {
     #[cfg(feature = "texture-cache")]
     pub fn set_streaming_items(&self, items: HashSet<usize>) {
         self.0.borrow_mut().streaming_items = items;
+    }
+
+    /// Set item indices that should emit detailed trace logs through the cache
+    /// pipeline. Used to diagnose specific card types (e.g. AskUserQuestion)
+    /// that may have rendering issues in offscreen textures.
+    #[cfg(feature = "texture-cache")]
+    pub fn set_trace_items(&self, items: HashSet<usize>) {
+        self.0.borrow_mut().trace_items = items;
     }
 }
 
@@ -2153,20 +2168,30 @@ impl Element for List {
         #[cfg(feature = "texture-cache")]
         let streaming_items_snapshot;
         #[cfg(feature = "texture-cache")]
+        let trace_items_snapshot;
+        #[cfg(feature = "texture-cache")]
         {
             let state = self.state.0.borrow();
             caching_enabled = state.caching_enabled;
             cache_clear_color = state.cache_clear_color;
             visible_frames_snapshot = state.visible_frames.clone();
             streaming_items_snapshot = state.streaming_items.clone();
+            trace_items_snapshot = state.trace_items.clone();
         }
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             for item in &mut prepaint.layout.item_layouts {
                 #[cfg(feature = "texture-cache")]
                 if caching_enabled {
+                    let is_traced = trace_items_snapshot.contains(&item.index);
+
                     // FR-4: Streaming items render Fresh every frame — content is
                     // still changing, so any cached texture would be immediately stale.
                     if streaming_items_snapshot.contains(&item.index) {
+                        if is_traced {
+                            log::info!("event=trace_item ix={} path=streaming_skip bounds={:.0},{:.0},{:.0},{:.0}",
+                                item.index, f32::from(item.origin.x), f32::from(item.origin.y),
+                                f32::from(item.size.width), f32::from(item.size.height));
+                        }
                         item.element.paint(window, cx);
                         continue;
                     }
@@ -2184,12 +2209,23 @@ impl Element for List {
                         .copied()
                         .unwrap_or(0);
                     if frames_visible < TRANSIENT_SKIP_FRAMES && !has_cached_region(region_id) {
+                        if is_traced {
+                            log::info!("event=trace_item ix={} path=transient_skip frames_visible={} bounds={:.0},{:.0},{:.0},{:.0}",
+                                item.index, frames_visible, f32::from(item.origin.x), f32::from(item.origin.y),
+                                f32::from(item.size.width), f32::from(item.size.height));
+                        }
                         // Transient item — render Fresh without texture annotation.
                         item.element.paint(window, cx);
                         continue;
                     }
 
                     if has_cached_region(region_id) {
+                        if is_traced {
+                            log::info!("event=trace_item ix={} path=cache_hit bounds={:.0},{:.0},{:.0},{:.0} clear_color=h{:.3},s{:.3},l{:.3},a{:.1}",
+                                item.index, f32::from(item.origin.x), f32::from(item.origin.y),
+                                f32::from(item.size.width), f32::from(item.size.height),
+                                cache_clear_color.h, cache_clear_color.s, cache_clear_color.l, cache_clear_color.a);
+                        }
                         // Cache HIT — annotate empty region, skip paint.
                         // Renderer composites from cached texture.
                         window.begin_cache_region(region_id, item_bounds, cache_clear_color);
@@ -2198,6 +2234,12 @@ impl Element for List {
                     }
 
                     // Cache MISS — paint normally, annotate for texture capture.
+                    if is_traced {
+                        log::info!("event=trace_item ix={} path=cache_miss bounds={:.0},{:.0},{:.0},{:.0} clear_color=h{:.3},s{:.3},l{:.3},a{:.1}",
+                            item.index, f32::from(item.origin.x), f32::from(item.origin.y),
+                            f32::from(item.size.width), f32::from(item.size.height),
+                            cache_clear_color.h, cache_clear_color.s, cache_clear_color.l, cache_clear_color.a);
+                    }
                     window.begin_cache_region(region_id, item_bounds, cache_clear_color);
                     item.element.paint(window, cx);
                     window.end_cache_region(region_id);

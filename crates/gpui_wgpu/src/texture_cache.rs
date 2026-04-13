@@ -253,6 +253,9 @@ pub(crate) struct TexturePool {
     budget_bytes: u64,
     /// Cumulative eviction count (for debug reporting).
     eviction_count: u32,
+    /// When true, composited textures get a subtle red tint overlay (5% opacity)
+    /// so users can visually distinguish cached items from fresh-rendered ones.
+    debug_tint: bool,
     /// Uniform buffer for per-item viewport globals (one entry per fresh render).
     item_globals_buffer: wgpu::Buffer,
     /// Stride between entries in item_globals_buffer (alignment-padded).
@@ -603,6 +606,7 @@ impl WgpuRenderer {
             total_memory_bytes: 0,
             budget_bytes: DEFAULT_BUDGET_BYTES,
             eviction_count: 0,
+            debug_tint: false,
             item_globals_buffer,
             globals_entry_stride: entry_stride,
             globals_capacity: capacity,
@@ -782,6 +786,22 @@ impl WgpuRenderer {
             // Cache miss or dimension change — render to texture
             let render_start = if debug { Some(Instant::now()) } else { None };
             let mini_scene = scene.extract_region_as_mini_scene(region);
+
+            // Trace: count primitives in the mini-scene for diagnostic output.
+            // Only active when the debug callback is registered (F9 Cache tab).
+            if debug {
+                let q = mini_scene.quads.len() as u32;
+                let m = mini_scene.monochrome_sprites.len() as u32;
+                let s = mini_scene.subpixel_sprites.len() as u32;
+                let p = mini_scene.paths.len() as u32;
+                let total = q + m + s + p + mini_scene.shadows.len() as u32
+                    + mini_scene.underlines.len() as u32
+                    + mini_scene.polychrome_sprites.len() as u32;
+                log::debug!(
+                    "event=trace_capture ix={} texture={}x{} total={} quads={} mono={} subpixel={} paths={} reused={}",
+                    region_id, tex_width, tex_height, total, q, m, s, p, reused
+                );
+            }
 
             // Write per-item viewport globals at a unique offset
             let pool = self.texture_pool.as_ref().unwrap();
@@ -1282,6 +1302,7 @@ impl WgpuRenderer {
             Some(p) => p,
             None => return true,
         };
+        let tint_enabled = pool.debug_tint;
 
         for region in scene.cache_regions() {
             let entry = match pool.active.get(&region.id.0) {
@@ -1303,9 +1324,40 @@ impl WgpuRenderer {
             ) {
                 return false;
             }
+
+            // Debug tint: draw a semi-transparent red overlay on composited textures
+            // so users can visually identify which items are cached vs fresh.
+            if tint_enabled {
+                let tint_quad = gpui::Quad {
+                    order: 0,
+                    border_style: gpui::BorderStyle::default(),
+                    bounds: region.bounds,
+                    content_mask: gpui::ContentMask { bounds: region.bounds },
+                    background: gpui::solid_background(gpui::hsla(0.0, 1.0, 0.5, 0.05)),
+                    border_color: gpui::Hsla::default(),
+                    corner_radii: gpui::Corners::default(),
+                    border_widths: gpui::Edges::default(),
+                };
+                if !self.draw_quads(
+                    std::slice::from_ref(&tint_quad),
+                    instance_offset,
+                    pass,
+                ) {
+                    return false;
+                }
+            }
         }
 
         true
+    }
+
+    /// Enable or disable the debug tint overlay on composited cached textures.
+    /// When enabled, cached items get a subtle red tint (5% opacity) so users
+    /// can visually distinguish them from fresh-rendered items during scroll.
+    pub(crate) fn set_texture_cache_debug_tint(&mut self, enabled: bool) {
+        if let Some(pool) = &mut self.texture_pool {
+            pool.debug_tint = enabled;
+        }
     }
 
     /// Invalidate all cached textures and free-list textures.
