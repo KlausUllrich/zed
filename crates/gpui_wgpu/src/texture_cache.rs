@@ -74,6 +74,11 @@ pub struct TextureCacheDebugItem {
     pub last_render_ms: f32,
     /// Reason for state (e.g. "first_appearance", "size_change", "reused_from_pool").
     pub reason: Option<String>,
+    /// Primitive counts from the mini-scene (only populated for fresh-rendered items).
+    pub quads: u32,
+    pub mono_sprites: u32,
+    pub subpixel_sprites: u32,
+    pub paths: u32,
 }
 
 /// Texture pool statistics.
@@ -259,9 +264,7 @@ pub(crate) struct TexturePool {
     budget_bytes: u64,
     /// Cumulative eviction count (for debug reporting).
     eviction_count: u32,
-    /// When true, composited textures get a subtle red tint overlay (5% opacity)
-    /// so users can visually distinguish cached items from fresh-rendered ones.
-    debug_tint: bool,
+    // Debug tint moved to thread-local in gpui::cache_region (set_debug_tint / is_debug_tint_enabled).
     /// Composite GPU pass duration from the previous frame (ms).
     /// Always zero until draw_cached_regions completes at least once.
     /// Debug callback reads this value one frame after it is written
@@ -617,7 +620,6 @@ impl WgpuRenderer {
             total_memory_bytes: 0,
             budget_bytes: DEFAULT_BUDGET_BYTES,
             eviction_count: 0,
-            debug_tint: false,
             prev_composite_ms: 0.0,
             item_globals_buffer,
             globals_entry_stride: entry_stride,
@@ -739,6 +741,10 @@ impl WgpuRenderer {
                             "exceeds max_texture_dimension_2d ({})",
                             self.max_texture_size
                         )),
+                        quads: 0,
+                        mono_sprites: 0,
+                        subpixel_sprites: 0,
+                        paths: 0,
                     });
                 }
                 continue;
@@ -760,6 +766,10 @@ impl WgpuRenderer {
                                 age_frames: 0,
                                 last_render_ms: 0.0,
                                 reason: None,
+                                quads: 0,
+                                mono_sprites: 0,
+                                subpixel_sprites: 0,
+                                paths: 0,
                             });
                         }
                         continue;
@@ -787,6 +797,10 @@ impl WgpuRenderer {
                                 age_frames: 0,
                                 last_render_ms: 0.0,
                                 reason: Some("over_budget".into()),
+                                quads: 0,
+                                mono_sprites: 0,
+                                subpixel_sprites: 0,
+                                paths: 0,
                             });
                         }
                         continue;
@@ -804,20 +818,20 @@ impl WgpuRenderer {
             // Primitive count comparison: ALWAYS log for every region capture.
             // Comparing working items (Read cards) vs failing items (Thinking, Bash,
             // Permission, AskUserQuestion) reveals if text sprites are missing at capture time.
-            {
-                let q = mini_scene.quads.len() as u32;
-                let m = mini_scene.monochrome_sprites.len() as u32;
-                let s = mini_scene.subpixel_sprites.len() as u32;
-                let p = mini_scene.paths.len() as u32;
-                let poly = mini_scene.polychrome_sprites.len() as u32;
-                let shadows = mini_scene.shadows.len() as u32;
-                let underlines = mini_scene.underlines.len() as u32;
-                let total = q + m + s + p + poly + shadows + underlines;
-                log::info!(
-                    "event=capture_detail ix={} texture={}x{} total={} quads={} mono={} subpixel={} paths={} polychrome={} shadows={} underlines={} reused={}",
-                    region_id, tex_width, tex_height, total, q, m, s, p, poly, shadows, underlines, reused
-                );
-            }
+            let q = mini_scene.quads.len() as u32;
+            let m = mini_scene.monochrome_sprites.len() as u32;
+            let s = mini_scene.subpixel_sprites.len() as u32;
+            let p = mini_scene.paths.len() as u32;
+            let poly = mini_scene.polychrome_sprites.len() as u32;
+            let shadows = mini_scene.shadows.len() as u32;
+            let underlines = mini_scene.underlines.len() as u32;
+            let total = q + m + s + p + poly + shadows + underlines;
+            log::info!(
+                "event=capture_detail ix={} texture={}x{} total={} quads={} mono={} subpixel={} paths={} polychrome={} shadows={} underlines={} reused={}",
+                region_id, tex_width, tex_height, total, q, m, s, p, poly, shadows, underlines, reused
+            );
+            // Capture counts for F9 debug item (available to debug callback below).
+            let (prim_quads, prim_mono, prim_subpixel, prim_paths) = (q, m, s, p);
 
             // Write per-item viewport globals at a unique offset
             let pool = self.texture_pool.as_ref().unwrap();
@@ -916,6 +930,10 @@ impl WgpuRenderer {
                     age_frames: 0,
                     last_render_ms: render_ms,
                     reason: Some(reason.into()),
+                    quads: prim_quads,
+                    mono_sprites: prim_mono,
+                    subpixel_sprites: prim_subpixel,
+                    paths: prim_paths,
                 });
                 debug_events.push(TextureCacheDebugLifecycle {
                     event_type: if reused { "reuse" } else { "create" },
@@ -1322,7 +1340,7 @@ impl WgpuRenderer {
             Some(p) => p,
             None => return true,
         };
-        let tint_enabled = pool.debug_tint;
+        let tint_enabled = gpui::is_debug_tint_enabled();
 
         for region in scene.cache_regions() {
             let entry = match pool.active.get(&region.id.0) {
@@ -1380,15 +1398,6 @@ impl WgpuRenderer {
     fn record_composite_elapsed(&mut self, started_at: Instant) {
         if let Some(pool) = &mut self.texture_pool {
             pool.prev_composite_ms = started_at.elapsed().as_secs_f32() * 1000.0;
-        }
-    }
-
-    /// Enable or disable the debug tint overlay on composited cached textures.
-    /// When enabled, cached items get a subtle red tint (5% opacity) so users
-    /// can visually distinguish them from fresh-rendered items during scroll.
-    pub(crate) fn set_texture_cache_debug_tint(&mut self, enabled: bool) {
-        if let Some(pool) = &mut self.texture_pool {
-            pool.debug_tint = enabled;
         }
     }
 

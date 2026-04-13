@@ -1,11 +1,13 @@
 //! GPU texture cache region types and scene extraction.
 //!
-//! Two responsibilities:
+//! Three responsibilities:
 //! 1. Cache region annotations — `CacheRegion`, `CacheRegionId`, and scene helpers
 //!    used by the renderer to capture list items to GPU textures.
 //! 2. Renderer feedback state — `CACHED_REGION_IDS` thread-local tracks which
 //!    regions have valid textures. `has_cached_region` / `clear_cached_region` /
 //!    `clear_cached_region_ids` let the list query and invalidate this state.
+//! 3. Debug overlay control — `DEBUG_TINT_ENABLED` thread-local and `set_debug_tint` /
+//!    `is_debug_tint_enabled`. Set by the app (F9 toggle); read by `draw_cached_regions`.
 
 use crate::{
     Bounds, ContentMask, Hsla, Point, Primitive, ScaledPixels, Scene,
@@ -108,6 +110,29 @@ pub fn request_pool_invalidation() {
 /// was requested since the last call. Called by the renderer at frame start.
 pub fn take_pending_pool_invalidation() -> bool {
     PENDING_POOL_INVALIDATION.with(|cell| cell.replace(false))
+}
+
+// --- Debug tint overlay ---
+// The app sets this flag (e.g., via F9 toggle) to enable a red tint overlay
+// on all composited cached textures. The renderer reads this in draw_cached_regions.
+
+thread_local! {
+    static DEBUG_TINT_ENABLED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Enable or disable the debug tint overlay on composited cached textures.
+/// When enabled, the renderer draws a semi-transparent red overlay on every
+/// composited texture so users can visually distinguish cached items from
+/// fresh-rendered ones during scroll (see `draw_cached_regions` for alpha value).
+/// Call site: cs-debug F9 tab tint toggle button.
+pub fn set_debug_tint(enabled: bool) {
+    DEBUG_TINT_ENABLED.with(|cell| cell.set(enabled));
+}
+
+/// Check whether the debug tint overlay is enabled.
+/// Called by the renderer in `draw_cached_regions`.
+pub fn is_debug_tint_enabled() -> bool {
+    DEBUG_TINT_ENABLED.with(|cell| cell.get())
 }
 
 /// A completed cache region annotation in the scene.
