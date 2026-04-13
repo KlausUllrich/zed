@@ -230,6 +230,13 @@ struct StateInner {
     prev_tail_scroll_max: Pixels,
     /// Timestamp of the last inertia physics update. Used for delta-time calculation.
     last_inertia_time: Option<Instant>,
+    // === Texture Cache Edge Cases (Phase B Stream 4) ===
+    // EC-6:  Transient skip — items visible <2 frames skip texture creation (rapid scroll)
+    // EC-7:  Stale dimension removal — size-changed textures evicted before hit check
+    // EC-10: Drag parity — texture caching enabled during scrollbar drag (matches wheel)
+    // EC-11: GPU recovery — cached_region_ids cleared on device lost
+    // EC-12: Overdraw caching — trailing overdraw items included in layout when caching active
+    // EC-13: Jump reset — visible_frames cleared on programmatic scroll jumps
     /// When true, items are annotated for GPU texture caching during paint.
     #[cfg(feature = "texture-cache")]
     caching_enabled: bool,
@@ -752,9 +759,11 @@ impl ListState {
             scroll_top.offset_in_item = px(0.);
         }
 
-        // EC-13: Clear frame counters on programmatic scroll jump.
-        // All visible items change at once — transient skip (EC-6) will spread
-        // texture creation across subsequent frames.
+        // EC-13: Clear frame counters on programmatic scroll jump. Textures remain
+        // valid (has_cached_region still returns true) so cached items composite
+        // immediately. Only genuinely new items (first appearance after jump)
+        // go through the transient skip (EC-6), spreading texture creation
+        // across 2+ frames instead of a single-frame burst.
         #[cfg(feature = "texture-cache")]
         state.visible_frames.clear();
 
@@ -1513,9 +1522,11 @@ impl StateInner {
                     }
                 }
 
-                // EC-12: When texture caching is active, include overdraw items
-                // in item_layouts so they get prepainted/painted and cached.
-                // Their textures will be ready when they scroll into the viewport.
+                // EC-12: include_in_layout controls whether a rendered item enters
+                // the prepaint+paint pipeline. Separate from should_render above:
+                // overdraw items are always rendered (CPU layout) but only included
+                // in the paint list when caching is active, so their textures are
+                // ready before they scroll into view.
                 #[cfg(feature = "texture-cache")]
                 let include_in_layout = visible_height < available_height
                     || (self.caching_enabled && visible_height < available_height + self.overdraw);
@@ -1817,6 +1828,8 @@ impl StateInner {
 
                 // EC-6: Update per-item visibility frame counters.
                 // Increment for items in this frame's layout, remove items no longer visible.
+                // TODO(perf): HashSet alloc per frame (~20 items at 60fps). Replace with
+                // generation-stamp approach if profiling shows GC pressure during scroll.
                 #[cfg(feature = "texture-cache")]
                 if self.caching_enabled {
                     let current_indices: std::collections::HashSet<usize> =

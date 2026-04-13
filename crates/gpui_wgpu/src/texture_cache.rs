@@ -2,12 +2,30 @@
 //!
 //! Renders list items to offscreen GPU textures and composites them as quads
 //! during scroll. Textures persist across frames and are reused until invalidated.
+//!
+//! Phase B: LRU eviction, memory budget enforcement, size-class bucketed free lists,
+//! dynamic globals buffer. Textures allocated at exact content dimensions (the path
+//! compositing pipeline maps UV via screen_position / viewport_size, which requires
+//! textures to match content bounds exactly). Size classes organize the free list
+//! for fast lookup; reuse requires exact (width, height) match.
 
 use super::*;
 use gpui::Hsla;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
+
+// ── Constants ────────────────────────────────────────────────────────────────
+
+/// Default memory budget: 64MB (NFR-1).
+const DEFAULT_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Bytes per pixel for RGBA8/BGRA8 surface formats.
+const BYTES_PER_PIXEL: u64 = 4;
+
+/// Initial globals buffer capacity (items per frame that can be rendered fresh).
+/// Replaces Phase A's hard-coded 16-item cap.
+const INITIAL_GLOBALS_CAPACITY: u32 = 64;
 
 // ── Debug callback types ─────────────────────────────────────────────────────
 
@@ -18,7 +36,7 @@ pub struct TextureCacheDebugFrame {
     pub fresh_count: u32,
     /// Items composited from cached textures (cache hit).
     pub cached_count: u32,
-    /// Total textures currently in the pool.
+    /// Total textures currently in the pool (active + free).
     pub texture_count: u32,
     /// Estimated GPU memory used by texture pool (MB).
     pub memory_mb: f32,
@@ -30,7 +48,7 @@ pub struct TextureCacheDebugFrame {
     pub items: Vec<TextureCacheDebugItem>,
     /// Texture pool statistics.
     pub pool: TextureCacheDebugPool,
-    /// Lifecycle events this frame (create only in Phase A).
+    /// Lifecycle events this frame.
     pub events: Vec<TextureCacheDebugLifecycle>,
 }
 
@@ -38,33 +56,55 @@ pub struct TextureCacheDebugFrame {
 pub struct TextureCacheDebugItem {
     /// CacheRegionId value.
     pub index: u32,
-    /// Cache state: "cached", "fresh", "too_large", "pool_full".
+    /// Cache state: "cached", "fresh", "too_large", "over_budget".
     pub state: &'static str,
     /// Texture width (0 if no texture).
     pub texture_width: u32,
     /// Texture height (0 if no texture).
     pub texture_height: u32,
-    /// Frames since capture. Phase A: always 0.
+    /// Frames since last used.
     pub age_frames: u32,
-    /// Per-item render time (ms). Phase A: 0.0.
+    /// Per-item render time (ms).
     pub last_render_ms: f32,
-    /// Reason for state (e.g. "first_appearance", "size_change").
+    /// Reason for state (e.g. "first_appearance", "size_change", "reused_from_pool").
     pub reason: Option<String>,
 }
 
 /// Texture pool statistics.
 pub struct TextureCacheDebugPool {
+    /// Textures actively assigned to cached items.
     pub allocated: u32,
+    /// Textures in the free list awaiting reuse.
     pub free: u32,
+    /// Total textures (allocated + free).
     pub total: u32,
+    /// Total GPU memory (active + free) in MB.
     pub memory_mb: f32,
+    /// Memory budget in MB.
     pub budget_mb: f32,
+    /// Cumulative eviction count this session.
     pub eviction_count: u32,
+    /// Per-size-class breakdown.
+    pub size_classes: Vec<TextureCacheDebugSizeClass>,
+}
+
+/// Per-size-class pool statistics.
+pub struct TextureCacheDebugSizeClass {
+    /// Human-readable size class name.
+    pub name: &'static str,
+    /// Maximum height for this class (px).
+    pub max_height: u32,
+    /// Textures actively assigned to items in this class.
+    pub active_count: u32,
+    /// Textures in the free list for this class.
+    pub free_count: u32,
+    /// Total memory in this class (MB).
+    pub memory_mb: f32,
 }
 
 /// Texture lifecycle event.
 pub struct TextureCacheDebugLifecycle {
-    /// "create", "evict", "invalidate".
+    /// "create", "evict", "reuse", "destroy", "invalidate".
     pub event_type: &'static str,
     pub index: u32,
     pub width: u32,
@@ -108,25 +148,355 @@ fn emit_texture_cache_debug(frame: TextureCacheDebugFrame) {
     });
 }
 
-/// A cached offscreen texture for a list item.
-pub(crate) struct CachedItemTexture {
-    #[allow(dead_code)]
+// ── Size classes ─────────────────────────────────────────────────────────────
+
+/// Height-based size classes for free-list organization.
+/// Textures are allocated at exact content dimensions; size classes determine
+/// which free-list bucket a texture is stored in for O(1) lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SizeClass {
+    /// ≤256px height — compact cards, tool summaries.
+    Small,
+    /// ≤512px — standard conversation items.
+    Medium,
+    /// ≤1024px — expanded code blocks, diffs.
+    Large,
+    /// ≤2048px — very tall items.
+    XLarge,
+    /// >2048px — exceptional items (up to max_texture_size).
+    Oversize,
+}
+
+impl SizeClass {
+    fn from_height(height: u32) -> Self {
+        match height {
+            0..=256 => SizeClass::Small,
+            257..=512 => SizeClass::Medium,
+            513..=1024 => SizeClass::Large,
+            1025..=2048 => SizeClass::XLarge,
+            _ => SizeClass::Oversize,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            SizeClass::Small => "small",
+            SizeClass::Medium => "medium",
+            SizeClass::Large => "large",
+            SizeClass::XLarge => "xlarge",
+            SizeClass::Oversize => "oversize",
+        }
+    }
+
+    fn max_height(&self) -> u32 {
+        match self {
+            SizeClass::Small => 256,
+            SizeClass::Medium => 512,
+            SizeClass::Large => 1024,
+            SizeClass::XLarge => 2048,
+            SizeClass::Oversize => u32::MAX,
+        }
+    }
+
+    const ALL: [SizeClass; 5] = [
+        SizeClass::Small,
+        SizeClass::Medium,
+        SizeClass::Large,
+        SizeClass::XLarge,
+        SizeClass::Oversize,
+    ];
+}
+
+// ── Pool data structures ─────────────────────────────────────────────────────
+
+/// An active cached texture assigned to a specific list item.
+struct CacheEntry {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     width: u32,
     height: u32,
+    size_class: SizeClass,
+    last_used_frame: u64,
+    memory_bytes: u64,
 }
 
-/// Simple texture pool for Phase A. Stores per-item offscreen textures
-/// keyed by CacheRegionId. Textures persist across frames until invalidated.
-/// Phase B adds size-class bucketing and LRU eviction.
+/// A recycled texture in the free list, available for reuse.
+struct FreeTexture {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    width: u32,
+    height: u32,
+    memory_bytes: u64,
+}
+
+fn texture_memory_bytes(width: u32, height: u32) -> u64 {
+    width as u64 * height as u64 * BYTES_PER_PIXEL
+}
+
+/// Production-quality texture pool with LRU eviction, memory budget, and
+/// size-class bucketed free lists.
+///
+/// Public API for other streams (flux, axle):
+/// - `invalidate(region_id)` — remove a specific cached texture
+/// - `evict_offscreen(visible_ids)` — evict textures for non-visible items
+/// - `memory_stats()` — return current memory statistics
 pub(crate) struct TexturePool {
-    pub(crate) textures: HashMap<u64, CachedItemTexture>,
-    /// Uniform buffer for per-item viewport globals (different size per item).
+    /// Active textures keyed by CacheRegionId.
+    active: HashMap<u64, CacheEntry>,
+    /// Free textures bucketed by size class, available for reuse.
+    free_list: HashMap<SizeClass, Vec<FreeTexture>>,
+    /// Current frame counter (incremented each frame).
+    current_frame: u64,
+    /// Total GPU memory across active + free textures (bytes).
+    total_memory_bytes: u64,
+    /// Memory budget (bytes). Allocations exceeding this trigger eviction.
+    budget_bytes: u64,
+    /// Cumulative eviction count (for debug reporting).
+    eviction_count: u32,
+    /// Uniform buffer for per-item viewport globals (one entry per fresh render).
     item_globals_buffer: wgpu::Buffer,
     /// Stride between entries in item_globals_buffer (alignment-padded).
     globals_entry_stride: u64,
+    /// Current capacity of the globals buffer (number of entries).
+    globals_capacity: u32,
 }
+
+/// Memory statistics returned by `TexturePool::memory_stats()`.
+#[allow(dead_code)] // Public API for other streams (flux, axle)
+pub(crate) struct TextureCacheMemoryStats {
+    pub active_count: u32,
+    pub free_count: u32,
+    pub total_memory_bytes: u64,
+    pub budget_bytes: u64,
+    pub eviction_count: u32,
+}
+
+impl TexturePool {
+    /// Mark the start of a new frame. Advances the frame counter for LRU tracking.
+    fn begin_frame(&mut self) {
+        self.current_frame += 1;
+    }
+
+    /// Try to find a reusable texture from the free list with exact dimensions.
+    fn try_reuse(&mut self, width: u32, height: u32) -> Option<FreeTexture> {
+        let size_class = SizeClass::from_height(height);
+        let bucket = self.free_list.get_mut(&size_class)?;
+        let idx = bucket
+            .iter()
+            .position(|t| t.width == width && t.height == height)?;
+        Some(bucket.swap_remove(idx))
+    }
+
+    /// Move an active entry to the free list (eviction without GPU deallocation).
+    fn release_to_free_list(&mut self, region_id: u64) {
+        if let Some(entry) = self.active.remove(&region_id) {
+            let sc = entry.size_class;
+            let free = FreeTexture {
+                texture: entry.texture,
+                view: entry.view,
+                width: entry.width,
+                height: entry.height,
+                memory_bytes: entry.memory_bytes,
+            };
+            self.free_list.entry(sc).or_default().push(free);
+            // total_memory_bytes unchanged — texture moved, not destroyed
+        }
+    }
+
+    /// Destroy a single free-list texture, reclaiming GPU memory.
+    /// Prefers destroying from the largest size class first (frees more memory).
+    /// Returns bytes freed, or 0 if free list is empty.
+    fn destroy_any_free(&mut self) -> u64 {
+        for class in SizeClass::ALL.iter().rev() {
+            if let Some(bucket) = self.free_list.get_mut(class) {
+                if let Some(freed) = bucket.pop() {
+                    self.total_memory_bytes -= freed.memory_bytes;
+                    drop(freed.texture);
+                    return freed.memory_bytes;
+                }
+            }
+        }
+        0
+    }
+
+    /// Destroy an active entry, reclaiming GPU memory.
+    fn destroy_active(&mut self, region_id: u64) {
+        if let Some(entry) = self.active.remove(&region_id) {
+            self.total_memory_bytes -= entry.memory_bytes;
+            drop(entry.texture);
+        }
+    }
+
+    /// Find the LRU victim in the active map (oldest last_used_frame).
+    fn find_lru_victim(&self) -> Option<u64> {
+        self.active
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used_frame)
+            .map(|(id, _)| *id)
+    }
+
+    /// Ensure memory budget allows `needed_bytes` of new allocation.
+    /// Two-phase eviction: (1) destroy free-list textures, (2) evict + destroy LRU active.
+    /// Returns true if budget allows the allocation, false if nothing left to evict.
+    fn ensure_budget(&mut self, needed_bytes: u64) -> bool {
+        if self.total_memory_bytes + needed_bytes <= self.budget_bytes {
+            return true;
+        }
+
+        // Phase 1: destroy free-list textures (cheapest — no re-render needed)
+        while self.total_memory_bytes + needed_bytes > self.budget_bytes {
+            if self.destroy_any_free() == 0 {
+                break;
+            }
+        }
+
+        // Phase 2: evict LRU active entries and destroy immediately
+        while self.total_memory_bytes + needed_bytes > self.budget_bytes {
+            if let Some(victim_id) = self.find_lru_victim() {
+                self.destroy_active(victim_id);
+                self.eviction_count += 1;
+            } else {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Insert a newly rendered texture into the active map.
+    fn insert(
+        &mut self,
+        region_id: u64,
+        texture: wgpu::Texture,
+        view: wgpu::TextureView,
+        width: u32,
+        height: u32,
+    ) {
+        let memory_bytes = texture_memory_bytes(width, height);
+        let size_class = SizeClass::from_height(height);
+
+        // If replacing an existing entry, account for memory
+        if let Some(old) = self.active.remove(&region_id) {
+            self.total_memory_bytes -= old.memory_bytes;
+            drop(old.texture);
+        }
+
+        self.total_memory_bytes += memory_bytes;
+        self.active.insert(
+            region_id,
+            CacheEntry {
+                texture,
+                view,
+                width,
+                height,
+                size_class,
+                last_used_frame: self.current_frame,
+                memory_bytes,
+            },
+        );
+    }
+
+    // ── Public API (for flux, axle, obedi) ───────────────────────────────────
+
+    /// Invalidate a specific cached region. Moves the texture to the free list
+    /// for potential reuse (does not destroy GPU resources).
+    pub fn invalidate(&mut self, region_id: u64) {
+        self.release_to_free_list(region_id);
+    }
+
+    /// Evict all textures for items not in the visible set.
+    /// Moves evicted textures to the free list. Returns the number evicted.
+    pub fn evict_offscreen(&mut self, visible_ids: &HashSet<u64>) -> u32 {
+        let to_evict: Vec<u64> = self
+            .active
+            .keys()
+            .filter(|id| !visible_ids.contains(id))
+            .cloned()
+            .collect();
+        let count = to_evict.len() as u32;
+        for id in to_evict {
+            self.release_to_free_list(id);
+        }
+        count
+    }
+
+    /// Return current memory statistics.
+    pub fn memory_stats(&self) -> TextureCacheMemoryStats {
+        let free_count: u32 = self
+            .free_list
+            .values()
+            .map(|bucket| bucket.len() as u32)
+            .sum();
+        TextureCacheMemoryStats {
+            active_count: self.active.len() as u32,
+            free_count,
+            total_memory_bytes: self.total_memory_bytes,
+            budget_bytes: self.budget_bytes,
+            eviction_count: self.eviction_count,
+        }
+    }
+
+    /// Collect all active region IDs (for skip-paint decisions).
+    fn active_region_ids(&self) -> HashSet<u64> {
+        self.active.keys().cloned().collect()
+    }
+
+    /// Build debug pool statistics.
+    fn debug_pool_stats(&self) -> TextureCacheDebugPool {
+        let active_count = self.active.len() as u32;
+        let free_count: u32 = self
+            .free_list
+            .values()
+            .map(|b| b.len() as u32)
+            .sum();
+
+        let size_classes: Vec<TextureCacheDebugSizeClass> = SizeClass::ALL
+            .iter()
+            .map(|class| {
+                let ac = self
+                    .active
+                    .values()
+                    .filter(|e| e.size_class == *class)
+                    .count() as u32;
+                let fc = self
+                    .free_list
+                    .get(class)
+                    .map(|b| b.len() as u32)
+                    .unwrap_or(0);
+                let active_mem: u64 = self
+                    .active
+                    .values()
+                    .filter(|e| e.size_class == *class)
+                    .map(|e| e.memory_bytes)
+                    .sum();
+                let free_mem: u64 = self
+                    .free_list
+                    .get(class)
+                    .map(|b| b.iter().map(|t| t.memory_bytes).sum())
+                    .unwrap_or(0);
+                TextureCacheDebugSizeClass {
+                    name: class.name(),
+                    max_height: class.max_height(),
+                    active_count: ac,
+                    free_count: fc,
+                    memory_mb: (active_mem + free_mem) as f32 / (1024.0 * 1024.0),
+                }
+            })
+            .collect();
+
+        TextureCacheDebugPool {
+            allocated: active_count,
+            free: free_count,
+            total: active_count + free_count,
+            memory_mb: self.total_memory_bytes as f32 / (1024.0 * 1024.0),
+            budget_mb: self.budget_bytes as f32 / (1024.0 * 1024.0),
+            eviction_count: self.eviction_count,
+            size_classes,
+        }
+    }
+}
+
+// ── Color conversion ─────────────────────────────────────────────────────────
 
 fn hsla_to_wgpu_color(color: Hsla) -> wgpu::Color {
     let h = color.h;
@@ -174,6 +544,8 @@ fn hsla_to_wgpu_color(color: Hsla) -> wgpu::Color {
     }
 }
 
+// ── WgpuRenderer integration ─────────────────────────────────────────────────
+
 impl WgpuRenderer {
     fn ensure_texture_pool(&mut self) {
         if self.texture_pool.is_some() {
@@ -183,18 +555,55 @@ impl WgpuRenderer {
         let alignment = resources.device.limits().min_uniform_buffer_offset_alignment as u64;
         let globals_size = std::mem::size_of::<GlobalParams>() as u64;
         let entry_stride = globals_size.next_multiple_of(alignment);
-        let max_items: u64 = 16;
+        let capacity = INITIAL_GLOBALS_CAPACITY;
         let item_globals_buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("item_texture_globals"),
-            size: entry_stride * max_items,
+            size: entry_stride * capacity as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         self.texture_pool = Some(TexturePool {
-            textures: HashMap::new(),
+            active: HashMap::new(),
+            free_list: HashMap::new(),
+            current_frame: 0,
+            total_memory_bytes: 0,
+            budget_bytes: DEFAULT_BUDGET_BYTES,
+            eviction_count: 0,
             item_globals_buffer,
             globals_entry_stride: entry_stride,
+            globals_capacity: capacity,
         });
+    }
+
+    /// Grow the globals buffer if the current capacity is insufficient.
+    fn ensure_globals_capacity(&mut self, needed: u32) {
+        let current_capacity = self
+            .texture_pool
+            .as_ref()
+            .map(|p| p.globals_capacity)
+            .unwrap_or(0);
+        if needed <= current_capacity {
+            return;
+        }
+        let stride = self
+            .texture_pool
+            .as_ref()
+            .expect("texture pool must exist")
+            .globals_entry_stride;
+        let new_capacity = (needed * 2).max(INITIAL_GLOBALS_CAPACITY);
+        let resources = self.resources();
+        let new_buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("item_texture_globals"),
+            size: stride * new_capacity as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let pool = self
+            .texture_pool
+            .as_mut()
+            .expect("texture pool must exist");
+        pool.item_globals_buffer = new_buffer;
+        pool.globals_capacity = new_capacity;
     }
 
     fn create_item_texture(&self, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
@@ -219,6 +628,7 @@ impl WgpuRenderer {
 
     /// Pre-pass: render dirty cache regions to offscreen textures.
     /// Textures persist across frames — only re-rendered on cache miss or size change.
+    /// Phase B: LRU tracking, memory budget enforcement, free-list reuse.
     pub(crate) fn process_cache_regions(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -232,16 +642,20 @@ impl WgpuRenderer {
 
         self.ensure_texture_pool();
 
+        // Advance frame counter for LRU tracking
+        self.texture_pool.as_mut().unwrap().begin_frame();
+
+        // Grow globals buffer if needed (removes Phase A's 16-item cap)
+        self.ensure_globals_capacity(regions.len() as u32);
+
         let debug = has_debug_callback();
         let start = if debug { Some(Instant::now()) } else { None };
-        // Vec::new() is zero-alloc — heap allocates only on first push (guarded by `if debug`).
         let mut debug_items: Vec<TextureCacheDebugItem> = Vec::new();
         let mut debug_events: Vec<TextureCacheDebugLifecycle> = Vec::new();
         let mut fresh_count: u32 = 0;
         let mut cached_count: u32 = 0;
 
         let globals_size = std::mem::size_of::<GlobalParams>() as u64;
-        let max_renders_per_frame: usize = 16;
         let mut render_idx: usize = 0;
 
         for region in &regions {
@@ -253,43 +667,75 @@ impl WgpuRenderer {
             if tex_width > self.max_texture_size || tex_height > self.max_texture_size {
                 if debug {
                     debug_items.push(TextureCacheDebugItem {
-                        index: region_id, state: "fresh", texture_width: 0, texture_height: 0,
-                        age_frames: 0, last_render_ms: 0.0, reason: Some("too_large".into()),
+                        index: region_id,
+                        state: "too_large",
+                        texture_width: 0,
+                        texture_height: 0,
+                        age_frames: 0,
+                        last_render_ms: 0.0,
+                        reason: Some("too_large".into()),
                     });
                 }
                 continue;
             }
 
-            // Cache hit: texture exists with matching dimensions — reuse
-            let pool = self.texture_pool.as_ref().unwrap();
-            if let Some(cached) = pool.textures.get(&region.id.0) {
-                if cached.width == tex_width && cached.height == tex_height {
-                    cached_count += 1;
+            // Cache hit: texture exists with matching dimensions — touch and reuse
+            {
+                let pool = self.texture_pool.as_mut().unwrap();
+                if let Some(cached) = pool.active.get_mut(&region.id.0) {
+                    if cached.width == tex_width && cached.height == tex_height {
+                        cached.last_used_frame = pool.current_frame;
+                        cached_count += 1;
+                        if debug {
+                            debug_items.push(TextureCacheDebugItem {
+                                index: region_id,
+                                state: "cached",
+                                texture_width: cached.width,
+                                texture_height: cached.height,
+                                age_frames: 0,
+                                last_render_ms: 0.0,
+                                reason: None,
+                            });
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            // Check memory budget before allocating
+            let needed_bytes = texture_memory_bytes(tex_width, tex_height);
+            {
+                let pool = self.texture_pool.as_mut().unwrap();
+                if !pool.ensure_budget(needed_bytes) {
                     if debug {
                         debug_items.push(TextureCacheDebugItem {
-                            index: region_id, state: "cached",
-                            texture_width: cached.width, texture_height: cached.height,
-                            age_frames: 0, last_render_ms: 0.0, reason: None,
+                            index: region_id,
+                            state: "over_budget",
+                            texture_width: 0,
+                            texture_height: 0,
+                            age_frames: 0,
+                            last_render_ms: 0.0,
+                            reason: Some("over_budget".into()),
                         });
                     }
                     continue;
                 }
             }
 
-            // Cap renders per frame to globals buffer capacity
-            if render_idx >= max_renders_per_frame {
-                if debug {
-                    debug_items.push(TextureCacheDebugItem {
-                        index: region_id, state: "fresh", texture_width: 0, texture_height: 0,
-                        age_frames: 0, last_render_ms: 0.0, reason: Some("pool_full".into()),
-                    });
+            // Try reusing a free-list texture with matching dimensions
+            let (texture, view, reused) = {
+                let pool = self.texture_pool.as_mut().unwrap();
+                if let Some(free) = pool.try_reuse(tex_width, tex_height) {
+                    (free.texture, free.view, true)
+                } else {
+                    let (t, v) = self.create_item_texture(tex_width, tex_height);
+                    (t, v, false)
                 }
-                continue; // Remaining items render Fresh (no texture)
-            }
+            };
 
-            // Cache miss or dimension change — render to new texture
+            // Cache miss or dimension change — render to texture
+            let render_start = if debug { Some(Instant::now()) } else { None };
             let mini_scene = scene.extract_region_as_mini_scene(region);
-            let (texture, view) = self.create_item_texture(tex_width, tex_height);
 
             // Write per-item viewport globals at a unique offset
             let pool = self.texture_pool.as_ref().unwrap();
@@ -351,29 +797,54 @@ impl WgpuRenderer {
                 return false;
             }
 
-            // Store in pool (replaces any stale entry)
-            self.texture_pool.as_mut().unwrap().textures.insert(
-                region.id.0,
-                CachedItemTexture {
-                    texture,
-                    view,
-                    width: tex_width,
-                    height: tex_height,
-                },
-            );
+            // Store in pool
+            let render_ms = render_start
+                .map(|s| s.elapsed().as_secs_f32() * 1000.0)
+                .unwrap_or(0.0);
+            let reason = if reused {
+                "reused_from_pool"
+            } else {
+                "first_appearance"
+            };
+            let pool = self.texture_pool.as_mut().unwrap();
+            if reused {
+                let mem = texture_memory_bytes(tex_width, tex_height);
+                let sc = SizeClass::from_height(tex_height);
+                pool.active.insert(
+                    region.id.0,
+                    CacheEntry {
+                        texture,
+                        view,
+                        width: tex_width,
+                        height: tex_height,
+                        size_class: sc,
+                        last_used_frame: pool.current_frame,
+                        memory_bytes: mem,
+                    },
+                );
+            } else {
+                pool.insert(region.id.0, texture, view, tex_width, tex_height);
+            }
             fresh_count += 1;
             if debug {
                 debug_items.push(TextureCacheDebugItem {
-                    index: region_id, state: "fresh",
-                    texture_width: tex_width, texture_height: tex_height,
-                    age_frames: 0, last_render_ms: 0.0,
-                    reason: Some("first_appearance".into()),
+                    index: region_id,
+                    state: "fresh",
+                    texture_width: tex_width,
+                    texture_height: tex_height,
+                    age_frames: 0,
+                    last_render_ms: render_ms,
+                    reason: Some(reason.into()),
                 });
                 debug_events.push(TextureCacheDebugLifecycle {
-                    event_type: "create", index: region_id,
-                    width: tex_width, height: tex_height,
-                    render_ms: 0.0, age_frames: 0,
-                    pool_bucket: None, reason: None,
+                    event_type: if reused { "reuse" } else { "create" },
+                    index: region_id,
+                    width: tex_width,
+                    height: tex_height,
+                    render_ms,
+                    age_frames: 0,
+                    pool_bucket: Some(SizeClass::from_height(tex_height).name().into()),
+                    reason: None,
                 });
             }
             render_idx += 1;
@@ -381,34 +852,26 @@ impl WgpuRenderer {
 
         // Report all cached region IDs back to the list for skip-paint decisions
         let pool = self.texture_pool.as_ref().unwrap();
-        let cached_ids: HashSet<u64> = pool.textures.keys().cloned().collect();
+        let cached_ids = pool.active_region_ids();
         gpui::set_cached_region_ids(cached_ids);
 
         // Emit debug callback with per-frame stats
         if debug {
-            let fresh_ms = start.map(|s| s.elapsed().as_secs_f32() * 1000.0).unwrap_or(0.0);
+            let fresh_ms = start
+                .map(|s| s.elapsed().as_secs_f32() * 1000.0)
+                .unwrap_or(0.0);
             let pool = self.texture_pool.as_ref().unwrap();
-            let texture_count = pool.textures.len() as u32;
-            let memory_mb = pool.textures.values()
-                .map(|t| (t.width as f64) * (t.height as f64) * 4.0) // RGBA8 assumed (4 bytes/px). Actual: surface_config.format. May undercount on HDR.
-                .sum::<f64>() / (1024.0 * 1024.0);
+            let pool_stats = pool.debug_pool_stats();
 
             emit_texture_cache_debug(TextureCacheDebugFrame {
                 fresh_count,
                 cached_count,
-                texture_count,
-                memory_mb: memory_mb as f32,
-                composite_ms: 0.0, // Not measured here — draw_cached_regions is separate
+                texture_count: pool_stats.total,
+                memory_mb: pool_stats.memory_mb,
+                composite_ms: 0.0,
                 fresh_ms,
                 items: debug_items,
-                pool: TextureCacheDebugPool {
-                    allocated: texture_count,
-                    free: 0,   // Phase A: no pre-allocation
-                    total: texture_count,
-                    memory_mb: memory_mb as f32,
-                    budget_mb: 0.0, // Phase A: no limit
-                    eviction_count: 0,
-                },
+                pool: pool_stats,
                 events: debug_events,
             });
         }
@@ -622,6 +1085,9 @@ impl WgpuRenderer {
     }
 
     /// Composite all cached textures as quads into the current main render pass.
+    /// Uses the `composite` pipeline which maps UV as unit_vertex [0,1],
+    /// giving correct sampling for standalone item textures and enabling
+    /// sub-pixel scroll positioning (the quad carries fractional Y from bounds).
     pub(crate) fn draw_cached_regions(
         &self,
         scene: &Scene,
@@ -634,8 +1100,8 @@ impl WgpuRenderer {
         };
 
         for region in scene.cache_regions() {
-            let cached = match pool.textures.get(&region.id.0) {
-                Some(c) => c,
+            let entry = match pool.active.get(&region.id.0) {
+                Some(e) => e,
                 None => continue,
             };
 
@@ -646,8 +1112,8 @@ impl WgpuRenderer {
             if !self.draw_instances_with_texture(
                 sprite_data,
                 1,
-                &cached.view,
-                &self.resources().pipelines.paths,
+                &entry.view,
+                &self.resources().pipelines.composite,
                 instance_offset,
                 pass,
             ) {
@@ -658,10 +1124,13 @@ impl WgpuRenderer {
         true
     }
 
-    /// Invalidate all cached textures (e.g., on DPI or width change).
+    /// Invalidate all cached textures and free-list textures.
+    /// Called on DPI change, window resize, or theme change.
     pub(crate) fn invalidate_texture_cache(&mut self) {
         if let Some(pool) = &mut self.texture_pool {
-            pool.textures.clear();
+            pool.active.clear();
+            pool.free_list.clear();
+            pool.total_memory_bytes = 0;
         }
     }
 }

@@ -87,6 +87,11 @@ struct WgpuPipelines {
     shadows: wgpu::RenderPipeline,
     path_rasterization: wgpu::RenderPipeline,
     paths: wgpu::RenderPipeline,
+    /// Composites standalone cached textures with correct [0,1] UV mapping.
+    /// Unlike `paths` (which derives UV from screen position for the window-sized
+    /// intermediate), this pipeline uses unit_vertex as UV directly.
+    #[cfg(feature = "texture-cache")]
+    composite: wgpu::RenderPipeline,
     underlines: wgpu::RenderPipeline,
     mono_sprites: wgpu::RenderPipeline,
     subpixel_sprites: Option<wgpu::RenderPipeline>,
@@ -773,6 +778,23 @@ impl WgpuRenderer {
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(wgpu::ColorTargetState {
                 format: surface_format,
+                blend: Some(paths_blend.clone()),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            1,
+            &shader_module,
+        );
+
+        #[cfg(feature = "texture-cache")]
+        let composite = create_pipeline(
+            "composite",
+            "vs_composite",
+            "fs_path",
+            &layouts.globals,
+            &layouts.instances_with_texture,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
                 blend: Some(paths_blend),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
@@ -866,6 +888,8 @@ impl WgpuRenderer {
             shadows,
             path_rasterization,
             paths,
+            #[cfg(feature = "texture-cache")]
+            composite,
             underlines,
             mono_sprites,
             subpixel_sprites,
@@ -1733,6 +1757,13 @@ impl WgpuRenderer {
         self.resources = None;
         self.atlas
             .handle_device_lost(Arc::clone(&context.device), Arc::clone(&context.queue));
+
+        // EC-11: Clear stale texture cache state before rebuilding.
+        // new_internal() creates a fresh renderer with texture_pool: None,
+        // but the global cached_region_ids still holds IDs from the old pool.
+        // Without clearing, list.rs would skip-paint items that have no texture.
+        #[cfg(feature = "texture-cache")]
+        gpui::clear_cached_region_ids();
 
         *self = Self::new_internal(
             Some(gpu_context.clone()),

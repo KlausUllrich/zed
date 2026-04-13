@@ -1117,6 +1117,24 @@ fn fs_path(input: PathVarying) -> @location(0) vec4<f32> {
     return sample;
 }
 
+// Composite a standalone cached texture as a quad.
+// Unlike vs_path (which computes UV from screen_position / viewport_size for the
+// window-sized path intermediate), this shader uses unit_vertex as UV directly.
+// This gives correct [0,1] UV mapping for standalone item textures, enabling
+// sub-pixel positioning — the quad position carries the fractional scroll offset
+// while the texture is sampled uniformly across its full extent.
+@vertex
+fn vs_composite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> PathVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let sprite = b_path_sprites[instance_id];
+    let device_position = to_device_position(unit_vertex, sprite.bounds);
+
+    var out = PathVarying();
+    out.position = device_position;
+    out.texture_coords = unit_vertex;
+    return out;
+}
+
 // --- underlines --- //
 
 struct Underline {

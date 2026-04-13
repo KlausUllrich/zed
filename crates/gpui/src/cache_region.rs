@@ -45,9 +45,12 @@ pub fn clear_cached_region(id: CacheRegionId) {
     CACHED_REGION_IDS.with(|cell| cell.borrow_mut().remove(&id.0));
 }
 
-/// Clear all cached region IDs. Called on GPU device lost recovery
-/// and on global invalidation (theme/font/DPI changes) to prevent
-/// stale IDs from causing skip-paint on items without textures.
+/// Clear all cached region IDs to prevent stale IDs from causing
+/// skip-paint on items without textures.
+///
+/// Callers:
+///   - `WgpuRenderer::invalidate_texture_cache()` — DPI/width change
+///   - `WgpuRenderer::recover()` — GPU device lost (EC-11)
 pub fn clear_cached_region_ids() {
     CACHED_REGION_IDS.with(|cell| cell.borrow_mut().clear());
 }
