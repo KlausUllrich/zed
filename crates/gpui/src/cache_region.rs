@@ -59,6 +59,29 @@ pub fn clear_cached_region_ids() {
     CACHED_REGION_IDS.with(|cell| cell.borrow_mut().clear());
 }
 
+// --- Texture dump request ---
+// The app sets this flag (e.g., via hotkey) to request a one-shot PNG dump of all
+// active textures in the cache pool. The renderer checks this at the start of each
+// frame, performs the readback, and clears the flag.
+
+thread_local! {
+    static TEXTURE_DUMP_REQUESTED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Request a one-shot dump of all active cached textures to PNG files.
+/// The renderer will write images to `/tmp/cs-texture-dump/` on the next frame
+/// and clear the flag automatically. Safe to call from any thread-local context
+/// (app hotkey handler, debug callback, etc.).
+pub fn request_texture_dump() {
+    TEXTURE_DUMP_REQUESTED.with(|cell| cell.set(true));
+}
+
+/// Check and clear the texture dump request flag. Returns `true` if a dump
+/// was requested since the last call. Called by the renderer at frame start.
+pub fn take_texture_dump_request() -> bool {
+    TEXTURE_DUMP_REQUESTED.with(|cell| cell.replace(false))
+}
+
 // --- List → Renderer invalidation signal ---
 // The list sets a flag when all cached textures should be released (DPI, theme, font).
 // The renderer checks this at the start of each frame and flushes the texture pool.

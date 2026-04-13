@@ -1380,6 +1380,12 @@ impl WgpuRenderer {
             self.resources()
                 .queue
                 .submit(std::iter::once(encoder.finish()));
+
+            // One-shot texture dump: reads back all active cached textures to PNG.
+            // Triggered by gpui::request_texture_dump() (hotkey in CS app).
+            #[cfg(feature = "texture-cache")]
+            self.dump_active_textures_if_requested();
+
             frame.present();
             return;
         }
