@@ -503,9 +503,17 @@ impl TexturePool {
         // VISIBLE items are never evicted; if only VISIBLE remain, return false → render Fresh.
         while self.total_memory_bytes + needed_bytes > self.budget_bytes {
             if let Some(victim_id) = self.find_priority_victim(viewport_center_index) {
+                // Log before destroy removes the entry from the map.
+                if let Some(entry) = self.active.get(&victim_id) {
+                    log::info!(
+                        "event=eviction region={} bin={:?} item_index={} reason=budget_pressure",
+                        victim_id, entry.priority_bin, entry.item_index,
+                    );
+                }
                 self.destroy_active(victim_id);
                 self.eviction_count += 1;
             } else {
+                log::info!("event=eviction_blocked reason=all_visible");
                 return false;
             }
         }
