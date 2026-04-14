@@ -785,17 +785,23 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        // Composite pipeline: draws cached item textures back onto the framebuffer.
+        // Uses PREMULTIPLIED_ALPHA_BLENDING (One/OneMinusSrcAlpha on both channels).
+        // The fs_composite fragment shader handles both surface alpha modes —
+        // see shaders.wgsl for the full alpha path analysis. Unlike paths_blend
+        // (which uses additive alpha for intermediate accumulation), composite
+        // needs proper over-compositing on both channels.
         #[cfg(feature = "texture-cache")]
         let composite = create_pipeline(
             "composite",
             "vs_composite",
-            "fs_path",
+            "fs_composite",
             &layouts.globals,
             &layouts.instances_with_texture,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(wgpu::ColorTargetState {
                 format: surface_format,
-                blend: Some(paths_blend),
+                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
             1,
