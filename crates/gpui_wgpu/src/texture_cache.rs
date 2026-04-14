@@ -23,6 +23,9 @@ use std::path::Path as StdPath;
 /// Default memory budget: 64MB (NFR-1).
 const DEFAULT_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Frames an item can be outside viewport+buffer before becoming Distant (~0.5s at 60fps).
+const RECENT_WINDOW: u64 = 30;
+
 /// Bytes per pixel for RGBA8/BGRA8 surface formats.
 const BYTES_PER_PIXEL: u64 = 4;
 
@@ -114,6 +117,11 @@ pub struct TextureCacheDebugPool {
     pub eviction_count: u32,
     /// Per-size-class breakdown.
     pub size_classes: Vec<TextureCacheDebugSizeClass>,
+    /// Priority bin counts (from classify_entries). All zero if classification didn't run.
+    pub bin_visible: u32,
+    pub bin_buffer: u32,
+    pub bin_recent: u32,
+    pub bin_distant: u32,
 }
 
 /// Per-size-class pool statistics.
@@ -235,6 +243,24 @@ impl SizeClass {
     ];
 }
 
+// ── Priority bins for visibility-aware eviction ─────────────────────────────
+
+/// Eviction priority based on visibility. Lower bins are evicted first.
+/// Ord derive gives natural eviction ordering: Distant < Recent < Buffer < Visible.
+/// INVARIANT: Declaration order = eviction order. New variants must be inserted
+/// at the correct position to preserve this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PriorityBin {
+    /// Far from viewport — evicted FIRST.
+    Distant,
+    /// Left viewport within RECENT_WINDOW frames — brief grace period.
+    Recent,
+    /// In overdraw zone — evicted reluctantly.
+    Buffer,
+    /// In viewport — NEVER evicted.
+    Visible,
+}
+
 // ── Pool data structures ─────────────────────────────────────────────────────
 
 /// An active cached texture assigned to a specific list item.
@@ -250,6 +276,18 @@ struct CacheEntry {
     /// False for blank captures. HIT path rejects entries with has_content=false
     /// to break the stale-feedback → blank-texture cycle.
     has_content: bool,
+    /// Visibility-based eviction priority, recomputed each frame by classify_entries().
+    priority_bin: PriorityBin,
+    /// Frame when this entry first left the viewport+buffer zone.
+    /// `None` means the entry is currently inside viewport/buffer, or was just inserted
+    /// (classify_entries sets it on the first outside-viewport frame).
+    exit_frame: Option<u64>,
+    /// Conversation item index (list index). Used for distance calculations in eviction (Phase 2).
+    #[allow(dead_code)] // Phase 2: priority-bin eviction uses this for distance sorting
+    item_index: usize,
+    /// Primitive count from first successful capture (Phase 2: quality guard).
+    #[allow(dead_code)] // Phase 2: guard compares against baseline to detect degraded captures
+    baseline_total: Option<u32>,
 }
 
 /// A recycled texture in the free list, available for reuse.
@@ -317,6 +355,48 @@ impl TexturePool {
     /// Mark the start of a new frame. Advances the frame counter for LRU tracking.
     fn begin_frame(&mut self) {
         self.current_frame += 1;
+    }
+
+    /// Reclassify all active entries into priority bins based on current viewport state.
+    /// Called by: `WgpuRenderer::process_cache_regions()` at the start of each frame,
+    /// after `begin_frame()` and before any capture decisions.
+    fn classify_entries(
+        &mut self,
+        visible_ids: &HashSet<u64>,
+        buffer_ids: &HashSet<u64>,
+    ) {
+        let current_frame = self.current_frame;
+        for (region_id, entry) in self.active.iter_mut() {
+            if visible_ids.contains(region_id) {
+                entry.priority_bin = PriorityBin::Visible;
+                entry.exit_frame = None;
+            } else if buffer_ids.contains(region_id) {
+                entry.priority_bin = PriorityBin::Buffer;
+                entry.exit_frame = None;
+            } else {
+                // Outside viewport+buffer — classify by recency
+                match entry.exit_frame {
+                    None => {
+                        // First frame outside viewport+buffer
+                        entry.exit_frame = Some(current_frame);
+                        entry.priority_bin = PriorityBin::Recent;
+                    }
+                    Some(f) if current_frame.saturating_sub(f) < RECENT_WINDOW => {
+                        entry.priority_bin = PriorityBin::Recent;
+                    }
+                    Some(_) => {
+                        entry.priority_bin = PriorityBin::Distant;
+                    }
+                }
+            }
+
+            log::debug!(
+                "classify region={} bin={:?} exit_frame={:?}",
+                region_id,
+                entry.priority_bin,
+                entry.exit_frame,
+            );
+        }
     }
 
     /// Try to find a reusable texture from the free list with exact dimensions.
@@ -436,6 +516,10 @@ impl TexturePool {
                 last_used_frame: self.current_frame,
                 memory_bytes,
                 has_content,
+                priority_bin: PriorityBin::Distant,
+                exit_frame: None,
+                item_index: region_id as usize,
+                baseline_total: None,
             },
         );
     }
@@ -464,6 +548,10 @@ impl TexturePool {
                 last_used_frame: self.current_frame,
                 memory_bytes,
                 has_content,
+                priority_bin: PriorityBin::Distant,
+                exit_frame: None,
+                item_index: region_id as usize,
+                baseline_total: None,
             },
         );
     }
@@ -564,6 +652,16 @@ impl TexturePool {
             })
             .collect();
 
+        let (mut bin_vis, mut bin_buf, mut bin_rec, mut bin_dist) = (0u32, 0u32, 0u32, 0u32);
+        for entry in self.active.values() {
+            match entry.priority_bin {
+                PriorityBin::Visible => bin_vis += 1,
+                PriorityBin::Buffer => bin_buf += 1,
+                PriorityBin::Recent => bin_rec += 1,
+                PriorityBin::Distant => bin_dist += 1,
+            }
+        }
+
         TextureCacheDebugPool {
             allocated: active_count,
             free: free_count,
@@ -572,6 +670,10 @@ impl TexturePool {
             budget_mb: self.budget_bytes as f32 / (1024.0 * 1024.0),
             eviction_count: self.eviction_count,
             size_classes,
+            bin_visible: bin_vis,
+            bin_buffer: bin_buf,
+            bin_recent: bin_rec,
+            bin_distant: bin_dist,
         }
     }
 }
@@ -733,6 +835,18 @@ impl WgpuRenderer {
 
         // Advance frame counter for LRU tracking
         self.texture_pool.as_mut().unwrap().begin_frame();
+
+        // Classify active cache entries into priority bins based on viewport state.
+        // Must run before any capture decisions so eviction uses current-frame data.
+        // Skip when list.rs reported no items (hidden panel, not yet laid out) —
+        // entries keep their previous-frame bin until budget eviction clears them.
+        let (visible_ids, buffer_ids) = gpui::take_classification_ids();
+        if !visible_ids.is_empty() || !buffer_ids.is_empty() {
+            self.texture_pool
+                .as_mut()
+                .unwrap()
+                .classify_entries(&visible_ids, &buffer_ids);
+        }
 
         // Grow globals buffer if needed (removes Phase A's 16-item cap)
         self.ensure_globals_capacity(regions.len() as u32);

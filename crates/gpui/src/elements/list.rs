@@ -2280,6 +2280,24 @@ impl Element for List {
         // When caching is active, bypass content_mask entirely — textures have their
         // own bounds and the list-level mask was culling edge-item primitives during
         // texture capture (bounds ∩ content_mask = empty).
+        // -- Visibility classification for texture cache eviction --
+        // Collected here (before paint loop) so the renderer gets current-frame data.
+        // Empty sets are valid — renderer will skip classify_entries that frame.
+        #[cfg(feature = "texture-cache")]
+        if caching_enabled {
+            let mut visible_ids = HashSet::new();
+            let mut buffer_ids = HashSet::new();
+            for item in &prepaint.layout.item_layouts {
+                let region_id = item.index as u64;
+                if item.is_overdraw {
+                    buffer_ids.insert(region_id);
+                } else {
+                    visible_ids.insert(region_id);
+                }
+            }
+            crate::set_classification_ids(visible_ids, buffer_ids);
+        }
+
         #[cfg(feature = "texture-cache")]
         let content_mask = if caching_enabled {
             None  // No clipping during texture capture — textures have their own bounds

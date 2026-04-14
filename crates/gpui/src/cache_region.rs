@@ -1,6 +1,6 @@
 //! GPU texture cache region types and scene extraction.
 //!
-//! Three responsibilities:
+//! Four responsibilities:
 //! 1. Cache region annotations — `CacheRegion`, `CacheRegionId`, and scene helpers
 //!    used by the renderer to capture list items to GPU textures.
 //! 2. Renderer feedback state — `CACHED_REGION_IDS` thread-local tracks which
@@ -8,6 +8,10 @@
 //!    `clear_cached_region_ids` let the list query and invalidate this state.
 //! 3. Debug overlay control — `DEBUG_TINT_ENABLED` thread-local and `set_debug_tint` /
 //!    `is_debug_tint_enabled`. Set by the app (F9 toggle); read by `draw_cached_regions`.
+//! 4. Visibility classification signal — `VISIBLE_REGION_IDS` / `BUFFER_REGION_IDS`
+//!    thread-locals with `set_classification_ids` / `take_classification_ids`.
+//!    list.rs sets these each paint; the renderer reads them in process_cache_regions
+//!    to drive priority-bin classification for eviction ordering.
 
 use crate::{
     Bounds, ContentMask, Hsla, Point, Primitive, ScaledPixels, Scene,
@@ -183,6 +187,32 @@ pub fn set_mono_fallback_enabled(enabled: bool) {
 /// Check if mono sprite fallback is enabled.
 pub fn is_mono_fallback_enabled() -> bool {
     MONO_FALLBACK_ENABLED.with(|cell| cell.get())
+}
+
+// --- List → Renderer visibility classification ---
+// The list sets visible/buffer region ID sets each frame during paint.
+// The renderer reads these in process_cache_regions to classify cache entries
+// into priority bins (Visible, Buffer, Recent, Distant) for eviction ordering.
+
+thread_local! {
+    static VISIBLE_REGION_IDS: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
+    static BUFFER_REGION_IDS: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
+}
+
+/// Set the visible (in-viewport) and buffer (overdraw) region ID sets for this frame.
+/// Called by: `List::paint()` in list.rs, before the item paint loop.
+pub fn set_classification_ids(visible_ids: HashSet<u64>, buffer_ids: HashSet<u64>) {
+    VISIBLE_REGION_IDS.with(|cell| *cell.borrow_mut() = visible_ids);
+    BUFFER_REGION_IDS.with(|cell| *cell.borrow_mut() = buffer_ids);
+}
+
+/// Take the visible and buffer region ID sets. Returns (visible_ids, buffer_ids).
+/// Clears the thread-local state.
+/// Called by: `WgpuRenderer::process_cache_regions()` in gpui_wgpu.
+pub fn take_classification_ids() -> (HashSet<u64>, HashSet<u64>) {
+    let visible = VISIBLE_REGION_IDS.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    let buffer = BUFFER_REGION_IDS.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    (visible, buffer)
 }
 
 // --- Debug tint overlay ---
