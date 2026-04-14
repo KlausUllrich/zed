@@ -66,6 +66,7 @@ struct GammaParams {
 #[repr(C)]
 struct PathSprite {
     bounds: Bounds<ScaledPixels>,
+    content_mask: Bounds<ScaledPixels>,
 }
 
 #[derive(Clone, Debug)]
@@ -1599,12 +1600,19 @@ impl WgpuRenderer {
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
         let first_path = &paths[0];
+        // Paths intermediate compositing uses the full viewport as content_mask
+        // (no clipping — the path rasterization already handles content masks).
+        let no_clip = Bounds {
+            origin: Point { x: ScaledPixels(0.0), y: ScaledPixels(0.0) },
+            size: Size { width: ScaledPixels(self.surface_config.width as f32), height: ScaledPixels(self.surface_config.height as f32) },
+        };
         let sprites: Vec<PathSprite> = if paths.last().map(|p| &p.order) == Some(&first_path.order)
         {
             paths
                 .iter()
                 .map(|p| PathSprite {
                     bounds: p.clipped_bounds(),
+                    content_mask: no_clip,
                 })
                 .collect()
         } else {
@@ -1612,7 +1620,7 @@ impl WgpuRenderer {
             for path in paths.iter().skip(1) {
                 bounds = bounds.union(&path.clipped_bounds());
             }
-            vec![PathSprite { bounds }]
+            vec![PathSprite { bounds, content_mask: no_clip }]
         };
 
         let resources = self.resources();

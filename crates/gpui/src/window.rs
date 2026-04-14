@@ -3172,12 +3172,16 @@ impl Window {
         id: CacheRegionId,
         bounds: Bounds<Pixels>,
         clear_color: Hsla,
+        viewport_clip: Bounds<Pixels>,
     ) {
         self.invalidator.debug_assert_paint();
         let scale_factor = self.scale_factor();
-        self.next_frame
-            .scene
-            .begin_cache_region(id, bounds.scale(scale_factor), clear_color);
+        self.next_frame.scene.begin_cache_region(
+            id,
+            bounds.scale(scale_factor),
+            clear_color,
+            viewport_clip.scale(scale_factor),
+        );
     }
 
     /// Mark the end of the current cache region.

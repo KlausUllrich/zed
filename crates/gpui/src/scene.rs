@@ -41,7 +41,7 @@ pub struct Scene {
     #[cfg(feature = "texture-cache")]
     cache_regions_data: Vec<CacheRegion>,
     #[cfg(feature = "texture-cache")]
-    active_cache_region: Option<(CacheRegionId, Bounds<ScaledPixels>, Hsla, usize, DrawOrder)>,
+    active_cache_region: Option<(CacheRegionId, Bounds<ScaledPixels>, Hsla, usize, DrawOrder, Bounds<ScaledPixels>)>,
 }
 
 #[expect(missing_docs)]
@@ -190,6 +190,7 @@ impl Scene {
         id: CacheRegionId,
         bounds: Bounds<ScaledPixels>,
         clear_color: Hsla,
+        viewport_clip: Bounds<ScaledPixels>,
     ) {
         // Each cache region gets its own draw order via primitive_bounds.insert(),
         // same as every other primitive. This ensures correct z-position for
@@ -198,7 +199,7 @@ impl Scene {
         self.paint_operations
             .push(PaintOperation::BeginCacheRegion(id));
         let start = self.paint_operations.len();
-        self.active_cache_region = Some((id, bounds, clear_color, start, order));
+        self.active_cache_region = Some((id, bounds, clear_color, start, order, viewport_clip));
     }
 
     /// Mark the end of the current cache region.
@@ -207,7 +208,7 @@ impl Scene {
         let end = self.paint_operations.len();
         self.paint_operations
             .push(PaintOperation::EndCacheRegion(id));
-        if let Some((region_id, bounds, clear_color, start, order)) = self.active_cache_region.take() {
+        if let Some((region_id, bounds, clear_color, start, order, viewport_clip)) = self.active_cache_region.take() {
             debug_assert_eq!(region_id, id, "Mismatched cache region begin/end");
             self.cache_regions_data.push(CacheRegion {
                 id: region_id,
@@ -215,6 +216,7 @@ impl Scene {
                 clear_color,
                 paint_op_range: start..end,
                 composite_order: order,
+                viewport_clip,
             });
         }
     }

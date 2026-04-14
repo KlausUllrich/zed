@@ -1173,15 +1173,24 @@ impl WgpuRenderer {
 
                         if did_rasterize {
                             let first_path = &paths[0];
+                            // Content mask covers the full viewport (paths intermediate is viewport-sized).
+                            // No clipping needed — the path rasterization already clips content.
+                            let capture_mask = gpui::Bounds {
+                                origin: gpui::Point { x: ScaledPixels(0.0), y: ScaledPixels(0.0) },
+                                size: gpui::Size {
+                                    width: ScaledPixels(self.surface_config.width as f32),
+                                    height: ScaledPixels(self.surface_config.height as f32),
+                                },
+                            };
                             let sprites: Vec<PathSprite> =
                                 if paths.last().map(|p| &p.order) == Some(&first_path.order) {
-                                    paths.iter().map(|p| PathSprite { bounds: p.clipped_bounds() }).collect()
+                                    paths.iter().map(|p| PathSprite { bounds: p.clipped_bounds(), content_mask: capture_mask }).collect()
                                 } else {
                                     let mut bounds = first_path.clipped_bounds();
                                     for path in &paths[1..] {
                                         bounds = bounds.union(&path.clipped_bounds());
                                     }
-                                    vec![PathSprite { bounds }]
+                                    vec![PathSprite { bounds, content_mask: capture_mask }]
                                 };
                             let sprite_data = unsafe { Self::instance_bytes(&sprites) };
                             if let Some(intermediate_view) =
@@ -1496,6 +1505,7 @@ impl WgpuRenderer {
 
             let sprite = PathSprite {
                 bounds: region.bounds,
+                content_mask: region.viewport_clip,
             };
             let sprite_data = unsafe { Self::instance_bytes(std::slice::from_ref(&sprite)) };
             if !self.draw_instances_with_texture(

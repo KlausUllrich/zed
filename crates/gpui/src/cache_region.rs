@@ -227,6 +227,10 @@ pub struct CacheRegion {
     /// to composite cached textures at the correct z-position (after content
     /// batches, before overlay layers).
     pub composite_order: u32,
+    /// Clip rectangle for compositing (the list viewport in window coordinates).
+    /// Composite quads are clipped to this rect to prevent overflow outside
+    /// the list bounds.
+    pub viewport_clip: Bounds<ScaledPixels>,
 }
 
 impl Primitive {

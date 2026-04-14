@@ -2378,7 +2378,7 @@ impl Element for List {
                         }
                         // Cache HIT — annotate empty region, skip paint.
                         // Renderer composites from cached texture.
-                        window.begin_cache_region(region_id, item_bounds, cache_clear_color);
+                        window.begin_cache_region(region_id, item_bounds, cache_clear_color, bounds);
                         window.end_cache_region(region_id);
                         continue;
                     }
@@ -2390,7 +2390,7 @@ impl Element for List {
                             f32::from(item.size.width), f32::from(item.size.height),
                             cache_clear_color.h, cache_clear_color.s, cache_clear_color.l, cache_clear_color.a);
                     }
-                    window.begin_cache_region(region_id, item_bounds, cache_clear_color);
+                    window.begin_cache_region(region_id, item_bounds, cache_clear_color, bounds);
                     item.element.paint(window, cx);
                     window.end_cache_region(region_id);
                     continue;

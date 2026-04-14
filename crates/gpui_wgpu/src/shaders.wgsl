@@ -1086,12 +1086,14 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
 
 struct PathSprite {
     bounds: Bounds,
+    content_mask: Bounds,
 }
 @group(1) @binding(0) var<storage, read> b_path_sprites: array<PathSprite>;
 
 struct PathVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) texture_coords: vec2<f32>,
+    @location(1) clip_distances: vec4<f32>,
 }
 
 @vertex
@@ -1107,12 +1109,16 @@ fn vs_path(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     var out = PathVarying();
     out.position = device_position;
     out.texture_coords = texture_coords;
+    out.clip_distances = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask);
 
     return out;
 }
 
 @fragment
 fn fs_path(input: PathVarying) -> @location(0) vec4<f32> {
+    if any(input.clip_distances < vec4<f32>(0.0)) {
+        return vec4<f32>(0.0);
+    }
     let sample = textureSample(t_sprite, s_sprite, input.texture_coords);
     return sample;
 }
@@ -1132,6 +1138,7 @@ fn vs_composite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) 
     var out = PathVarying();
     out.position = device_position;
     out.texture_coords = unit_vertex;
+    out.clip_distances = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask);
     return out;
 }
 
@@ -1152,6 +1159,9 @@ fn vs_composite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) 
 //   1 = premultiplied surface (texture is straight) → pre-multiply
 @fragment
 fn fs_composite(input: PathVarying) -> @location(0) vec4<f32> {
+    if any(input.clip_distances < vec4<f32>(0.0)) {
+        return vec4<f32>(0.0);
+    }
     let sample = textureSample(t_sprite, s_sprite, input.texture_coords);
     if globals.premultiplied_alpha != 0u {
         // Texture has straight alpha — pre-multiply for One/OneMinusSrcAlpha blend
