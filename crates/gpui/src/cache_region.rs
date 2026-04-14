@@ -12,6 +12,9 @@
 //!    thread-locals with `set_classification_ids` / `take_classification_ids`.
 //!    list.rs sets these each paint; the renderer reads them in process_cache_regions
 //!    to drive priority-bin classification for eviction ordering.
+//! 5. Per-item invalidation signal — `INVALIDATED_REGION_IDS` thread-local with
+//!    `invalidate_pool_region` / `take_invalidated_region_ids`. list.rs marks items
+//!    for GPU texture purge; the renderer removes them from TexturePool.active.
 
 use crate::{
     Bounds, ContentMask, Hsla, Point, Primitive, ScaledPixels, Scene,
@@ -187,6 +190,28 @@ pub fn set_mono_fallback_enabled(enabled: bool) {
 /// Check if mono sprite fallback is enabled.
 pub fn is_mono_fallback_enabled() -> bool {
     MONO_FALLBACK_ENABLED.with(|cell| cell.get())
+}
+
+// --- List → Renderer per-item invalidation signal ---
+// When a specific item's cache is invalidated (e.g. user interaction on a permission card),
+// the old GPU texture must also be purged from TexturePool.active to prevent a 1-frame
+// stale HIT from the feedback delay.
+
+thread_local! {
+    static INVALIDATED_REGION_IDS: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
+}
+
+/// Mark a region for GPU texture purge. The renderer will remove the matching entry
+/// from `TexturePool.active` (moving the texture to the free list for reuse).
+/// Called by: `ListState::invalidate_item_cache()` in list.rs.
+pub fn invalidate_pool_region(id: CacheRegionId) {
+    INVALIDATED_REGION_IDS.with(|cell| cell.borrow_mut().insert(id.0));
+}
+
+/// Take the set of region IDs that need GPU texture purging. Clears the thread-local.
+/// Called by: `WgpuRenderer::process_cache_regions()` in gpui_wgpu.
+pub fn take_invalidated_region_ids() -> HashSet<u64> {
+    INVALIDATED_REGION_IDS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
 
 // --- List → Renderer visibility classification ---

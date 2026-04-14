@@ -1253,9 +1253,14 @@ impl ListState {
     /// items-array index — this is what the paint loop uses as `CacheRegionId`.
     #[cfg(feature = "texture-cache")]
     pub fn invalidate_item_cache(&self, index: usize) {
+        let region_id = CacheRegionId(index as u64);
         // Remove this item from the renderer's "valid cache" feedback set.
         // On the next paint, has_cached_region() returns false → cache MISS → re-render.
-        crate::clear_cached_region(CacheRegionId(index as u64));
+        crate::clear_cached_region(region_id);
+        // Signal the renderer to purge the old GPU texture from TexturePool.active.
+        // Without this, the 1-frame feedback delay means the stale texture could
+        // be served as HIT on the first scroll frame after invalidation.
+        crate::invalidate_pool_region(region_id);
         // Reset frame visibility counter so the item goes through the transient
         // skip check again (avoids caching a single-frame flash).
         self.0.borrow_mut().visible_frames.remove(&index);

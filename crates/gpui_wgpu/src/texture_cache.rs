@@ -833,6 +833,16 @@ impl WgpuRenderer {
             self.invalidate_texture_cache();
         }
 
+        // Purge specific items invalidated by list.rs (e.g. user interaction on a card).
+        // Moves textures to the free list for reuse rather than destroying GPU resources.
+        let invalidated = gpui::take_invalidated_region_ids();
+        if !invalidated.is_empty() {
+            let pool = self.texture_pool.as_mut().unwrap();
+            for region_id in &invalidated {
+                pool.invalidate(*region_id);
+            }
+        }
+
         // Advance frame counter for LRU tracking
         self.texture_pool.as_mut().unwrap().begin_frame();
 
