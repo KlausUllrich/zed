@@ -2273,6 +2273,7 @@ impl Element for List {
             prev_item_heights_snapshot = state.prev_item_heights.clone();
             state.paint_frame_count += 1;
             frame_count = state.paint_frame_count;
+            crate::card_timeline::bump_frame();
         }
         #[cfg(feature = "texture-cache")]
         let mut current_frame_heights: HashMap<usize, Pixels> = HashMap::new();
@@ -2293,6 +2294,8 @@ impl Element for List {
                 if caching_enabled {
                     let is_traced = trace_items_snapshot.contains(&item.index);
 
+                    let is_timeline_watched = crate::card_timeline::is_watched(item.index);
+
                     // FR-4: Streaming items render Fresh every frame — content is
                     // still changing, so any cached texture would be immediately stale.
                     if streaming_items_snapshot.contains(&item.index) {
@@ -2300,6 +2303,11 @@ impl Element for List {
                             log::info!("event=trace_item ix={} path=streaming_skip bounds={:.0},{:.0},{:.0},{:.0}",
                                 item.index, f32::from(item.origin.x), f32::from(item.origin.y),
                                 f32::from(item.size.width), f32::from(item.size.height));
+                        }
+                        if is_timeline_watched {
+                            crate::card_timeline::log_event(&format!(
+                                "[list_paint] item={} status=STREAMING in_rendered_range=true caching_enabled=true size={:.0}x{:.0}",
+                                item.index, f32::from(item.size.width), f32::from(item.size.height)));
                         }
                         // Height change detection: STREAMING path
                         if let Some(&prev_h) = prev_item_heights_snapshot.get(&item.index) {
@@ -2335,6 +2343,11 @@ impl Element for List {
                             log::info!("event=trace_item ix={} path=transient_skip frames_visible={} bounds={:.0},{:.0},{:.0},{:.0}",
                                 item.index, frames_visible, f32::from(item.origin.x), f32::from(item.origin.y),
                                 f32::from(item.size.width), f32::from(item.size.height));
+                        }
+                        if is_timeline_watched {
+                            crate::card_timeline::log_event(&format!(
+                                "[list_paint] item={} status=TRANSIENT in_rendered_range=true caching_enabled=true frames_visible={} size={:.0}x{:.0}",
+                                item.index, frames_visible, f32::from(item.size.width), f32::from(item.size.height)));
                         }
                         // Height change detection: TRANSIENT path
                         if let Some(&prev_h) = prev_item_heights_snapshot.get(&item.index) {
@@ -2376,6 +2389,11 @@ impl Element for List {
                                 f32::from(item.size.width), f32::from(item.size.height),
                                 cache_clear_color.h, cache_clear_color.s, cache_clear_color.l, cache_clear_color.a);
                         }
+                        if is_timeline_watched {
+                            crate::card_timeline::log_event(&format!(
+                                "[list_paint] item={} status=HIT in_rendered_range=true caching_enabled=true size={:.0}x{:.0}",
+                                item.index, f32::from(item.size.width), f32::from(item.size.height)));
+                        }
                         // Cache HIT — annotate empty region, skip paint.
                         // Renderer composites from cached texture.
                         window.begin_cache_region(region_id, item_bounds, cache_clear_color, bounds);
@@ -2390,9 +2408,44 @@ impl Element for List {
                             f32::from(item.size.width), f32::from(item.size.height),
                             cache_clear_color.h, cache_clear_color.s, cache_clear_color.l, cache_clear_color.a);
                     }
+                    if is_timeline_watched {
+                        crate::card_timeline::log_event(&format!(
+                            "[list_paint] item={} status=MISS in_rendered_range=true caching_enabled=true size={:.0}x{:.0}",
+                            item.index, f32::from(item.size.width), f32::from(item.size.height)));
+                    }
+                    // Fix: Replace content_mask_stack with a full-card mask during
+                    // MISS capture. Ancestor masks (e.g. viewport clip) would cause
+                    // paint_line() to skip glyphs outside the viewport — but the
+                    // texture needs ALL card content, including off-screen portions.
+                    // item_bounds is the full card area, not intersected with viewport.
+                    // The renderer's viewport_clip parameter to begin_cache_region
+                    // handles display-boundary culling separately.
+                    // NOTE: If element.paint() panics, content_mask_stack is left
+                    // corrupted — acceptable because GPUI panics are app-fatal.
+                    let ancestor_masks = std::mem::take(&mut window.content_mask_stack);
+                    window.content_mask_stack.push(ContentMask {
+                        bounds: item_bounds,
+                    });
+
                     window.begin_cache_region(region_id, item_bounds, cache_clear_color, bounds);
+                    let ops_before = window.next_frame.scene.len();
+                    if is_timeline_watched {
+                        crate::card_timeline::begin_clip_drop_count();
+                    }
                     item.element.paint(window, cx);
+                    let ops_after = window.next_frame.scene.len();
+                    if is_timeline_watched {
+                        let clipped = crate::card_timeline::end_clip_drop_count();
+                        crate::card_timeline::log_event(&format!(
+                            "[miss_paint] item={} ops_added={} ops_before={} ops_after={} clip_dropped={}",
+                            item.index, ops_after - ops_before, ops_before, ops_after, clipped,
+                        ));
+                    }
                     window.end_cache_region(region_id);
+
+                    // Restore after end_cache_region: scene finalization
+                    // does not read content_mask_stack.
+                    window.content_mask_stack = ancestor_masks;
                     continue;
                 }
 

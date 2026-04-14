@@ -155,6 +155,8 @@ pub struct WgpuRenderer {
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(feature = "texture-cache")]
     texture_pool: Option<texture_cache::TexturePool>,
+    #[cfg(feature = "texture-cache")]
+    pending_timeline_dumps: Vec<texture_cache::PendingTimelineDump>,
 }
 
 impl WgpuRenderer {
@@ -500,6 +502,8 @@ impl WgpuRenderer {
             device_lost: context.device_lost_flag(),
             #[cfg(feature = "texture-cache")]
             texture_pool: None,
+            #[cfg(feature = "texture-cache")]
+            pending_timeline_dumps: Vec::new(),
         })
     }
 
@@ -1392,6 +1396,10 @@ impl WgpuRenderer {
             // Triggered by gpui::request_texture_dump() (hotkey in CS app).
             #[cfg(feature = "texture-cache")]
             self.dump_active_textures_if_requested();
+
+            // Card timeline: flush any pending PNG dumps staged during process_cache_regions.
+            #[cfg(feature = "texture-cache")]
+            self.flush_timeline_dumps();
 
             frame.present();
             return;

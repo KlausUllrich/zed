@@ -890,12 +890,22 @@ impl Frame {
     }
 
     pub(crate) fn finish(&mut self, prev_frame: &mut Self) {
+        let states_before = prev_frame.element_states.len();
         for element_state_key in &self.accessed_element_states {
             if let Some((element_state_key, element_state)) =
                 prev_frame.element_states.remove_entry(element_state_key)
             {
                 self.element_states.insert(element_state_key, element_state);
             }
+        }
+        let dropped = prev_frame.element_states.len();
+        if dropped > 0 {
+            crate::card_timeline::log_event(&format!(
+                "[state_gc] states_before={} states_after={} dropped={}",
+                states_before,
+                states_before - dropped,
+                dropped,
+            ));
         }
 
         self.scene.finish();

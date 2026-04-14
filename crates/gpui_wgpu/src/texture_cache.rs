@@ -30,6 +30,23 @@ const BYTES_PER_PIXEL: u64 = 4;
 /// Replaces Phase A's hard-coded 16-item cap.
 const INITIAL_GLOBALS_CAPACITY: u32 = 64;
 
+// ── Card timeline PNG dump ───────────────────────────────────────────────────
+
+/// A staged GPU readback for the card timeline diagnostic.
+/// Created during process_cache_regions, flushed after queue.submit().
+#[cfg(feature = "texture-cache")]
+pub(crate) struct PendingTimelineDump {
+    pub staging: wgpu::Buffer,
+    pub width: u32,
+    pub height: u32,
+    pub padded_row_bytes: u32,
+    pub unpadded_row_bytes: u32,
+    pub region_id: u32,
+    pub primitive_count: u32,
+    pub sequence: u64,
+    pub format: wgpu::TextureFormat,
+}
+
 // ── Debug callback types ─────────────────────────────────────────────────────
 
 /// Per-frame debug data emitted by the texture cache for the F9 Cache tab.
@@ -1022,6 +1039,67 @@ impl WgpuRenderer {
             } else {
                 pool.insert(region.id.0, texture, view, tex_width, tex_height, has_content);
             }
+            // Card timeline: log capture event + stage PNG dump for watched item
+            if gpui::card_timeline::is_watched(region_id as usize) {
+                let pool_frame = pool.current_frame;
+                gpui::card_timeline::log_event(&format!(
+                    "[capture] item={} primitive_count={} texture_size={}x{} pool_frame={}",
+                    region_id, total, tex_width, tex_height, pool_frame,
+                ));
+                if gpui::card_timeline::should_dump_capture(total) {
+                    // Stage a GPU readback for this texture (flushed after queue.submit)
+                    let entry = pool.active.get(&region.id.0);
+                    if let Some(entry) = entry {
+                        let bytes_per_pixel = 4u32;
+                        let unpadded_row_bytes = tex_width * bytes_per_pixel;
+                        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+                        let padded_row_bytes = (unpadded_row_bytes + align - 1) / align * align;
+                        let buffer_size = padded_row_bytes as u64 * tex_height as u64;
+                        let resources = self.resources.as_ref().unwrap();
+                        let staging = resources.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("timeline_dump_staging"),
+                            size: buffer_size,
+                            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                            mapped_at_creation: false,
+                        });
+                        encoder.copy_texture_to_buffer(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: &entry.texture,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            wgpu::TexelCopyBufferInfo {
+                                buffer: &staging,
+                                layout: wgpu::TexelCopyBufferLayout {
+                                    offset: 0,
+                                    bytes_per_row: Some(padded_row_bytes),
+                                    rows_per_image: Some(tex_height),
+                                },
+                            },
+                            wgpu::Extent3d {
+                                width: tex_width,
+                                height: tex_height,
+                                depth_or_array_layers: 1,
+                            },
+                        );
+                        let seq = gpui::card_timeline::next_capture_sequence();
+                        let format = self.surface_config.format;
+                        self.pending_timeline_dumps.push(PendingTimelineDump {
+                            staging,
+                            width: tex_width,
+                            height: tex_height,
+                            padded_row_bytes,
+                            unpadded_row_bytes,
+                            region_id,
+                            primitive_count: total,
+                            sequence: seq,
+                            format,
+                        });
+                    }
+                }
+            }
+
             // Proof logging: guard self-heal confirmation
             if has_content && pool.guarded_ids.remove(&region.id.0) {
                 use std::io::Write;
@@ -1775,6 +1853,93 @@ impl WgpuRenderer {
             pool.active.len(),
             dump_dir.display()
         );
+    }
+
+    /// Flush pending card-timeline PNG dumps (called after queue.submit).
+    /// Reads back staged GPU buffers and writes PNGs to /tmp/.
+    #[cfg(feature = "texture-cache")]
+    pub(crate) fn flush_timeline_dumps(&mut self) {
+        if self.pending_timeline_dumps.is_empty() {
+            return;
+        }
+        let resources = self.resources.as_ref().unwrap();
+        let dumps: Vec<PendingTimelineDump> = self.pending_timeline_dumps.drain(..).collect();
+        for dump in &dumps {
+            let slice = dump.staging.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+            if let Err(e) = resources.device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_secs(5)),
+            }) {
+                gpui::card_timeline::log_event(&format!(
+                    "[capture_dump] item={} error=gpu_timeout {:?}",
+                    dump.region_id, e,
+                ));
+                continue;
+            }
+            match rx.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    gpui::card_timeline::log_event(&format!(
+                        "[capture_dump] item={} error=map_failed {}",
+                        dump.region_id, e,
+                    ));
+                    continue;
+                }
+                Err(e) => {
+                    gpui::card_timeline::log_event(&format!(
+                        "[capture_dump] item={} error=recv_failed {}",
+                        dump.region_id, e,
+                    ));
+                    continue;
+                }
+            }
+            let mapped = slice.get_mapped_range();
+            let is_bgra = matches!(
+                dump.format,
+                wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+            );
+            let mut rgba_data = Vec::with_capacity((dump.width * dump.height * 4) as usize);
+            for row in 0..dump.height {
+                let row_start = row as usize * dump.padded_row_bytes as usize;
+                let row_end = row_start + dump.unpadded_row_bytes as usize;
+                let row_data = &mapped[row_start..row_end];
+                if is_bgra {
+                    for pixel in row_data.chunks_exact(4) {
+                        rgba_data.push(pixel[2]);
+                        rgba_data.push(pixel[1]);
+                        rgba_data.push(pixel[0]);
+                        rgba_data.push(pixel[3]);
+                    }
+                } else {
+                    rgba_data.extend_from_slice(row_data);
+                }
+            }
+            drop(mapped);
+            dump.staging.unmap();
+
+            let path = format!(
+                "/tmp/cs-texture-capture-{}-{}.png",
+                dump.region_id, dump.sequence,
+            );
+            match write_png(StdPath::new(&path), dump.width, dump.height, &rgba_data) {
+                Ok(()) => {
+                    gpui::card_timeline::log_event(&format!(
+                        "[capture_dump] item={} seq={} file={} size={}x{} primitives={}",
+                        dump.region_id, dump.sequence, path, dump.width, dump.height, dump.primitive_count,
+                    ));
+                }
+                Err(e) => {
+                    gpui::card_timeline::log_event(&format!(
+                        "[capture_dump] item={} error=write_failed {}",
+                        dump.region_id, e,
+                    ));
+                }
+            }
+        }
     }
 }
 

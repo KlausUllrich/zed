@@ -88,6 +88,7 @@ impl Scene {
             .intersect(&primitive.content_mask().bounds);
 
         if clipped_bounds.is_empty() {
+            crate::card_timeline::record_clip_drop();
             return;
         }
 

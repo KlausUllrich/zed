@@ -40,6 +40,8 @@ pub mod profiler;
 pub mod queue;
 #[cfg(feature = "texture-cache")]
 mod cache_region;
+/// Per-frame diagnostic for QuestionCard texture capture timeline.
+pub mod card_timeline;
 mod scene;
 mod shared_string;
 mod shared_uri;
