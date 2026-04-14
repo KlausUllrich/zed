@@ -640,9 +640,14 @@ impl TexturePool {
         }
     }
 
-    /// Collect all active region IDs (for skip-paint decisions).
+    /// Collect active region IDs that have real content (for skip-paint decisions).
+    /// Entries with has_content=false (empty captures) are excluded so that
+    /// has_cached_region() returns false, forcing a full render on the next frame.
     fn active_region_ids(&self) -> HashSet<u64> {
-        self.active.keys().cloned().collect()
+        self.active.iter()
+            .filter(|(_, entry)| entry.has_content)
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     /// Build debug pool statistics.
