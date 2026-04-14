@@ -785,17 +785,22 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        // Composite pipeline: draws cached item textures back onto the framebuffer.
+        // Uses standard premultiplied-alpha "over" compositing for both color and alpha.
+        // The capture pass renders with standard GPUI pipelines, producing premultiplied
+        // content. Unlike paths_blend (which uses additive alpha for intermediate
+        // accumulation), composite needs proper over-compositing on both channels.
         #[cfg(feature = "texture-cache")]
         let composite = create_pipeline(
             "composite",
             "vs_composite",
-            "fs_path",
+            "fs_composite",
             &layouts.globals,
             &layouts.instances_with_texture,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(wgpu::ColorTargetState {
                 format: surface_format,
-                blend: Some(paths_blend),
+                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
             1,

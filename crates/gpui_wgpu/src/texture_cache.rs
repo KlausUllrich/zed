@@ -973,8 +973,16 @@ impl WgpuRenderer {
                         ],
                     });
 
-            // Render mini-scene to offscreen texture
-            let clear_color = hsla_to_wgpu_color(region.clear_color);
+            // Render mini-scene to offscreen texture.
+            // When debug tint is active, override the clear color to opaque magenta.
+            // If magenta cards appear during scroll, the composite pipeline works —
+            // the issue is in the texture content. If still invisible, the composite
+            // pipeline itself is broken.
+            let clear_color = if gpui::is_debug_tint_enabled() {
+                wgpu::Color { r: 1.0, g: 0.0, b: 1.0, a: 1.0 }
+            } else {
+                hsla_to_wgpu_color(region.clear_color)
+            };
             if !self.render_mini_scene_to_texture(
                 encoder,
                 &mini_scene,
@@ -1452,11 +1460,30 @@ impl WgpuRenderer {
             log::info!("event=tint_draw_start regions={} pool_active={}", scene.cache_regions().len(), pool.active.len());
         }
 
+        let mut composite_count: u32 = 0;
+        let mut skip_count: u32 = 0;
+
         for region in scene.cache_regions() {
             let entry = match pool.active.get(&region.id.0) {
                 Some(e) => e,
-                None => continue,
+                None => {
+                    skip_count += 1;
+                    continue;
+                }
             };
+
+            let use_composite = gpui::is_composite_pipeline_enabled();
+            if tint_enabled {
+                log::info!(
+                    "event=composite_draw ix={} pipeline={} bounds=({:.0},{:.0},{:.0},{:.0}) tex={}x{} has_content={}",
+                    region.id.0,
+                    if use_composite { "composite" } else { "paths" },
+                    region.bounds.origin.x.0, region.bounds.origin.y.0,
+                    region.bounds.size.width.0, region.bounds.size.height.0,
+                    entry.width, entry.height,
+                    entry.has_content,
+                );
+            }
 
             let sprite = PathSprite {
                 bounds: region.bounds,
@@ -1466,7 +1493,7 @@ impl WgpuRenderer {
                 sprite_data,
                 1,
                 &entry.view,
-                if gpui::is_composite_pipeline_enabled() {
+                if use_composite {
                     &self.resources().pipelines.composite
                 } else {
                     &self.resources().pipelines.paths
@@ -1477,6 +1504,8 @@ impl WgpuRenderer {
                 self.record_composite_elapsed(started_at);
                 return false;
             }
+
+            composite_count += 1;
 
             // Debug tint: draw a semi-transparent red overlay on composited textures
             // so users can visually identify which items are cached vs fresh.
@@ -1500,6 +1529,13 @@ impl WgpuRenderer {
                     return false;
                 }
             }
+        }
+
+        if tint_enabled {
+            log::info!(
+                "event=composite_summary composited={} skipped={} total_regions={}",
+                composite_count, skip_count, scene.cache_regions().len(),
+            );
         }
 
         self.record_composite_elapsed(started_at);

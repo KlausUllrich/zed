@@ -1135,6 +1135,31 @@ fn vs_composite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) 
     return out;
 }
 
+// Fragment shader for cached texture compositing.
+// The capture pass renders with premultiplied_alpha=0 in its globals (straight alpha
+// shader output). The GPU blend during capture determines the texture's alpha format:
+//
+// - Opaque surface → ALPHA_BLENDING (SrcAlpha/OneMinusSrcAlpha) → texture content
+//   is premultiplied (SrcAlpha factor pre-multiplies the straight shader output).
+//   Return as-is — already correct for One/OneMinusSrcAlpha composite blend.
+//
+// - PreMultiplied surface → PREMULTIPLIED_ALPHA_BLENDING (One/OneMinusSrcAlpha) →
+//   texture content is straight (One factor passes straight output unchanged).
+//   Must pre-multiply rgb by alpha before compositing with One/OneMinusSrcAlpha.
+//
+// The main-pass globals.premultiplied_alpha distinguishes these cases:
+//   0 = opaque surface (texture is premultiplied) → pass through
+//   1 = premultiplied surface (texture is straight) → pre-multiply
+@fragment
+fn fs_composite(input: PathVarying) -> @location(0) vec4<f32> {
+    let sample = textureSample(t_sprite, s_sprite, input.texture_coords);
+    if globals.premultiplied_alpha != 0u {
+        // Texture has straight alpha — pre-multiply for One/OneMinusSrcAlpha blend
+        return vec4<f32>(sample.rgb * sample.a, sample.a);
+    }
+    return sample;
+}
+
 // --- underlines --- //
 
 struct Underline {
