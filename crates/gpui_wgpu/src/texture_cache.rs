@@ -800,7 +800,7 @@ impl WgpuRenderer {
                 } else {
                     // No reusable texture — check memory budget before allocating new
                     let needed_bytes = texture_memory_bytes(tex_width, tex_height);
-                    if !pool.ensure_budget(needed_bytes) {
+                    if gpui::is_budget_eviction_enabled() && !pool.ensure_budget(needed_bytes) {
                         if debug {
                             debug_items.push(TextureCacheDebugItem {
                                 index: region_id,
@@ -1473,7 +1473,7 @@ impl WgpuRenderer {
                     border_style: gpui::BorderStyle::default(),
                     bounds: region.bounds,
                     content_mask: gpui::ContentMask { bounds: region.bounds },
-                    background: gpui::solid_background(gpui::hsla(0.0, 1.0, 0.5, 0.05)),
+                    background: gpui::solid_background(gpui::hsla(0.0, 1.0, 0.5, 0.15)),
                     border_color: gpui::Hsla::default(),
                     corner_radii: gpui::Corners::default(),
                     border_widths: gpui::Edges::default(),

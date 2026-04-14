@@ -112,6 +112,50 @@ pub fn take_pending_pool_invalidation() -> bool {
     PENDING_POOL_INVALIDATION.with(|cell| cell.replace(false))
 }
 
+// --- Phase B feature toggles ---
+// Runtime toggles for Phase B features that can cause blank cards.
+// Each defaults to ON (Phase B behavior). Toggle OFF for Phase A behavior.
+// Set by F9 debug tab; read by list.rs and texture_cache.rs.
+
+thread_local! {
+    /// EC-6: When ON, items must be visible for TRANSIENT_SKIP_FRAMES before capture.
+    /// OFF = capture on first frame (Phase A behavior).
+    static TRANSIENT_SKIP_ENABLED: Cell<bool> = const { Cell::new(true) };
+    /// When ON, 64MB memory budget triggers LRU eviction.
+    /// OFF = no eviction, textures persist forever (Phase A behavior).
+    static BUDGET_EVICTION_ENABLED: Cell<bool> = const { Cell::new(true) };
+    /// EC-12: When ON, items beyond viewport are laid out and cached.
+    /// OFF = only cache items inside viewport (Phase A behavior).
+    static OVERDRAW_CACHING_ENABLED: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Toggle transient skip (EC-6). OFF = capture on first frame (Phase A).
+pub fn set_transient_skip_enabled(enabled: bool) {
+    TRANSIENT_SKIP_ENABLED.with(|cell| cell.set(enabled));
+}
+/// Check if transient skip is enabled.
+pub fn is_transient_skip_enabled() -> bool {
+    TRANSIENT_SKIP_ENABLED.with(|cell| cell.get())
+}
+
+/// Toggle budget eviction. OFF = no eviction (Phase A).
+pub fn set_budget_eviction_enabled(enabled: bool) {
+    BUDGET_EVICTION_ENABLED.with(|cell| cell.set(enabled));
+}
+/// Check if budget eviction is enabled.
+pub fn is_budget_eviction_enabled() -> bool {
+    BUDGET_EVICTION_ENABLED.with(|cell| cell.get())
+}
+
+/// Toggle overdraw caching (EC-12). OFF = only cache viewport items (Phase A).
+pub fn set_overdraw_caching_enabled(enabled: bool) {
+    OVERDRAW_CACHING_ENABLED.with(|cell| cell.set(enabled));
+}
+/// Check if overdraw caching is enabled.
+pub fn is_overdraw_caching_enabled() -> bool {
+    OVERDRAW_CACHING_ENABLED.with(|cell| cell.get())
+}
+
 // --- Debug tint overlay ---
 // The app sets this flag (e.g., via F9 toggle) to enable a red tint overlay
 // on all composited cached textures. The renderer reads this in draw_cached_regions.

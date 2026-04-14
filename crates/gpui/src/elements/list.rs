@@ -1599,7 +1599,7 @@ impl StateInner {
             #[cfg(feature = "texture-cache")]
             let should_render = visible_height < available_height
                 || size.is_none()
-                || (self.caching_enabled && visible_height < available_height + self.overdraw);
+                || (self.caching_enabled && crate::is_overdraw_caching_enabled() && visible_height < available_height + self.overdraw);
             #[cfg(not(feature = "texture-cache"))]
             let should_render = visible_height < available_height || size.is_none();
             if should_render {
@@ -1661,7 +1661,7 @@ impl StateInner {
                 // ready before they scroll into view.
                 #[cfg(feature = "texture-cache")]
                 let include_in_layout = visible_height < available_height
-                    || (self.caching_enabled && visible_height < available_height + self.overdraw);
+                    || (self.caching_enabled && crate::is_overdraw_caching_enabled() && visible_height < available_height + self.overdraw);
                 #[cfg(not(feature = "texture-cache"))]
                 let include_in_layout = visible_height < available_height;
 
@@ -2330,7 +2330,7 @@ impl Element for List {
                         .get(&item.index)
                         .copied()
                         .unwrap_or(0);
-                    if frames_visible < TRANSIENT_SKIP_FRAMES && !has_cached_region(region_id) {
+                    if crate::is_transient_skip_enabled() && frames_visible < TRANSIENT_SKIP_FRAMES && !has_cached_region(region_id) {
                         if is_traced {
                             log::info!("event=trace_item ix={} path=transient_skip frames_visible={} bounds={:.0},{:.0},{:.0},{:.0}",
                                 item.index, frames_visible, f32::from(item.origin.x), f32::from(item.origin.y),
