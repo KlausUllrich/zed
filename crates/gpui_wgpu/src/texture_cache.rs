@@ -1442,6 +1442,9 @@ impl WgpuRenderer {
             None => return true,
         };
         let tint_enabled = gpui::is_debug_tint_enabled();
+        if tint_enabled {
+            log::info!("event=tint_draw_start regions={} pool_active={}", scene.cache_regions().len(), pool.active.len());
+        }
 
         for region in scene.cache_regions() {
             let entry = match pool.active.get(&region.id.0) {
