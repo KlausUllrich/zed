@@ -2292,13 +2292,24 @@ impl Element for List {
         if caching_enabled {
             let mut visible_ids = HashSet::new();
             let mut buffer_ids = HashSet::new();
+            let mut visible_min_ix = usize::MAX;
+            let mut visible_max_ix = 0usize;
             for item in &prepaint.layout.item_layouts {
                 let region_id = item.index as u64;
                 if item.is_overdraw {
                     buffer_ids.insert(region_id);
                 } else {
                     visible_ids.insert(region_id);
+                    visible_min_ix = visible_min_ix.min(item.index);
+                    visible_max_ix = visible_max_ix.max(item.index);
                 }
+            }
+            // Viewport center index for distance-based eviction ordering.
+            // Only non-overdraw items define "center of viewport".
+            let has_visible_items = visible_min_ix <= visible_max_ix;
+            if has_visible_items {
+                let center = (visible_min_ix + visible_max_ix) / 2;
+                crate::set_viewport_center_index(center);
             }
             crate::set_classification_ids(visible_ids, buffer_ids);
         }

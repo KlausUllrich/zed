@@ -3,8 +3,10 @@
 //! Renders list items to offscreen GPU textures and composites them as quads
 //! during scroll. Textures persist across frames and are reused until invalidated.
 //!
-//! Phase B: LRU eviction, memory budget enforcement, size-class bucketed free lists,
-//! dynamic globals buffer. Textures allocated at exact content dimensions (the path
+//! Phase B: Memory budget enforcement, size-class bucketed free lists,
+//! dynamic globals buffer. Phase 2: Priority-bin eviction — VISIBLE items never evicted,
+//! DISTANT evicted first, within-bin tiebreak by distance from viewport center.
+//! Textures allocated at exact content dimensions (the path
 //! compositing pipeline maps UV via screen_position / viewport_size, which requires
 //! textures to match content bounds exactly). Size classes organize the free list
 //! for fast lookup; reuse requires exact (width, height) match.
@@ -28,6 +30,10 @@ const RECENT_WINDOW: u64 = 30;
 
 /// Bytes per pixel for RGBA8/BGRA8 surface formats.
 const BYTES_PER_PIXEL: u64 = 4;
+
+/// Percentage threshold for degraded-capture warning. If a recapture produces
+/// fewer primitives than this fraction of the baseline, a warn log fires.
+const DEGRADED_CAPTURE_THRESHOLD_PCT: u32 = 30;
 
 /// Initial globals buffer capacity (items per frame that can be rendered fresh).
 /// Replaces Phase A's hard-coded 16-item cap.
@@ -282,11 +288,12 @@ struct CacheEntry {
     /// `None` means the entry is currently inside viewport/buffer, or was just inserted
     /// (classify_entries sets it on the first outside-viewport frame).
     exit_frame: Option<u64>,
-    /// Conversation item index (list index). Used for distance calculations in eviction (Phase 2).
-    #[allow(dead_code)] // Phase 2: priority-bin eviction uses this for distance sorting
+    /// Conversation item index (list index). Used for distance calculations
+    /// in find_priority_victim(). INVARIANT: equals region_id (see list.rs paint loop).
     item_index: usize,
-    /// Primitive count from first successful capture (Phase 2: quality guard).
-    #[allow(dead_code)] // Phase 2: guard compares against baseline to detect degraded captures
+    /// Primitive count from first successful capture. process_cache_regions compares
+    /// subsequent captures against this baseline to detect degraded renders.
+    /// `None` until first capture with has_content == true.
     baseline_total: Option<u32>,
 }
 
@@ -449,18 +456,38 @@ impl TexturePool {
         }
     }
 
-    /// Find the LRU victim in the active map (oldest last_used_frame).
-    fn find_lru_victim(&self) -> Option<u64> {
-        self.active
-            .iter()
-            .min_by_key(|(_, entry)| entry.last_used_frame)
-            .map(|(id, _)| *id)
+    /// Find the best eviction victim using priority-bin ordering.
+    /// VISIBLE items are never evicted. Within the same bin, items farthest
+    /// from the viewport center are preferred (less likely to be scrolled to).
+    fn find_priority_victim(&self, viewport_center_index: usize) -> Option<u64> {
+        let mut best: Option<(u64, PriorityBin, usize)> = None; // (region_id, bin, distance)
+
+        for (&region_id, entry) in &self.active {
+            if entry.priority_bin == PriorityBin::Visible {
+                continue; // NEVER evict visible
+            }
+            let dist =
+                (entry.item_index as isize - viewport_center_index as isize).unsigned_abs();
+            match &best {
+                None => best = Some((region_id, entry.priority_bin, dist)),
+                Some((_, best_bin, best_dist)) => {
+                    // Lower bin = evict first. Same bin = farthest from viewport first.
+                    if entry.priority_bin < *best_bin
+                        || (entry.priority_bin == *best_bin && dist > *best_dist)
+                    {
+                        best = Some((region_id, entry.priority_bin, dist));
+                    }
+                }
+            }
+        }
+        best.map(|(id, _, _)| id)
     }
 
     /// Ensure memory budget allows `needed_bytes` of new allocation.
-    /// Two-phase eviction: (1) destroy free-list textures, (2) evict + destroy LRU active.
-    /// Returns true if budget allows the allocation, false if nothing left to evict.
-    fn ensure_budget(&mut self, needed_bytes: u64) -> bool {
+    /// Two-phase eviction: (1) destroy free-list textures, (2) evict by priority bin
+    /// (Distant first, then Recent, then Buffer — VISIBLE items are never evicted).
+    /// Returns true if budget allows the allocation, false if only VISIBLE items remain.
+    fn ensure_budget(&mut self, needed_bytes: u64, viewport_center_index: usize) -> bool {
         if self.total_memory_bytes + needed_bytes <= self.budget_bytes {
             return true;
         }
@@ -472,9 +499,10 @@ impl TexturePool {
             }
         }
 
-        // Phase 2: evict LRU active entries and destroy immediately
+        // Phase 2: evict by priority bin — lowest bin first, farthest from viewport within bin.
+        // VISIBLE items are never evicted; if only VISIBLE remain, return false → render Fresh.
         while self.total_memory_bytes + needed_bytes > self.budget_bytes {
-            if let Some(victim_id) = self.find_lru_victim() {
+            if let Some(victim_id) = self.find_priority_victim(viewport_center_index) {
                 self.destroy_active(victim_id);
                 self.eviction_count += 1;
             } else {
@@ -857,6 +885,9 @@ impl WgpuRenderer {
                 .unwrap()
                 .classify_entries(&visible_ids, &buffer_ids);
         }
+        // Viewport center for distance-based eviction within priority bins.
+        // Falls back to 0 when list.rs didn't report (hidden panel, first frame).
+        let viewport_center_index = gpui::take_viewport_center_index().unwrap_or(0);
 
         // Grow globals buffer if needed (removes Phase A's 16-item cap)
         self.ensure_globals_capacity(regions.len() as u32);
@@ -941,7 +972,7 @@ impl WgpuRenderer {
                 } else {
                     // No reusable texture — check memory budget before allocating new
                     let needed_bytes = texture_memory_bytes(tex_width, tex_height);
-                    if gpui::is_budget_eviction_enabled() && !pool.ensure_budget(needed_bytes) {
+                    if gpui::is_budget_eviction_enabled() && !pool.ensure_budget(needed_bytes, viewport_center_index) {
                         if debug {
                             debug_items.push(TextureCacheDebugItem {
                                 index: region_id,
@@ -1163,6 +1194,32 @@ impl WgpuRenderer {
             } else {
                 pool.insert(region.id.0, texture, view, tex_width, tex_height, has_content);
             }
+
+            // Guard baseline tracking: record first successful primitive count,
+            // warn on subsequent captures that drop below 30% of baseline.
+            if let Some(entry) = pool.active.get_mut(&region.id.0) {
+                if has_content {
+                    match entry.baseline_total {
+                        None => {
+                            entry.baseline_total = Some(total);
+                        }
+                        Some(baseline)
+                            if total * 100
+                                < baseline * DEGRADED_CAPTURE_THRESHOLD_PCT =>
+                        {
+                            log::warn!(
+                                "event=low_primitive_capture region={} total={} baseline={} ratio={:.1}%",
+                                region_id,
+                                total,
+                                baseline,
+                                (total as f32 / baseline as f32) * 100.0,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
             // Card timeline: log capture event + stage PNG dump for watched item
             if gpui::card_timeline::is_watched(region_id as usize) {
                 let pool_frame = pool.current_frame;

@@ -1,6 +1,6 @@
 //! GPU texture cache region types and scene extraction.
 //!
-//! Four responsibilities:
+//! Six responsibilities:
 //! 1. Cache region annotations — `CacheRegion`, `CacheRegionId`, and scene helpers
 //!    used by the renderer to capture list items to GPU textures.
 //! 2. Renderer feedback state — `CACHED_REGION_IDS` thread-local tracks which
@@ -15,6 +15,10 @@
 //! 5. Per-item invalidation signal — `INVALIDATED_REGION_IDS` thread-local with
 //!    `invalidate_pool_region` / `take_invalidated_region_ids`. list.rs marks items
 //!    for GPU texture purge; the renderer removes them from TexturePool.active.
+//! 6. Viewport center index signal — `VIEWPORT_CENTER_INDEX` thread-local with
+//!    `set_viewport_center_index` / `take_viewport_center_index`. list.rs sets this
+//!    each paint alongside set_classification_ids; texture_cache.rs reads it in
+//!    find_priority_victim() to prefer evicting items farthest from scroll position.
 
 use crate::{
     Bounds, ContentMask, Hsla, Point, Primitive, ScaledPixels, Scene,
@@ -238,6 +242,27 @@ pub fn take_classification_ids() -> (HashSet<u64>, HashSet<u64>) {
     let visible = VISIBLE_REGION_IDS.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
     let buffer = BUFFER_REGION_IDS.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
     (visible, buffer)
+}
+
+// --- Viewport center index for priority-bin eviction ---
+// The list sets this each frame during paint. The renderer uses it in
+// find_priority_victim() to prefer evicting items farthest from the viewport center.
+
+thread_local! {
+    static VIEWPORT_CENTER_INDEX: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Set the viewport center item index for this frame.
+/// Called by: `List::paint()` in list.rs, alongside set_classification_ids.
+pub fn set_viewport_center_index(center: usize) {
+    VIEWPORT_CENTER_INDEX.with(|cell| cell.set(Some(center)));
+}
+
+/// Take the viewport center item index. Returns `None` if not set this frame.
+/// Clears the thread-local state.
+/// Called by: `WgpuRenderer::process_cache_regions()` in gpui_wgpu.
+pub fn take_viewport_center_index() -> Option<usize> {
+    VIEWPORT_CENTER_INDEX.with(|cell| cell.take())
 }
 
 // --- Debug tint overlay ---
