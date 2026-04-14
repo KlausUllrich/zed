@@ -1226,14 +1226,20 @@ impl WgpuRenderer {
                     let items = &mini_scene.subpixel_sprites[range];
                     let tex_info = self.atlas.get_texture_info(texture_id);
                     let data = unsafe { Self::instance_bytes(items) };
-                    // Subpixel rendering uses dual-source blending that cannot round-trip
-                    // through an RGBA texture. Fall back to monochrome AA for cached items.
-                    // Imperceptible on HiDPI. See S487 analysis.
+                    // Phase B: mono fallback (dual-source blending can't round-trip through RGBA).
+                    // Phase A: used subpixel pipeline with mono fallback.
+                    let resources = self.resources();
+                    let pipeline = if gpui::is_mono_fallback_enabled() {
+                        &resources.pipelines.mono_sprites
+                    } else {
+                        resources.pipelines.subpixel_sprites.as_ref()
+                            .unwrap_or(&resources.pipelines.mono_sprites)
+                    };
                     self.draw_instances_with_texture_and_globals(
                         data,
                         items.len() as u32,
                         &tex_info.view,
-                        &self.resources().pipelines.mono_sprites,
+                        pipeline,
                         globals_bind_group,
                         instance_offset,
                         &mut pass,
@@ -1460,7 +1466,11 @@ impl WgpuRenderer {
                 sprite_data,
                 1,
                 &entry.view,
-                &self.resources().pipelines.composite,
+                if gpui::is_composite_pipeline_enabled() {
+                    &self.resources().pipelines.composite
+                } else {
+                    &self.resources().pipelines.paths
+                },
                 instance_offset,
                 pass,
             ) {

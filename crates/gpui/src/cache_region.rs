@@ -156,6 +156,35 @@ pub fn is_overdraw_caching_enabled() -> bool {
     OVERDRAW_CACHING_ENABLED.with(|cell| cell.get())
 }
 
+// --- Phase B feature toggles (batch 2) ---
+
+thread_local! {
+    /// When ON, composites cached textures via `pipelines.composite` (Phase B).
+    /// OFF = use `pipelines.paths` (Phase A behavior).
+    static COMPOSITE_PIPELINE_ENABLED: Cell<bool> = const { Cell::new(true) };
+    /// When ON, SubpixelSprites in cached textures fall back to mono_sprites pipeline (Phase B).
+    /// OFF = use original subpixel_sprites pipeline (Phase A behavior).
+    static MONO_FALLBACK_ENABLED: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Toggle composite pipeline. OFF = use paths pipeline (Phase A).
+pub fn set_composite_pipeline_enabled(enabled: bool) {
+    COMPOSITE_PIPELINE_ENABLED.with(|cell| cell.set(enabled));
+}
+/// Check if composite pipeline is enabled.
+pub fn is_composite_pipeline_enabled() -> bool {
+    COMPOSITE_PIPELINE_ENABLED.with(|cell| cell.get())
+}
+
+/// Toggle mono sprite fallback. OFF = use subpixel pipeline (Phase A).
+pub fn set_mono_fallback_enabled(enabled: bool) {
+    MONO_FALLBACK_ENABLED.with(|cell| cell.set(enabled));
+}
+/// Check if mono sprite fallback is enabled.
+pub fn is_mono_fallback_enabled() -> bool {
+    MONO_FALLBACK_ENABLED.with(|cell| cell.get())
+}
+
 // --- Debug tint overlay ---
 // The app sets this flag (e.g., via F9 toggle) to enable a red tint overlay
 // on all composited cached textures. The renderer reads this in draw_cached_regions.
