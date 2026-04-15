@@ -20,6 +20,7 @@ mod texture_cache;
 pub use texture_cache::{
     set_texture_cache_debug_callback, TextureCacheDebugFrame, TextureCacheDebugItem,
     TextureCacheDebugLifecycle, TextureCacheDebugPool,
+    set_eviction_callback, TextureEvictionEvent,
 };
 
 #[repr(C)]

@@ -190,6 +190,50 @@ fn emit_texture_cache_debug(frame: TextureCacheDebugFrame) {
     });
 }
 
+// ── Eviction callback ────────────────────────────────────────────────────────
+// Feeds cs-debug Rule 3 (eviction_storm) via registration in cs-app/src/main.rs.
+// Called from ensure_budget() on the render thread only.
+
+/// Data passed to the eviction callback when a texture is evicted from the cache.
+#[derive(Debug, Clone)]
+pub struct TextureEvictionEvent {
+    /// The region ID of the evicted texture.
+    pub region_id: u64,
+    /// Priority bin the evicted texture was in.
+    pub priority_bin: &'static str,
+    /// Item index of the evicted texture.
+    pub item_index: usize,
+    /// Reason for eviction.
+    pub reason: &'static str,
+}
+
+type TextureEvictionCallback = Box<dyn Fn(TextureEvictionEvent) + Send + 'static>;
+
+// Thread-local mirrors set_texture_cache_debug_callback's design.
+// ensure_budget() is only called from the render thread, so thread-local
+// avoids lock overhead on the hot path. Registered once at startup.
+thread_local! {
+    static TEXTURE_EVICTION_CB: Cell<Option<*const TextureEvictionCallback>> = const { Cell::new(None) };
+}
+
+/// Register a callback for GPU texture eviction events.
+/// Call once at app startup. Follows the same pattern as `set_texture_cache_debug_callback`.
+pub fn set_eviction_callback(callback: TextureEvictionCallback) {
+    let leaked = Box::leak(Box::new(callback));
+    TEXTURE_EVICTION_CB.with(|cell| cell.set(Some(leaked as *const TextureEvictionCallback)));
+}
+
+fn emit_eviction_event(event: TextureEvictionEvent) {
+    TEXTURE_EVICTION_CB.with(|cell| {
+        if let Some(ptr) = cell.get() {
+            // SAFETY: Pointer was created by Box::leak in set_eviction_callback,
+            // lives for program lifetime, and is only read (never mutated).
+            let cb = unsafe { &*ptr };
+            cb(event);
+        }
+    });
+}
+
 // ── Size classes ─────────────────────────────────────────────────────────────
 
 /// Height-based size classes for free-list organization.
@@ -503,17 +547,35 @@ impl TexturePool {
         // VISIBLE items are never evicted; if only VISIBLE remain, return false → render Fresh.
         while self.total_memory_bytes + needed_bytes > self.budget_bytes {
             if let Some(victim_id) = self.find_priority_victim(viewport_center_index) {
-                // Log before destroy removes the entry from the map.
+                // Log + callback before destroy removes the entry from the map.
                 if let Some(entry) = self.active.get(&victim_id) {
+                    let bin_str = match entry.priority_bin {
+                        PriorityBin::Distant => "Distant",
+                        PriorityBin::Recent => "Recent",
+                        PriorityBin::Buffer => "Buffer",
+                        PriorityBin::Visible => "Visible",
+                    };
                     log::info!(
                         "event=eviction region={} bin={:?} item_index={} reason=budget_pressure",
                         victim_id, entry.priority_bin, entry.item_index,
                     );
+                    emit_eviction_event(TextureEvictionEvent {
+                        region_id: victim_id,
+                        priority_bin: bin_str,
+                        item_index: entry.item_index,
+                        reason: "budget_pressure",
+                    });
                 }
                 self.destroy_active(victim_id);
                 self.eviction_count += 1;
             } else {
                 log::info!("event=eviction_blocked reason=all_visible");
+                emit_eviction_event(TextureEvictionEvent {
+                    region_id: 0,
+                    priority_bin: "none",
+                    item_index: 0,
+                    reason: "eviction_blocked_all_visible",
+                });
                 return false;
             }
         }

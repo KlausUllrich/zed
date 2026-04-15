@@ -12,4 +12,5 @@ pub use wgpu_renderer::{GpuContext, WgpuRenderer, WgpuSurfaceConfig};
 pub use wgpu_renderer::{
     set_texture_cache_debug_callback, TextureCacheDebugFrame, TextureCacheDebugItem,
     TextureCacheDebugLifecycle, TextureCacheDebugPool,
+    set_eviction_callback, TextureEvictionEvent,
 };
