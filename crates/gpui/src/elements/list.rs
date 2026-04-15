@@ -807,7 +807,17 @@ impl ListState {
         cursor.seek(&Count(current_offset.item_ix), Bias::Right);
 
         let start_pixel_offset = cursor.start().height + current_offset.offset_in_item;
-        let new_pixel_offset = (start_pixel_offset + distance).max(px(0.));
+        // Clamp at both boundaries: 0 (top) and scroll_max (bottom).
+        // Without bottom clamp, inertia animation can overshoot past content,
+        // creating a visible gap between last item and viewport bottom.
+        let bounds = state.last_layout_bounds.unwrap_or_default();
+        let padding = state.last_padding.unwrap_or_default();
+        let scroll_max = (state.items.summary().height + padding.top + padding.bottom
+            - bounds.size.height)
+            .max(px(0.));
+        let new_pixel_offset = (start_pixel_offset + distance)
+            .max(px(0.))
+            .min(scroll_max);
         if new_pixel_offset > start_pixel_offset {
             cursor.seek_forward(&Height(new_pixel_offset), Bias::Right);
         } else {
