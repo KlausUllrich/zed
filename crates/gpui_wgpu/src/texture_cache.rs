@@ -1079,6 +1079,11 @@ impl WgpuRenderer {
                         }
                         continue;
                     }
+                    // Dimension mismatch or missing content — will re-capture below
+                    log::debug!(
+                        "event=dimension_mismatch ix={} cached_w={} cached_h={} tex_w={} tex_h={} has_content={} action=recapture",
+                        region_id, cached.width, cached.height, tex_width, tex_height, cached.has_content
+                    );
                 }
             }
 
