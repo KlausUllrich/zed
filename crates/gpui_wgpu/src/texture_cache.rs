@@ -234,6 +234,50 @@ fn emit_eviction_event(event: TextureEvictionEvent) {
     });
 }
 
+// ── Quality guard callback ────────────────────────────────────────────────────
+// Fires when a re-capture produces significantly fewer primitives than baseline.
+// Feeds cs-debug anomaly detection via registration in cs-app/src/main.rs.
+// Called from process_cache_regions() on the render thread only.
+
+/// Data passed to the quality guard callback when a degraded capture is detected.
+#[derive(Debug, Clone)]
+pub struct QualityGuardEvent {
+    /// The region ID of the degraded texture.
+    pub region_id: u64,
+    /// Total primitives in the degraded capture.
+    pub total: u32,
+    /// Baseline primitive count from first successful capture.
+    pub baseline: u32,
+    /// Ratio of total/baseline (0.0–1.0).
+    pub ratio: f32,
+}
+
+type QualityGuardCallback = Box<dyn Fn(QualityGuardEvent) + Send + 'static>;
+
+// Thread-local mirrors set_eviction_callback's design.
+// process_cache_regions() is only called from the render thread.
+thread_local! {
+    static QUALITY_GUARD_CB: Cell<Option<*const QualityGuardCallback>> = const { Cell::new(None) };
+}
+
+/// Register a callback for quality guard warnings (degraded primitive captures).
+/// Call once at app startup. Follows the same pattern as `set_eviction_callback`.
+pub fn set_quality_guard_callback(callback: QualityGuardCallback) {
+    let leaked = Box::leak(Box::new(callback));
+    QUALITY_GUARD_CB.with(|cell| cell.set(Some(leaked as *const QualityGuardCallback)));
+}
+
+fn emit_quality_guard_event(event: QualityGuardEvent) {
+    QUALITY_GUARD_CB.with(|cell| {
+        if let Some(ptr) = cell.get() {
+            // SAFETY: Pointer was created by Box::leak in set_quality_guard_callback,
+            // lives for program lifetime, and is only read (never mutated).
+            let cb = unsafe { &*ptr };
+            cb(event);
+        }
+    });
+}
+
 // ── Size classes ─────────────────────────────────────────────────────────────
 
 /// Height-based size classes for free-list organization.
@@ -1282,13 +1326,20 @@ impl WgpuRenderer {
                             if total * 100
                                 < baseline * DEGRADED_CAPTURE_THRESHOLD_PCT =>
                         {
+                            let ratio = total as f32 / baseline as f32;
                             log::warn!(
                                 "event=low_primitive_capture region={} total={} baseline={} ratio={:.1}%",
                                 region_id,
                                 total,
                                 baseline,
-                                (total as f32 / baseline as f32) * 100.0,
+                                ratio * 100.0,
                             );
+                            emit_quality_guard_event(QualityGuardEvent {
+                                region_id: region.id.0,
+                                total,
+                                baseline,
+                                ratio,
+                            });
                         }
                         _ => {}
                     }
