@@ -22,8 +22,9 @@ use std::path::Path as StdPath;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// Default memory budget: 64MB (NFR-1).
-const DEFAULT_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+/// Default memory budget: 128MB (was 64MB; increased to reduce eviction thrash
+/// during fast scroll through 100+ cards — see GH #76).
+const DEFAULT_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Frames an item can be outside viewport+buffer before becoming Distant (~0.5s at 60fps).
 const RECENT_WINDOW: u64 = 30;
