@@ -1084,6 +1084,13 @@ impl WgpuRenderer {
                         "event=dimension_mismatch ix={} cached_w={} cached_h={} tex_w={} tex_h={} has_content={} action=recapture",
                         region_id, cached.width, cached.height, tex_width, tex_height, cached.has_content
                     );
+                    // S498 INV-X4: Dimension mismatch triggers recapture loop.
+                    if cached.width != tex_width || cached.height != tex_height {
+                        log::warn!(
+                            "event=INVARIANT_VIOLATION rule=X4 region={} cached_w={} cached_h={} actual_w={} actual_h={}",
+                            region_id, cached.width, cached.height, tex_width, tex_height
+                        );
+                    }
                 }
             }
 

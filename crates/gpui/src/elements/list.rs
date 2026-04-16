@@ -1571,6 +1571,18 @@ impl StateInner {
         window: &mut Window,
         cx: &mut App,
     ) -> LayoutItemsResponse {
+        // S498: Layout phase timing — measures full layout_items() cost.
+        #[cfg(feature = "texture-cache")]
+        let layout_phase_start = std::time::Instant::now();
+        #[cfg(feature = "texture-cache")]
+        {
+            let item_count = self.items.summary().count;
+            log::info!(
+                "event=layout_phase_start items={} caching={}",
+                item_count, self.caching_enabled
+            );
+        }
+
         // If following tail, scroll toward end before layout.
         // Inertia-based smooth scroll for Tail mode (delta-time).
         // Content growth adds velocity impulses; friction decays velocity per second.
@@ -1687,6 +1699,9 @@ impl StateInner {
         let mut perf_rendered_count: usize = 0;
         let mut perf_cached_count: usize = 0;
         let mut perf_slowest_secs: f32 = 0.0;
+        // S498: Accumulate total render_item cost for layout breakdown.
+        #[cfg(feature = "texture-cache")]
+        let mut render_sum_secs: f32 = 0.0;
         let mut perf_slowest_ix: usize = 0;
 
         // Render items after the scroll top, including those in the trailing overdraw
@@ -1715,6 +1730,17 @@ impl StateInner {
                 let element_size = element.layout_as_root(available_item_space, window, cx);
                 let item_elapsed = item_start.elapsed().as_secs_f32();
                 perf_rendered_count += 1;
+                // S498: Accumulate per-item render cost + log slow items.
+                #[cfg(feature = "texture-cache")]
+                {
+                    render_sum_secs += item_elapsed;
+                    if item_elapsed > 0.0005 {
+                        log::info!(
+                            "event=render_item_cost ix={} ms={:.1}",
+                            item_index, item_elapsed * 1000.0
+                        );
+                    }
+                }
                 if item_elapsed > perf_slowest_secs {
                     perf_slowest_secs = item_elapsed;
                     perf_slowest_ix = item_index;
@@ -1968,6 +1994,20 @@ impl StateInner {
                 slowest_item_secs: perf_slowest_secs,
                 slowest_item_ix: perf_slowest_ix,
             });
+        }
+
+        // S498: Layout phase timing — end measurement with render vs GPUI breakdown.
+        #[cfg(feature = "texture-cache")]
+        {
+            let elapsed_ms = layout_phase_start.elapsed().as_secs_f32() * 1000.0;
+            let render_ms = render_sum_secs * 1000.0;
+            let gpui_ms = elapsed_ms - render_ms;
+            if elapsed_ms > 1.0 {
+                log::info!(
+                    "event=layout_phase_end duration_ms={:.1} items_rendered={} items_cached={} render_sum_ms={:.1} gpui_layout_ms={:.1}",
+                    elapsed_ms, perf_rendered_count, perf_cached_count, render_ms, gpui_ms
+                );
+            }
         }
 
         LayoutItemsResponse {
