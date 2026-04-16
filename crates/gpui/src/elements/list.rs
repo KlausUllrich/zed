@@ -1057,6 +1057,8 @@ impl ListState {
     /// this computes the actual scroll position. Works with any ListAlignment.
     pub fn scroll_to_max(&self) {
         let state = &mut *self.0.borrow_mut();
+        #[cfg(feature = "texture-cache")]
+        let old_top = state.logical_scroll_top;
         // EC-13: Clear frame counters — programmatic jump resets visibility.
         #[cfg(feature = "texture-cache")]
         state.visible_frames.clear();
@@ -1074,6 +1076,19 @@ impl ListState {
             item_ix: start.count,
             offset_in_item: scroll_max - start.height,
         });
+
+        #[cfg(feature = "texture-cache")]
+        log::info!(
+            "event=scroll_to_max paint_frame={} old_ix={} old_off={:.1} new_ix={} new_off={:.1} scroll_max_px={:.1} total_height_px={:.1} viewport_px={:.1}",
+            state.paint_frame_count,
+            old_top.map_or(0, |o| o.item_ix),
+            old_top.map_or(0.0, |o| f32::from(o.offset_in_item)),
+            start.count,
+            f32::from(scroll_max - start.height),
+            f32::from(scroll_max),
+            f32::from(total_height),
+            f32::from(bounds.size.height)
+        );
     }
 
     /// Returns true if the list is scrolled to (or very near) the bottom.
@@ -1227,6 +1242,20 @@ impl ListState {
     #[cfg(feature = "texture-cache")]
     pub fn is_item_caching_enabled(&self) -> bool {
         self.0.borrow().caching_enabled
+    }
+
+    /// Returns the monotonic paint frame counter.
+    /// Incremented once per paint() call.
+    /// Useful for correlating events that happen between paints.
+    #[cfg(feature = "texture-cache")]
+    pub fn paint_frame_count(&self) -> u64 {
+        self.0.borrow().paint_frame_count
+    }
+
+    /// Returns the current logical scroll position (item index + offset within item).
+    #[cfg(feature = "texture-cache")]
+    pub fn current_scroll_top(&self) -> ListOffset {
+        self.0.borrow().logical_scroll_top()
     }
 
     /// Disable GPU texture caching and reset per-item frame counters.
@@ -2262,6 +2291,8 @@ impl Element for List {
         window: &mut Window,
         cx: &mut App,
     ) {
+        #[cfg(feature = "texture-cache")]
+        let paint_start = std::time::Instant::now();
         let current_view = window.current_view();
         #[cfg(feature = "texture-cache")]
         let caching_enabled;
@@ -2332,6 +2363,16 @@ impl Element for List {
         };
         #[cfg(not(feature = "texture-cache"))]
         let content_mask = Some(ContentMask { bounds });
+        #[cfg(feature = "texture-cache")]
+        let mut diag_hit: u32 = 0;
+        #[cfg(feature = "texture-cache")]
+        let mut diag_miss: u32 = 0;
+        #[cfg(feature = "texture-cache")]
+        let mut diag_streaming: u32 = 0;
+        #[cfg(feature = "texture-cache")]
+        let mut diag_transient: u32 = 0;
+        #[cfg(feature = "texture-cache")]
+        let mut diag_plain: u32 = 0;
         window.with_content_mask(content_mask, |window| {
             for item in &mut prepaint.layout.item_layouts {
                 #[cfg(feature = "texture-cache")]
@@ -2366,6 +2407,7 @@ impl Element for List {
                             }
                         }
                         current_frame_heights.insert(item.index, item.size.height);
+                        diag_streaming += 1;
                         item.element.paint(window, cx);
                         continue;
                     }
@@ -2407,6 +2449,7 @@ impl Element for List {
                         }
                         current_frame_heights.insert(item.index, item.size.height);
                         // Transient item — render Fresh without texture annotation.
+                        diag_transient += 1;
                         item.element.paint(window, cx);
                         continue;
                     }
@@ -2440,6 +2483,7 @@ impl Element for List {
                         }
                         // Cache HIT — annotate empty region, skip paint.
                         // Renderer composites from cached texture.
+                        diag_hit += 1;
                         window.begin_cache_region(region_id, item_bounds, cache_clear_color, bounds);
                         window.end_cache_region(region_id);
                         continue;
@@ -2490,12 +2534,22 @@ impl Element for List {
                     // Restore after end_cache_region: scene finalization
                     // does not read content_mask_stack.
                     window.content_mask_stack = ancestor_masks;
+                    diag_miss += 1;
                     continue;
                 }
 
+                // All caching_enabled=true branches above use `continue`.
+                // This line is reached only when caching_enabled=false.
+                #[cfg(feature = "texture-cache")]
+                { diag_plain += 1; }
                 item.element.paint(window, cx);
             }
         });
+        #[cfg(feature = "texture-cache")]
+        log::info!(
+            "event=frame_cache_summary paint_frame={} caching={} hit={} miss={} streaming={} transient={} plain={}",
+            frame_count, caching_enabled, diag_hit, diag_miss, diag_streaming, diag_transient, diag_plain
+        );
         // Update prev_item_heights for next frame comparison
         #[cfg(feature = "texture-cache")]
         if caching_enabled {
@@ -2524,6 +2578,18 @@ impl Element for List {
                 )
             }
         });
+        #[cfg(feature = "texture-cache")]
+        {
+            let paint_dur = paint_start.elapsed();
+            if paint_dur.as_micros() > 4000 {
+                log::info!(
+                    "event=paint_timing paint_frame={} dur_us={} items={}",
+                    frame_count,
+                    paint_dur.as_micros(),
+                    prepaint.layout.item_layouts.len()
+                );
+            }
+        }
     }
 }
 

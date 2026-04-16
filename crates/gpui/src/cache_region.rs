@@ -69,7 +69,11 @@ pub fn clear_cached_region(id: CacheRegionId) {
 ///   - `WgpuRenderer::invalidate_texture_cache()` — DPI/width change
 ///   - `WgpuRenderer::recover()` — GPU device lost (EC-11)
 pub fn clear_cached_region_ids() {
-    CACHED_REGION_IDS.with(|cell| cell.borrow_mut().clear());
+    CACHED_REGION_IDS.with(|cell| {
+        cell.borrow_mut().clear();
+        // Ungated — this function is called by non-feature paths too (e.g. EC-11 recovery).
+        log::debug!("event=clear_all_region_ids");
+    });
 }
 
 // --- Texture dump request ---
