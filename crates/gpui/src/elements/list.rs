@@ -307,6 +307,10 @@ struct StateInner {
     /// Monotonic paint frame counter for height change event timestamps.
     #[cfg(feature = "texture-cache")]
     paint_frame_count: u64,
+    /// When true, scroll_to_max() smooths large jumps (>50px) over multiple
+    /// frames instead of snapping. Set by the host app during follow_output mode.
+    #[cfg(feature = "texture-cache")]
+    smooth_scroll_active: bool,
 }
 
 /// Keeps track of a fractional scroll position within an item for restoration
@@ -536,6 +540,8 @@ impl ListState {
             prev_item_heights: HashMap::new(),
             #[cfg(feature = "texture-cache")]
             paint_frame_count: 0,
+            #[cfg(feature = "texture-cache")]
+            smooth_scroll_active: false,
         })));
         this.splice(0..0, item_count);
         this
@@ -1068,14 +1074,61 @@ impl ListState {
         let scroll_max =
             (total_height + padding.top + padding.bottom - bounds.size.height).max(px(0.));
 
+        // S497: Smooth scrolling for follow_output mode. When active and the
+        // jump to bottom exceeds 50px, spread the movement over ~4 frames
+        // instead of snapping. Prevents visual jank from content bursts.
+        // Called once per rendered frame by follow_output; each call advances
+        // one step, host re-calls on next frame until is_at_bottom() is true.
+        #[cfg(feature = "texture-cache")]
+        let effective_target = if state.smooth_scroll_active {
+            // Compute current scroll position in pixels.
+            // For Bottom-aligned pinned lists, logical_scroll_top() returns
+            // item_ix=count → current_px = total_height → delta negative → skip.
+            let current = state.logical_scroll_top();
+            let mut cursor = state.items.cursor::<ListItemSummary>(());
+            let summary: ListItemSummary =
+                cursor.summary(&Count(current.item_ix), Bias::Right);
+            let current_px = summary.height + current.offset_in_item;
+            let delta = scroll_max - current_px;
+            let delta_f32 = f32::from(delta);
+
+            // delta < 0 means content shrank — fall through to scroll_max.
+            if delta_f32 > 50.0 {
+                // Spread over ~4 frames, but never step less than 40px
+                // to avoid falling behind content growth.
+                let step_px = (delta_f32 / 4.0).max(40.0);
+                let frame_target = (current_px + px(step_px)).min(scroll_max);
+                log::info!(
+                    "event=scroll_to_max_smoothed paint_frame={} delta_px={:.1} step_px={:.1} frame_target_px={:.1} scroll_max_px={:.1}",
+                    state.paint_frame_count, delta_f32, step_px, f32::from(frame_target), f32::from(scroll_max)
+                );
+                frame_target
+            } else {
+                scroll_max
+            }
+        } else {
+            scroll_max
+        };
+        #[cfg(not(feature = "texture-cache"))]
+        let effective_target = scroll_max;
+
         let (start, ..) =
             state
                 .items
-                .find::<ListItemSummary, _>((), &Height(scroll_max), Bias::Right);
+                .find::<ListItemSummary, _>((), &Height(effective_target), Bias::Right);
         state.logical_scroll_top = Some(ListOffset {
             item_ix: start.count,
-            offset_in_item: scroll_max - start.height,
+            offset_in_item: effective_target - start.height,
         });
+
+        // Log completion when smoothing reaches the target
+        #[cfg(feature = "texture-cache")]
+        if state.smooth_scroll_active && effective_target == scroll_max {
+            log::info!(
+                "event=scroll_smooth_complete paint_frame={} final_px={:.1}",
+                state.paint_frame_count, f32::from(scroll_max)
+            );
+        }
 
         #[cfg(feature = "texture-cache")]
         log::info!(
@@ -1084,7 +1137,7 @@ impl ListState {
             old_top.map_or(0, |o| o.item_ix),
             old_top.map_or(0.0, |o| f32::from(o.offset_in_item)),
             start.count,
-            f32::from(scroll_max - start.height),
+            f32::from(effective_target - start.height),
             f32::from(scroll_max),
             f32::from(total_height),
             f32::from(bounds.size.height)
@@ -1335,6 +1388,15 @@ impl ListState {
     #[cfg(feature = "texture-cache")]
     pub fn set_streaming_items(&self, items: HashSet<usize>) {
         self.0.borrow_mut().streaming_items = items;
+    }
+
+    /// Enable/disable smooth scrolling for scroll_to_max(). When active,
+    /// large jumps (>50px) are spread over multiple frames. Set by the host
+    /// app during follow_output/tail mode to prevent visual jank from
+    /// content arriving in bursts.
+    #[cfg(feature = "texture-cache")]
+    pub fn set_smooth_scroll(&self, active: bool) {
+        self.0.borrow_mut().smooth_scroll_active = active;
     }
 
     /// Set item indices that should emit detailed trace logs through the cache
