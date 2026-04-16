@@ -15,6 +15,7 @@ path = "src/gpui_wgpu.rs"
 default = []
 font-kit = ["dep:font-kit"]
 texture-cache = ["gpui/texture-cache", "dep:png"]
+texture-cache-debug = ["texture-cache", "gpui/texture-cache-debug"]
 
 [dependencies]
 gpui.workspace = true

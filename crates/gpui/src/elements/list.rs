@@ -1572,9 +1572,9 @@ impl StateInner {
         cx: &mut App,
     ) -> LayoutItemsResponse {
         // S498: Layout phase timing — measures full layout_items() cost.
-        #[cfg(feature = "texture-cache")]
+        #[cfg(feature = "texture-cache-debug")]
         let layout_phase_start = std::time::Instant::now();
-        #[cfg(feature = "texture-cache")]
+        #[cfg(feature = "texture-cache-debug")]
         {
             let item_count = self.items.summary().count;
             log::info!(
@@ -1700,7 +1700,7 @@ impl StateInner {
         let mut perf_cached_count: usize = 0;
         let mut perf_slowest_secs: f32 = 0.0;
         // S498: Accumulate total render_item cost for layout breakdown.
-        #[cfg(feature = "texture-cache")]
+        #[cfg(feature = "texture-cache-debug")]
         let mut render_sum_secs: f32 = 0.0;
         let mut perf_slowest_ix: usize = 0;
 
@@ -1731,7 +1731,7 @@ impl StateInner {
                 let item_elapsed = item_start.elapsed().as_secs_f32();
                 perf_rendered_count += 1;
                 // S498: Accumulate per-item render cost + log slow items.
-                #[cfg(feature = "texture-cache")]
+                #[cfg(feature = "texture-cache-debug")]
                 {
                     render_sum_secs += item_elapsed;
                     if item_elapsed > 0.0005 {
@@ -1799,7 +1799,7 @@ impl StateInner {
 
                 if include_in_layout {
                     // S498 INV-X9: Overdraw items should only be in layout when caching is active.
-                    #[cfg(feature = "texture-cache")]
+                    #[cfg(feature = "texture-cache-debug")]
                     if visible_height >= available_height && !self.caching_enabled {
                         log::warn!(
                             "event=INVARIANT_VIOLATION rule=X9 ix={} reason=overdraw_without_caching visible_h={:.0} available_h={:.0}",
@@ -1997,7 +1997,7 @@ impl StateInner {
         }
 
         // S498: Layout phase timing — end measurement with render vs GPUI breakdown.
-        #[cfg(feature = "texture-cache")]
+        #[cfg(feature = "texture-cache-debug")]
         {
             let elapsed_ms = layout_phase_start.elapsed().as_secs_f32() * 1000.0;
             let render_ms = render_sum_secs * 1000.0;

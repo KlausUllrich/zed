@@ -1085,6 +1085,7 @@ impl WgpuRenderer {
                         region_id, cached.width, cached.height, tex_width, tex_height, cached.has_content
                     );
                     // S498 INV-X4: Dimension mismatch triggers recapture loop.
+                    #[cfg(feature = "texture-cache-debug")]
                     if cached.width != tex_width || cached.height != tex_height {
                         log::warn!(
                             "event=INVARIANT_VIOLATION rule=X4 region={} cached_w={} cached_h={} actual_w={} actual_h={}",
