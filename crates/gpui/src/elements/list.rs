@@ -1772,6 +1772,14 @@ impl StateInner {
                 let include_in_layout = visible_height < available_height;
 
                 if include_in_layout {
+                    // S498 INV-X9: Overdraw items should only be in layout when caching is active.
+                    #[cfg(feature = "texture-cache")]
+                    if visible_height >= available_height && !self.caching_enabled {
+                        log::warn!(
+                            "event=INVARIANT_VIOLATION rule=X9 ix={} reason=overdraw_without_caching visible_h={:.0} available_h={:.0}",
+                            item_index, f32::from(visible_height), f32::from(available_height)
+                        );
+                    }
                     item_layouts.push_back(ItemLayout {
                         index: item_index,
                         element,
