@@ -39,7 +39,9 @@ screen-capture = [
 ]
 windows-manifest = ["dep:embed-resource"]
 texture-cache = []
-texture-cache-debug = ["texture-cache"]
+# CS S499: forwards to gpui_platform so wayland-side trace events in gpui_linux
+# compile in alongside the instrumentation events in gpui itself.
+texture-cache-debug = ["texture-cache", "gpui_platform/texture-cache-debug"]
 
 [lib]
 path = "src/gpui.rs"

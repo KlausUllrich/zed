@@ -1143,6 +1143,14 @@ impl Dispatch<WlCallback, ObjectId> for WaylandClientStatePtr {
         drop(state);
 
         if let wl_callback::Event::Done { .. } = event {
+            // CS S499: every compositor frame-callback "done" marks a point at which
+            // we're cleared to present the next frame. If the silent transition window
+            // ends consistently within <5ms of this event, the wait is compositor-paced
+            // (hypothesis B). If the gap between this event and next view_render_start
+            // is much larger, something is throttling us even after the compositor
+            // released us.
+            #[cfg(feature = "texture-cache-debug")]
+            log::info!("event=wayland_frame_callback");
             window.frame();
         }
     }

@@ -1267,12 +1267,28 @@ impl WgpuRenderer {
                                 PrimitiveBatch::Surfaces(r) => scene.surfaces[r.start].order,
                             };
                             if batch_order > max_order {
+                                // CS S499: bracket the interleaved cache composite path.
+                                // `source=interleaved` distinguishes this from the fallback
+                                // path below (cache z lies within batch order range).
+                                #[cfg(feature = "texture-cache-debug")]
+                                let cache_composite_started_at = std::time::Instant::now();
+                                #[cfg(feature = "texture-cache-debug")]
+                                log::info!("event=cache_composite_start source=interleaved");
                                 if !self.draw_cached_regions(
                                     scene,
                                     &mut instance_offset,
                                     &mut pass,
                                 ) {
                                     overflow = true;
+                                }
+                                #[cfg(feature = "texture-cache-debug")]
+                                {
+                                    let duration_ms =
+                                        cache_composite_started_at.elapsed().as_secs_f32() * 1000.0;
+                                    log::info!(
+                                        "event=cache_composite_end duration_ms={:.1} source=interleaved",
+                                        duration_ms
+                                    );
                                 }
                                 cache_composited = true;
                             }
@@ -1370,8 +1386,23 @@ impl WgpuRenderer {
                 // e.g., no overlay layers present).
                 #[cfg(feature = "texture-cache")]
                 if !cache_composited && !overflow {
+                    // CS S499: bracket the fallback cache composite path. Exactly one of
+                    // interleaved vs fallback fires per paint (guarded by `cache_composited`).
+                    #[cfg(feature = "texture-cache-debug")]
+                    let cache_composite_started_at = std::time::Instant::now();
+                    #[cfg(feature = "texture-cache-debug")]
+                    log::info!("event=cache_composite_start source=fallback");
                     if !self.draw_cached_regions(scene, &mut instance_offset, &mut pass) {
                         overflow = true;
+                    }
+                    #[cfg(feature = "texture-cache-debug")]
+                    {
+                        let duration_ms =
+                            cache_composite_started_at.elapsed().as_secs_f32() * 1000.0;
+                        log::info!(
+                            "event=cache_composite_end duration_ms={:.1} source=fallback",
+                            duration_ms
+                        );
                     }
                 }
             }
@@ -1383,16 +1414,45 @@ impl WgpuRenderer {
                         "instance buffer size grew too large: {}",
                         self.instance_buffer_capacity
                     );
+                    // CS S499: bracket frame.present() on the overflow-abort path so the
+                    // trace still closes the present span in this pathological exit.
+                    #[cfg(feature = "texture-cache-debug")]
+                    let frame_present_started_at = std::time::Instant::now();
                     frame.present();
+                    #[cfg(feature = "texture-cache-debug")]
+                    {
+                        let duration_ms =
+                            frame_present_started_at.elapsed().as_secs_f32() * 1000.0;
+                        log::info!(
+                            "event=frame_present_end duration_ms={:.1} path=overflow_abort",
+                            duration_ms
+                        );
+                    }
                     return;
                 }
                 self.grow_instance_buffer();
                 continue;
             }
 
+            // CS S499: bracket queue.submit() to measure GPU command submission cost.
+            // If this interval dominates the silent transition window, hypothesis A
+            // (GPU backpressure / fence wait) is confirmed. If it's sub-millisecond,
+            // hypothesis A is ruled out and the wait is downstream (compositor / idle).
+            #[cfg(feature = "texture-cache-debug")]
+            let wgpu_submit_started_at = std::time::Instant::now();
+            #[cfg(feature = "texture-cache-debug")]
+            log::info!("event=wgpu_submit_start");
             self.resources()
                 .queue
                 .submit(std::iter::once(encoder.finish()));
+            #[cfg(feature = "texture-cache-debug")]
+            {
+                let duration_ms = wgpu_submit_started_at.elapsed().as_secs_f32() * 1000.0;
+                log::info!(
+                    "event=wgpu_submit_end duration_ms={:.1}",
+                    duration_ms
+                );
+            }
 
             // One-shot texture dump: reads back all active cached textures to PNG.
             // Triggered by gpui::request_texture_dump() (hotkey in CS app).
@@ -1403,7 +1463,22 @@ impl WgpuRenderer {
             #[cfg(feature = "texture-cache")]
             self.flush_timeline_dumps();
 
+            // CS S499: bracket frame.present() — the compositor-handoff call. Combined
+            // with wgpu_submit_end above, a reader can compute the gap between submit
+            // and present to see if wgpu drivers backpressure between the two.
+            // Hypothesis B: a slow frame.present() implicates compositor backpressure;
+            // a fast one places the wait in the compositor-callback interval downstream.
+            #[cfg(feature = "texture-cache-debug")]
+            let frame_present_started_at = std::time::Instant::now();
             frame.present();
+            #[cfg(feature = "texture-cache-debug")]
+            {
+                let duration_ms = frame_present_started_at.elapsed().as_secs_f32() * 1000.0;
+                log::info!(
+                    "event=frame_present_end duration_ms={:.1} path=normal",
+                    duration_ms
+                );
+            }
             return;
         }
     }

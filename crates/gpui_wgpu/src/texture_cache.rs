@@ -1022,6 +1022,18 @@ impl WgpuRenderer {
         let globals_size = std::mem::size_of::<GlobalParams>() as u64;
         let mut render_idx: usize = 0;
 
+        // CS S499: snapshot eviction counter before per-region processing so we can
+        // emit a single aggregated "burst" event at end-of-loop rather than rely on
+        // the per-eviction log lines. A burst of 51 evictions tightly clustered right
+        // before the silent CACHE->DIRECT window would implicate hypothesis A
+        // (mass texture destruction at caching_disable).
+        #[cfg(feature = "texture-cache-debug")]
+        let eviction_count_before = self
+            .texture_pool
+            .as_ref()
+            .map(|p| p.eviction_count)
+            .unwrap_or(0);
+
         for region in &regions {
             let tex_width = (region.bounds.size.width.0.ceil() as u32).max(1);
             let tex_height = (region.bounds.size.height.0.ceil() as u32).max(1);
@@ -1461,6 +1473,21 @@ impl WgpuRenderer {
         let pool = self.texture_pool.as_ref().unwrap();
         let cached_ids = pool.active_region_ids();
         gpui::set_cached_region_ids(cached_ids);
+
+        // CS S499: emit aggregated eviction-burst event if any evictions happened
+        // this frame. Paired with eviction_count_before snapshot above.
+        #[cfg(feature = "texture-cache-debug")]
+        {
+            let burst = pool.eviction_count.saturating_sub(eviction_count_before);
+            if burst > 0 {
+                log::info!(
+                    "event=texture_eviction_burst count={} pool_active={} paint_frame={}",
+                    burst,
+                    pool.active.len(),
+                    pool.current_frame
+                );
+            }
+        }
 
         // Emit debug callback with per-frame stats
         if debug {

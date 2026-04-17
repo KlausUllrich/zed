@@ -577,6 +577,14 @@ impl WaylandWindowStatePtr {
     pub fn set_presentation_time(&self, nanos: u64) {
         let mut state = self.state.borrow_mut();
         state.presentation_time_nanos = Some(nanos);
+        // CS S499: report when the compositor actually scanned out pixels for the
+        // previous frame. Gap between our `frame_present` (queue.submit/frame.present)
+        // and this presentation timestamp exposes compositor-side queueing delay.
+        #[cfg(feature = "texture-cache-debug")]
+        log::info!(
+            "event=presentation_feedback presentation_time_nanos={}",
+            nanos
+        );
     }
 
     pub fn frame(&self) {

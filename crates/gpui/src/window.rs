@@ -2260,6 +2260,18 @@ impl Window {
         // This ensures that multiple test Apps have isolated arenas.
         let _arena_scope = ElementArenaScope::enter(&cx.element_arena);
 
+        // CS S499: bracket the entirety of Window::draw so trace analysis can
+        // separate "inside draw" time (paint-pipeline cost) from "outside draw"
+        // time (wgpu submit / compositor wait) in the silent CACHE->DIRECT window.
+        #[cfg(feature = "texture-cache-debug")]
+        let window_draw_started_at = std::time::Instant::now();
+        #[cfg(feature = "texture-cache-debug")]
+        log::info!(
+            "event=window_draw_start dirty_views={} refreshing={}",
+            self.dirty_views.len(),
+            self.refreshing
+        );
+
         self.invalidate_entities();
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
@@ -2327,6 +2339,17 @@ impl Window {
         self.invalidator.set_phase(DrawPhase::None);
         self.needs_present.set(true);
 
+        // CS S499: close the bracket opened at window_draw_start above.
+        #[cfg(feature = "texture-cache-debug")]
+        {
+            let duration_ms = window_draw_started_at.elapsed().as_secs_f32() * 1000.0;
+            log::info!(
+                "event=window_draw_end duration_ms={:.1} needs_present={}",
+                duration_ms,
+                self.needs_present.get()
+            );
+        }
+
         ArenaClearNeeded::new(&cx.element_arena)
     }
 
@@ -2354,9 +2377,28 @@ impl Window {
 
     #[profiling::function]
     fn present(&self) {
+        // CS S499: bracket `platform_window.draw(&scene)` — this is GPUI's handoff
+        // to the Linux platform layer, which on wayland/wgpu eventually calls
+        // queue.submit() + frame.present() inside the wgpu renderer. Separating
+        // this span from wgpu_submit_start/end (measured inside the wgpu crate)
+        // isolates the cost of the platform-window indirection from GPU submission.
+        #[cfg(feature = "texture-cache-debug")]
+        let window_present_started_at = std::time::Instant::now();
+        #[cfg(feature = "texture-cache-debug")]
+        log::info!("event=window_present_start");
+
         self.platform_window.draw(&self.rendered_frame.scene);
         self.needs_present.set(false);
         profiling::finish_frame!();
+
+        #[cfg(feature = "texture-cache-debug")]
+        {
+            let duration_ms = window_present_started_at.elapsed().as_secs_f32() * 1000.0;
+            log::info!(
+                "event=window_present_end duration_ms={:.1}",
+                duration_ms
+            );
+        }
     }
 
     fn draw_roots(&mut self, cx: &mut App) {

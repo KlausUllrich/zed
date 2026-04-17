@@ -19,6 +19,12 @@ screen-capture = ["gpui/screen-capture", "gpui_macos/screen-capture", "gpui_wind
 runtime_shaders = ["gpui_macos/runtime_shaders"]
 wayland = ["gpui_linux/wayland"]
 x11 = ["gpui_linux/x11"]
+# CS S499: forwards texture-cache-debug to gpui_linux so wayland-side trace events
+# (wayland_frame_callback, presentation_feedback) compile in alongside gpui's.
+# Safe on macOS/Windows: gpui_linux is a Linux/freebsd-only target dep above, and
+# Cargo ignores the feature activation on platforms where the dep is absent — same
+# pattern as `screen-capture` above (which references gpui_linux/screen-capture).
+texture-cache-debug = ["gpui_linux/texture-cache-debug"]
 
 [dependencies]
 gpui.workspace = true
