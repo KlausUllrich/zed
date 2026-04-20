@@ -1434,6 +1434,9 @@ impl WgpuRenderer {
                 continue;
             }
 
+            // CS S500: flush glyph atlas uploads queued during this frame's paint before GPU submits (sage atlas-proper-fix analysis)
+            self.atlas.before_frame();
+
             // CS S499: bracket queue.submit() to measure GPU command submission cost.
             // If this interval dominates the silent transition window, hypothesis A
             // (GPU backpressure / fence wait) is confirmed. If it's sub-millisecond,
