@@ -16,6 +16,8 @@ use crate::{
 #[cfg(feature = "texture-cache")]
 use crate::{CacheRegionId, Hsla, has_cached_region};
 #[cfg(feature = "texture-cache")]
+use std::any::TypeId;
+#[cfg(feature = "texture-cache")]
 use std::collections::{HashMap, HashSet};
 use collections::VecDeque;
 use refineable::Refineable as _;
@@ -311,6 +313,18 @@ struct StateInner {
     /// frames instead of snapping. Set by the host app during follow_output mode.
     #[cfg(feature = "texture-cache")]
     smooth_scroll_active: bool,
+    /// S500: Element state keys captured at MISS/TRANSIENT paint per cached
+    /// item. During HIT frames the item's `element.paint` is skipped entirely,
+    /// so its `with_element_state` calls never re-register their keys in
+    /// `next_frame.accessed_element_states`. Without re-registration,
+    /// `Frame::finish` drops the states on the next tick — the first DIRECT
+    /// paint after transition then re-creates `TextViewState` with empty
+    /// `parsed_content`, producing a 1-frame shell-only render while the async
+    /// parse task repopulates content. Re-extending these keys each HIT frame
+    /// (via `Window::keep_element_states_alive`) keeps the states alive across
+    /// arbitrary cached-scroll durations.
+    #[cfg(feature = "texture-cache")]
+    cached_item_state_keys: HashMap<usize, Vec<(GlobalElementId, TypeId)>>,
 }
 
 /// Keeps track of a fractional scroll position within an item for restoration
@@ -542,6 +556,8 @@ impl ListState {
             paint_frame_count: 0,
             #[cfg(feature = "texture-cache")]
             smooth_scroll_active: false,
+            #[cfg(feature = "texture-cache")]
+            cached_item_state_keys: HashMap::new(),
         })));
         this.splice(0..0, item_count);
         this
@@ -694,6 +710,7 @@ impl ListState {
         if state.caching_enabled {
             state.caching_enabled = false;
             state.visible_frames.clear();
+            state.cached_item_state_keys.clear();
             crate::clear_cached_region_ids();
             crate::request_pool_invalidation();
             let ts = std::time::SystemTime::now()
@@ -746,6 +763,7 @@ impl ListState {
         if state.caching_enabled {
             state.caching_enabled = false;
             state.visible_frames.clear();
+            state.cached_item_state_keys.clear();
             crate::clear_cached_region_ids();
             crate::request_pool_invalidation();
             let ts = std::time::SystemTime::now()
@@ -1324,6 +1342,7 @@ impl ListState {
         inner.caching_enabled = false;
         inner.visible_frames.clear();
         inner.prev_item_heights.clear();
+        inner.cached_item_state_keys.clear();
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1354,8 +1373,12 @@ impl ListState {
         // be served as HIT on the first scroll frame after invalidation.
         crate::invalidate_pool_region(region_id);
         // Reset frame visibility counter so the item goes through the transient
-        // skip check again (avoids caching a single-frame flash).
-        self.0.borrow_mut().visible_frames.remove(&index);
+        // skip check again (avoids caching a single-frame flash). Also drop any
+        // captured element-state keys so a subsequent HIT does not re-extend
+        // stale keys after content/collapse invalidation (S500 §3.1 cleanup).
+        let mut inner = self.0.borrow_mut();
+        inner.visible_frames.remove(&index);
+        inner.cached_item_state_keys.remove(&index);
     }
 
     /// EC-3/4/5: Invalidate ALL cached GPU textures and clear the renderer feedback set.
@@ -1370,6 +1393,7 @@ impl ListState {
         inner.visible_frames.clear();
         inner.streaming_items.clear();
         inner.prev_item_heights.clear();
+        inner.cached_item_state_keys.clear();
         // Clear the renderer feedback set — all cached textures become stale.
         crate::clear_cached_region_ids();
         // Signal the renderer to flush all GPU texture pool resources on the next frame.
@@ -2419,6 +2443,8 @@ impl Element for List {
         #[cfg(feature = "texture-cache")]
         let frame_count;
         #[cfg(feature = "texture-cache")]
+        let cached_item_state_keys_snapshot;
+        #[cfg(feature = "texture-cache")]
         {
             let mut state = self.state.0.borrow_mut();
             caching_enabled = state.caching_enabled;
@@ -2427,12 +2453,30 @@ impl Element for List {
             streaming_items_snapshot = state.streaming_items.clone();
             trace_items_snapshot = state.trace_items.clone();
             prev_item_heights_snapshot = state.prev_item_heights.clone();
+            cached_item_state_keys_snapshot = state.cached_item_state_keys.clone();
             state.paint_frame_count += 1;
             frame_count = state.paint_frame_count;
             crate::card_timeline::bump_frame();
         }
         #[cfg(feature = "texture-cache")]
         let mut current_frame_heights: HashMap<usize, Pixels> = HashMap::new();
+        // S500: start from prior frame's captured keys so HIT sees keys from the
+        // MISS that originally cached the item, even if this frame's MISS set is
+        // empty. MISS/TRANSIENT overwrite their own entries below; entries for
+        // items no longer painted this frame drop out naturally (see §3.3 of
+        // S500-sage-element-state-gc-fix.md).
+        //
+        // Note: unlike `current_frame_heights` (empty at loop start), this
+        // starts populated — pure-HIT items don't pass through the
+        // MISS/TRANSIENT capture blocks, so they must inherit prior keys here
+        // rather than re-capture them each frame.
+        #[cfg(feature = "texture-cache")]
+        let mut current_item_state_keys: HashMap<usize, Vec<(GlobalElementId, TypeId)>> =
+            if caching_enabled {
+                cached_item_state_keys_snapshot
+            } else {
+                HashMap::new()
+            };
         // When caching is active, bypass content_mask entirely — textures have their
         // own bounds and the list-level mask was culling edge-item primitives during
         // texture capture (bounds ∩ content_mask = empty).
@@ -2560,7 +2604,29 @@ impl Element for List {
                         current_frame_heights.insert(item.index, item.size.height);
                         // Transient item — render Fresh without texture annotation.
                         diag_transient += 1;
+                        // S500: capture element state keys added by this paint so
+                        // subsequent HIT frames can re-extend them and prevent GC.
+                        // Transient items can later flip to HIT once the
+                        // frames_visible threshold is crossed and a cache region
+                        // exists.
+                        let state_keys_start =
+                            window.next_frame.accessed_element_states.len();
                         item.element.paint(window, cx);
+                        let state_keys_end =
+                            window.next_frame.accessed_element_states.len();
+                        // Guard: an empty-capture paint (degenerate or
+                        // structurally-changed card) keeps the prior frame's
+                        // capture rather than clearing it — a structural change
+                        // that zeroes out element state also changes height, so
+                        // invalidate_item_cache clears the entry on that path
+                        // (S500 §3.1).
+                        if state_keys_end > state_keys_start {
+                            let keys: Vec<(GlobalElementId, TypeId)> = window
+                                .next_frame
+                                .accessed_element_states[state_keys_start..state_keys_end]
+                                .to_vec();
+                            current_item_state_keys.insert(item.index, keys);
+                        }
                         continue;
                     }
 
@@ -2594,6 +2660,17 @@ impl Element for List {
                         // Cache HIT — annotate empty region, skip paint.
                         // Renderer composites from cached texture.
                         diag_hit += 1;
+                        // S500: re-extend accessed_element_states with keys
+                        // captured at the MISS that originally cached this
+                        // item, so Frame::finish's GC preserves its
+                        // TextViewState (and other element state) across this
+                        // HIT frame. Without this, an item spending >1 frame
+                        // on HIT loses its state — the first DIRECT paint
+                        // after transition re-creates it empty and shows a
+                        // shell-only card until the async parse task lands.
+                        if let Some(keys) = current_item_state_keys.get(&item.index) {
+                            window.keep_element_states_alive(keys);
+                        }
                         window.begin_cache_region(region_id, item_bounds, cache_clear_color, bounds);
                         window.end_cache_region(region_id);
                         continue;
@@ -2630,8 +2707,24 @@ impl Element for List {
                     if is_timeline_watched {
                         crate::card_timeline::begin_clip_drop_count();
                     }
+                    // S500: capture element state keys added by this MISS paint
+                    // so subsequent HIT frames can re-extend them and prevent
+                    // GC of TextViewState etc.
+                    let state_keys_start = window.next_frame.accessed_element_states.len();
                     item.element.paint(window, cx);
+                    let state_keys_end = window.next_frame.accessed_element_states.len();
                     let ops_after = window.next_frame.scene.len();
+                    // Guard: see TRANSIENT-path comment above — empty capture
+                    // preserves the prior frame's keys. Structural changes that
+                    // zero out element state also change height and go through
+                    // invalidate_item_cache, which clears the entry.
+                    if state_keys_end > state_keys_start {
+                        let keys: Vec<(GlobalElementId, TypeId)> = window
+                            .next_frame
+                            .accessed_element_states[state_keys_start..state_keys_end]
+                            .to_vec();
+                        current_item_state_keys.insert(item.index, keys);
+                    }
                     if is_timeline_watched {
                         let clipped = crate::card_timeline::end_clip_drop_count();
                         crate::card_timeline::log_event(&format!(
@@ -2660,10 +2753,13 @@ impl Element for List {
             "event=frame_cache_summary paint_frame={} caching={} hit={} miss={} streaming={} transient={} plain={}",
             frame_count, caching_enabled, diag_hit, diag_miss, diag_streaming, diag_transient, diag_plain
         );
-        // Update prev_item_heights for next frame comparison
+        // Update prev_item_heights and cached_item_state_keys for next frame.
+        // Single borrow_mut for both write-backs.
         #[cfg(feature = "texture-cache")]
         if caching_enabled {
-            self.state.0.borrow_mut().prev_item_heights = current_frame_heights;
+            let mut inner = self.state.0.borrow_mut();
+            inner.prev_item_heights = current_frame_heights;
+            inner.cached_item_state_keys = current_item_state_keys;
         }
 
         let list_state = self.state.clone();

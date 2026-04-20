@@ -750,7 +750,7 @@ pub(crate) struct Frame {
     pub(crate) focus: Option<FocusId>,
     pub(crate) window_active: bool,
     pub(crate) element_states: FxHashMap<(GlobalElementId, TypeId), ElementStateBox>,
-    accessed_element_states: Vec<(GlobalElementId, TypeId)>,
+    pub(crate) accessed_element_states: Vec<(GlobalElementId, TypeId)>,
     pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
@@ -3132,6 +3132,32 @@ impl Window {
             );
             result
         }
+    }
+
+    /// Extend `next_frame.accessed_element_states` with an arbitrary set of keys
+    /// so that `Frame::finish` preserves the matching element states across the
+    /// next frame boundary. Used by `List` during HIT frames to keep a cached
+    /// item's `TextViewState` (and other per-element state) alive across frames
+    /// where `element.paint` is skipped. Without this, a card that spends
+    /// multiple frames on the cache HIT path loses its element state, and the
+    /// first DIRECT paint after transition re-creates it from scratch — causing
+    /// a 1-frame shell-only render while an async parse task repopulates
+    /// content (S500 size-jump flicker).
+    ///
+    /// Narrower than `reuse_prepaint` / `reuse_paint`: touches only element
+    /// state, NOT hitboxes, dispatch tree, text layouts, cursor styles, or
+    /// mouse listeners. Those would be stale for a card whose element did not
+    /// paint this frame.
+    ///
+    /// Calling with unknown keys is a no-op — the state simply isn't there to
+    /// preserve. Duplicate keys are harmless — `Frame::finish` uses
+    /// `remove_entry`, so a key already moved on a prior pass is a no-op on
+    /// subsequent passes.
+    #[cfg(feature = "texture-cache")]
+    pub fn keep_element_states_alive(&mut self, keys: &[(GlobalElementId, TypeId)]) {
+        self.next_frame
+            .accessed_element_states
+            .extend(keys.iter().cloned());
     }
 
     /// A variant of `with_element_state` that allows the element's id to be optional. This is a convenience
