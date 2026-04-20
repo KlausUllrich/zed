@@ -57,6 +57,98 @@ use std::{
 };
 use uuid::Uuid;
 
+// CS S503 (GH #90): shared thread-local trace state for the 1.5s
+// transition-outlier investigation. The on_request_frame closure (gpui), the
+// wayland dispatch handler (gpui_linux), and the wgpu frame-present path
+// (gpui_wgpu) all run on the main thread and each hold a timestamp the others
+// need to partition the dispatch → wake → draw → present → feedback pipeline.
+// All state and API feature-gated under `texture-cache-debug`; zero cost in
+// release builds. `pub use` re-exports the helpers at the crate root so sibling
+// crates can call `gpui::record_frame_callback_arrival()` etc.
+#[cfg(feature = "texture-cache-debug")]
+mod s503_trace {
+    use std::cell::Cell;
+    use std::time::Instant;
+
+    thread_local! {
+        static LAST_FRAME_CALLBACK_AT: Cell<Option<Instant>> = const { Cell::new(None) };
+        static LAST_FRAME_PRESENT_END_AT: Cell<Option<Instant>> = const { Cell::new(None) };
+        static REQUEST_FRAME_SEQ: Cell<u64> = const { Cell::new(0) };
+        static LAST_COMMITTED_FRAME_SEQ: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Sentinel emitted into trace lines when an `Option<f32>` metric has no
+    /// prior sample yet (first wake of the session). Chosen negative so it's
+    /// grep-distinguishable from any real millisecond gap — real gaps are
+    /// always ≥ 0 — and still sorts sensibly against numeric values.
+    pub const NO_PRIOR_SAMPLE: f32 = -1.0;
+
+    /// Called by gpui_linux when a `wl_callback::Done` arrives. Returns the
+    /// gap (ms) since the previous arrival — None only on the first wake of
+    /// the process. Powers the `since_last_ms` field on `wayland_frame_callback`.
+    pub fn record_frame_callback_arrival() -> Option<f32> {
+        LAST_FRAME_CALLBACK_AT.with(|c| {
+            let now = Instant::now();
+            let prev = c.replace(Some(now));
+            prev.map(|t| now.duration_since(t).as_secs_f32() * 1000.0)
+        })
+    }
+
+    /// Milliseconds since the last frame-callback arrival. Read by the
+    /// on_request_frame closure to emit `since_callback_ms` — distinguishes
+    /// C1 (compositor silent) from CS-main-blocked (Done fired, closure late).
+    pub fn since_last_frame_callback_ms() -> Option<f32> {
+        LAST_FRAME_CALLBACK_AT.with(|c| c.get().map(|t| t.elapsed().as_secs_f32() * 1000.0))
+    }
+
+    /// Called by gpui_wgpu when `frame.present()` returns.
+    pub fn record_frame_present_end() {
+        LAST_FRAME_PRESENT_END_AT.with(|c| c.set(Some(Instant::now())));
+    }
+
+    /// Milliseconds since the last frame.present() completion. Read by the
+    /// wayland presentation-feedback handler to emit `since_present_ms` —
+    /// compositor-internal display queueing latency (C4 detector).
+    pub fn since_last_frame_present_end_ms() -> Option<f32> {
+        LAST_FRAME_PRESENT_END_AT.with(|c| c.get().map(|t| t.elapsed().as_secs_f32() * 1000.0))
+    }
+
+    /// Monotonic request-frame sequence. Used as `paint_frame=N` on
+    /// request_frame_entry / request_frame_decision so downstream events
+    /// (window_draw_start, wayland_surface_commit, …) can be correlated to
+    /// the wake that initiated them. Distinct from ListState::paint_frame_count,
+    /// which only increments when list.paint actually runs.
+    pub fn next_request_frame_seq() -> u64 {
+        REQUEST_FRAME_SEQ.with(|c| {
+            let n = c.get().wrapping_add(1);
+            c.set(n);
+            n
+        })
+    }
+
+    /// Current in-flight request-frame sequence without incrementing. Read by
+    /// wayland_surface_commit (which runs in-wake — same seq as the entry that
+    /// started it).
+    pub fn current_request_frame_seq() -> u64 {
+        REQUEST_FRAME_SEQ.with(|c| c.get())
+    }
+
+    /// Stamp the paint_frame of the wake that issued the most recent commit.
+    /// Read later by the async presentation-feedback handler so `Presented`
+    /// events can be tied back to the wake whose buffer they describe.
+    pub fn record_surface_commit_seq(seq: u64) {
+        LAST_COMMITTED_FRAME_SEQ.with(|c| c.set(seq));
+    }
+
+    /// paint_frame of the most recent surface commit.
+    pub fn last_committed_frame_seq() -> u64 {
+        LAST_COMMITTED_FRAME_SEQ.with(|c| c.get())
+    }
+}
+
+#[cfg(feature = "texture-cache-debug")]
+pub use s503_trace::*;
+
 mod prompts;
 
 use crate::util::atomic_incr_if_not_zero;
@@ -1219,6 +1311,31 @@ impl Window {
             let next_frame_callbacks = next_frame_callbacks.clone();
             let input_rate_tracker = input_rate_tracker.clone();
             move |request_frame_options| {
+                // CS S503 (GH #90): wake-entry telemetry. Emit BEFORE the thermal
+                // check so every compositor wake is observable, even on the early-
+                // return path. `paint_frame` correlates with downstream events
+                // emitted later in this wake; `since_callback_ms` is the gap from
+                // wl_callback::Done arrival to this closure entry (distinguishes
+                // C1 compositor-silent from CS-main-blocked).
+                #[cfg(feature = "texture-cache-debug")]
+                let paint_frame = next_request_frame_seq();
+                #[cfg(feature = "texture-cache-debug")]
+                let since_callback_ms =
+                    since_last_frame_callback_ms().unwrap_or(NO_PRIOR_SAMPLE);
+                #[cfg(feature = "texture-cache-debug")]
+                log::info!(
+                    "event=request_frame_entry paint_frame={} dirty={} force_render={} \
+                     needs_present_flag={} next_frame_cbs={} \
+                     input_high_rate={} since_callback_ms={:.1}",
+                    paint_frame,
+                    invalidator.is_dirty(),
+                    request_frame_options.force_render,
+                    needs_present.get(),
+                    next_frame_callbacks.borrow().len(),
+                    input_rate_tracker.borrow().is_high_rate(),
+                    since_callback_ms,
+                );
+
                 let thermal_state = handle
                     .update(&mut cx, |_, _, cx| cx.thermal_state())
                     .log_err();
@@ -1232,6 +1349,20 @@ impl Window {
                     if let Some(last_frame) = last_frame_time
                         && now.duration_since(last_frame) < Duration::from_micros(16667)
                     {
+                        // CS S503 (GH #90, sage rev #3): the thermal early-return
+                        // skips complete_frame → surface.commit, which leaves the
+                        // wayland compositor unnotified. Currently unreachable on
+                        // Linux (ThermalState always Nominal per kb S481), but a
+                        // future regression would be silently mis-attributed to
+                        // compositor behavior without this emit. `since_callback_ms`
+                        // included so all `request_frame_decision` emits share one
+                        // schema — keeps grep/jq readers honest.
+                        #[cfg(feature = "texture-cache-debug")]
+                        log::info!(
+                            "event=request_frame_decision paint_frame={} action=thermal_return \
+                             state={:?} since_callback_ms={:.1}",
+                            paint_frame, thermal_state, since_callback_ms
+                        );
                         return;
                     }
                 }
@@ -1254,7 +1385,32 @@ impl Window {
                     || needs_present.get()
                     || (active.get() && input_rate_tracker.borrow_mut().is_high_rate());
 
-                if invalidator.is_dirty() || request_frame_options.force_render {
+                // CS S503 (GH #90): cache dirty once so the decision emit and the
+                // branch predicate read identical values (narrow race tolerance).
+                let is_dirty = invalidator.is_dirty();
+                let will_draw = is_dirty || request_frame_options.force_render;
+
+                #[cfg(feature = "texture-cache-debug")]
+                {
+                    let action: &'static str = if will_draw {
+                        "draw"
+                    } else if needs_present {
+                        "present_only"
+                    } else {
+                        "skip"
+                    };
+                    log::info!(
+                        "event=request_frame_decision paint_frame={} action={} dirty={} \
+                         force_render={} needs_present={}",
+                        paint_frame,
+                        action,
+                        is_dirty,
+                        request_frame_options.force_render,
+                        needs_present
+                    );
+                }
+
+                if will_draw {
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {

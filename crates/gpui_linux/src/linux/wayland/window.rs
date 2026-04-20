@@ -580,10 +580,21 @@ impl WaylandWindowStatePtr {
         // CS S499: report when the compositor actually scanned out pixels for the
         // previous frame. Gap between our `frame_present` (queue.submit/frame.present)
         // and this presentation timestamp exposes compositor-side queueing delay.
+        //
+        // CS S503 (GH #90): `since_present_ms` is the gap from our last
+        // `frame_present_end` (gpui_wgpu) to this `Presented` event. Normal ≈ 1-20ms.
+        // A spike to ~500ms points at C4 (compositor holds buffer, back-pressures
+        // next Done). See sage rev #2 for the Discarded-silence false-positive this
+        // measurement could otherwise produce — now handled in client.rs.
+        // `paint_frame` is the seq stamped at wayland_surface_commit, since
+        // Presented fires async after commit → only that stamp is stable here.
         #[cfg(feature = "texture-cache-debug")]
         log::info!(
-            "event=presentation_feedback presentation_time_nanos={}",
-            nanos
+            "event=presentation_feedback paint_frame={} presentation_time_nanos={} \
+             since_present_ms={:.1}",
+            gpui::last_committed_frame_seq(),
+            nanos,
+            gpui::since_last_frame_present_end_ms().unwrap_or(gpui::NO_PRIOR_SAMPLE)
         );
     }
 
@@ -1414,6 +1425,8 @@ impl PlatformWindow for WaylandWindow {
         // Register for presentation feedback before commit (wp_presentation_time).
         // The compositor will fire Presented with the actual VSync timestamp,
         // enabling accurate animation dt computation.
+        #[cfg(feature = "texture-cache-debug")]
+        let has_feedback_object = state.globals.presentation.is_some();
         if let Some(ref presentation) = state.globals.presentation {
             // The feedback object is kept alive by the Wayland dispatch queue.
             // Dropping it here is intentional — the Dispatch<WpPresentationFeedback>
@@ -1425,6 +1438,23 @@ impl PlatformWindow for WaylandWindow {
             );
         }
         state.surface.commit();
+        // CS S503 (GH #90): wayland contract — compositor may stop sending Done
+        // if the client stops committing. Emit on every commit so trace readers
+        // can verify the commit cadence matches the frame-callback cadence
+        // during a stall. A divergence (commits < callbacks) implicates C2;
+        // an exact match during a stall implicates C1 (compositor-side throttle).
+        // `paint_frame` is the current in-flight wake seq; stamping it into the
+        // shared thread_local lets the async presentation-feedback handler tie
+        // `Presented` events back to the commit that produced the buffer.
+        #[cfg(feature = "texture-cache-debug")]
+        {
+            let paint_frame = gpui::current_request_frame_seq();
+            gpui::record_surface_commit_seq(paint_frame);
+            log::info!(
+                "event=wayland_surface_commit paint_frame={} has_feedback_object={}",
+                paint_frame, has_feedback_object
+            );
+        }
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

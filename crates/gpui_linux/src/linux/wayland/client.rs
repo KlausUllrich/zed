@@ -1104,24 +1104,36 @@ impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, ObjectId>
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wp_presentation_feedback::Event::Presented {
-            tv_sec_hi,
-            tv_sec_lo,
-            tv_nsec,
-            ..
-        } = event
-        {
-            // wp_presentation_time splits seconds into two 32-bit fields to avoid
-            // Year 2038 overflow in 32-bit compositors. Reconstruct the full 64-bit value.
-            let secs = (tv_sec_hi as u64) << 32 | tv_sec_lo as u64;
-            let nanos = secs * 1_000_000_000 + tv_nsec as u64;
+        match event {
+            wp_presentation_feedback::Event::Presented {
+                tv_sec_hi,
+                tv_sec_lo,
+                tv_nsec,
+                ..
+            } => {
+                // wp_presentation_time splits seconds into two 32-bit fields to avoid
+                // Year 2038 overflow in 32-bit compositors. Reconstruct the full 64-bit value.
+                let secs = (tv_sec_hi as u64) << 32 | tv_sec_lo as u64;
+                let nanos = secs * 1_000_000_000 + tv_nsec as u64;
 
-            let client = state.get_client();
-            let mut state = client.borrow_mut();
-            if let Some(window) = get_window(&mut state, surface_id) {
-                drop(state);
-                window.set_presentation_time(nanos);
+                let client = state.get_client();
+                let mut state = client.borrow_mut();
+                if let Some(window) = get_window(&mut state, surface_id) {
+                    drop(state);
+                    window.set_presentation_time(nanos);
+                }
             }
+            wp_presentation_feedback::Event::Discarded => {
+                // CS S503 (GH #90, sage rev #2): compositor discarded the buffer
+                // without ever showing it (occlusion, minimize, focus-loss). Without
+                // this arm, presentation_time_nanos sits stale and `since_present_ms`
+                // would compute a large delta on the NEXT `Presented` — a false
+                // C4 positive. Emit under the existing gate so trace readers can
+                // correlate stalls with buffer-discard bursts (a new C7 candidate).
+                #[cfg(feature = "texture-cache-debug")]
+                log::info!("event=presentation_feedback_discarded");
+            }
+            _ => {}
         }
     }
 }
@@ -1149,8 +1161,21 @@ impl Dispatch<WlCallback, ObjectId> for WaylandClientStatePtr {
             // (hypothesis B). If the gap between this event and next view_render_start
             // is much larger, something is throttling us even after the compositor
             // released us.
+            //
+            // CS S503 (GH #90): `since_last_ms` is the inter-arrival gap. Normal
+            // 144Hz ≈ 7ms, 60Hz ≈ 17ms. Outlier stalls show >50ms — direct evidence
+            // of compositor throttling (C1). `gpui::record_frame_callback_arrival`
+            // updates a shared thread_local so gpui's on_request_frame closure can
+            // compute dispatch→wake latency on the same timeline.
             #[cfg(feature = "texture-cache-debug")]
-            log::info!("event=wayland_frame_callback");
+            {
+                let since_last_ms = gpui::record_frame_callback_arrival()
+                    .unwrap_or(gpui::NO_PRIOR_SAMPLE);
+                log::info!(
+                    "event=wayland_frame_callback since_last_ms={:.1}",
+                    since_last_ms
+                );
+            }
             window.frame();
         }
     }

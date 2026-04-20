@@ -1481,6 +1481,11 @@ impl WgpuRenderer {
             #[cfg(feature = "texture-cache-debug")]
             let frame_present_started_at = std::time::Instant::now();
             frame.present();
+            // CS S503 (GH #90): stamp the present-end timestamp into a shared
+            // thread_local so the wayland presentation-feedback handler can
+            // compute `since_present_ms` on the next `Presented` event.
+            #[cfg(feature = "texture-cache-debug")]
+            gpui::record_frame_present_end();
             #[cfg(feature = "texture-cache-debug")]
             {
                 let duration_ms = frame_present_started_at.elapsed().as_secs_f32() * 1000.0;
