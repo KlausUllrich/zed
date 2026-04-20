@@ -29,7 +29,11 @@ pub use texture_cache::{
 struct GlobalParams {
     viewport_size: [f32; 2],
     premultiplied_alpha: u32,
-    pad: u32,
+    /// Fade alpha applied to cached-texture composites in `fs_composite`.
+    /// 1.0 = full opacity (no fade). Written each frame from
+    /// `Scene::composite_fade_alpha`. Occupies the same 4-byte slot the
+    /// former std140 `pad` did — no uniform-buffer resize required.
+    composite_fade_alpha: f32,
 }
 
 #[repr(C)]
@@ -1172,7 +1176,10 @@ impl WgpuRenderer {
             } else {
                 0
             },
-            pad: 0,
+            // S502: fade alpha for cached-texture composites. List::paint
+            // writes scene.composite_fade_alpha each frame from the
+            // controller's tick value. Default 1.0 = no fade.
+            composite_fade_alpha: scene.composite_fade_alpha,
         };
 
         let path_globals = GlobalParams {

@@ -1249,7 +1249,10 @@ impl WgpuRenderer {
             let item_globals = GlobalParams {
                 viewport_size: [tex_width as f32, tex_height as f32],
                 premultiplied_alpha: 0,
-                pad: 0,
+                // S502: capture-pass globals — fade alpha is never applied to
+                // capture (texture ingestion, not composite). Set to 1.0 to
+                // keep the field's "no-op" default explicit.
+                composite_fade_alpha: 1.0,
             };
             let resources = self.resources();
             resources.queue.write_buffer(

@@ -325,6 +325,15 @@ struct StateInner {
     /// arbitrary cached-scroll durations.
     #[cfg(feature = "texture-cache")]
     cached_item_state_keys: HashMap<usize, Vec<(GlobalElementId, TypeId)>>,
+    /// S502: Fade alpha applied to cached-texture composites during the
+    /// texture→layout transition. Default 1.0 = no fade (composite as opaque).
+    /// Driven from CS via `set_fade_alpha()` on each frame the controller's
+    /// `tick()` returns < 1.0. Written into `Scene::composite_fade_alpha` at
+    /// paint entry so the GPU composite shader applies the multiply. Reset to
+    /// 1.0 in `set_item_caching_enabled(true, ...)` so scroll resume snaps the
+    /// cached path back to full opacity immediately (RS-FADE-B).
+    #[cfg(feature = "texture-cache")]
+    fade_alpha: f32,
 }
 
 /// Keeps track of a fractional scroll position within an item for restoration
@@ -558,6 +567,8 @@ impl ListState {
             smooth_scroll_active: false,
             #[cfg(feature = "texture-cache")]
             cached_item_state_keys: HashMap::new(),
+            #[cfg(feature = "texture-cache")]
+            fade_alpha: 1.0,
         })));
         this.splice(0..0, item_count);
         this
@@ -1300,6 +1311,15 @@ impl ListState {
         if prev && !enabled {
             inner.prev_item_heights.clear();
         }
+        // S502: scroll resumed — fade is stale. Snap cached composites back to
+        // full opacity so the HIT path renders as normal. CS's
+        // FadeComposeController also calls cancel() at the matching call
+        // sites; this reset is the last line of defense when a future
+        // caller adds a new `set_item_caching_enabled(true, …)` site and
+        // forgets to plumb the CS-side cancel.
+        if enabled && !prev {
+            inner.fade_alpha = 1.0;
+        }
         if prev != enabled {
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1313,6 +1333,17 @@ impl ListState {
     #[cfg(feature = "texture-cache")]
     pub fn is_item_caching_enabled(&self) -> bool {
         self.0.borrow().caching_enabled
+    }
+
+    /// S502: Set the fade alpha applied to cached-texture composites during
+    /// the texture→layout transition crossfade. 1.0 = no fade (normal cached
+    /// composite). 0.0 = fully transparent (texture invisible, DIRECT paint
+    /// shows). CS's `FadeComposeController::tick()` is the sole caller — it
+    /// drives this toward 0.0 over the 100 ms fade window and calls cancel()
+    /// (alpha back to 1.0) on scroll resume.
+    #[cfg(feature = "texture-cache")]
+    pub fn set_fade_alpha(&self, alpha: f32) {
+        self.0.borrow_mut().fade_alpha = alpha.clamp(0.0, 1.0);
     }
 
     /// Returns the monotonic paint frame counter.
@@ -2445,6 +2476,8 @@ impl Element for List {
         #[cfg(feature = "texture-cache")]
         let cached_item_state_keys_snapshot;
         #[cfg(feature = "texture-cache")]
+        let fade_alpha;
+        #[cfg(feature = "texture-cache")]
         {
             let mut state = self.state.0.borrow_mut();
             caching_enabled = state.caching_enabled;
@@ -2454,9 +2487,20 @@ impl Element for List {
             trace_items_snapshot = state.trace_items.clone();
             prev_item_heights_snapshot = state.prev_item_heights.clone();
             cached_item_state_keys_snapshot = state.cached_item_state_keys.clone();
+            fade_alpha = state.fade_alpha;
             state.paint_frame_count += 1;
             frame_count = state.paint_frame_count;
             crate::card_timeline::bump_frame();
+        }
+        // S502: publish the controller-driven fade alpha into the Scene so
+        // the composite shader applies it via `globals.composite_fade_alpha`.
+        // Reset to 1.0 at frame start by Scene::clear, so writing only when
+        // < 1.0 would leave stale 1.0 frames untouched — but we write
+        // unconditionally because overwriting with 1.0 is a no-op and keeps
+        // this hunk single-line.
+        #[cfg(feature = "texture-cache")]
+        {
+            window.next_frame.scene.composite_fade_alpha = fade_alpha;
         }
         #[cfg(feature = "texture-cache")]
         let mut current_frame_heights: HashMap<usize, Pixels> = HashMap::new();
@@ -2743,6 +2787,45 @@ impl Element for List {
 
                 // All caching_enabled=true branches above use `continue`.
                 // This line is reached only when caching_enabled=false.
+
+                // S502 FADE-OVERLAY: during the post-stop 100ms fade window,
+                // caching is disabled but cached textures from the just-ended
+                // scroll are still valid (renderer feedback set un-purged).
+                // Paint DIRECT, then emit an empty cache-region bracket so the
+                // composite shader draws the old texture on top at the current
+                // fade alpha. As alpha decays to 0.0, the texture fades out,
+                // revealing the fresh DIRECT paint underneath.
+                //
+                // Gated on `fade_alpha < 1.0` so non-fading DIRECT frames stay
+                // on the single-line `element.paint` path below (no extra
+                // bracket, no composite-shader work).
+                #[cfg(feature = "texture-cache")]
+                if fade_alpha < 1.0 {
+                    let region_id = CacheRegionId(item.index as u64);
+                    // If the cached texture was evicted mid-fade,
+                    // has_cached_region returns false: skip the bracket and
+                    // fall through to a plain DIRECT paint below. A
+                    // DIRECT-only render is always correct; the overlay is
+                    // additive improvement only.
+                    if has_cached_region(region_id) {
+                        let item_bounds = Bounds {
+                            origin: item.origin,
+                            size: item.size,
+                        };
+                        crate::elements::list_fade::emit_fade_overlay(
+                            window,
+                            cx,
+                            &mut item.element,
+                            region_id,
+                            item_bounds,
+                            bounds,
+                            cache_clear_color,
+                            fade_alpha,
+                        );
+                        continue;
+                    }
+                }
+
                 #[cfg(feature = "texture-cache")]
                 { diag_plain += 1; }
                 item.element.paint(window, cx);

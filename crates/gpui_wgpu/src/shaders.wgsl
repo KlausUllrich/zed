@@ -80,7 +80,10 @@ fn apply_contrast_and_gamma_correction3(sample: vec3<f32>, color: vec3<f32>, enh
 struct GlobalParams {
     viewport_size: vec2<f32>,
     premultiplied_alpha: u32,
-    pad: u32,
+    // S502 fade overlay alpha ∈ [0,1]. Default 1.0 = no fade.
+    // Multiplied into fs_composite output to crossfade cached textures
+    // against the underlying DIRECT paint during the texture→layout transition.
+    composite_fade_alpha: f32,
 }
 
 struct GammaParams {
@@ -1163,11 +1166,15 @@ fn fs_composite(input: PathVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
     let sample = textureSample(t_sprite, s_sprite, input.texture_coords);
+    // S502: multiply both rgb and alpha by composite_fade_alpha so the cached
+    // texture composites at the controller-driven fade alpha. Default 1.0 is
+    // a no-op for non-fading frames.
+    let fa = globals.composite_fade_alpha;
     if globals.premultiplied_alpha != 0u {
         // Texture has straight alpha — pre-multiply for One/OneMinusSrcAlpha blend
-        return vec4<f32>(sample.rgb * sample.a, sample.a);
+        return vec4<f32>(sample.rgb * sample.a * fa, sample.a * fa);
     }
-    return sample;
+    return vec4<f32>(sample.rgb * fa, sample.a * fa);
 }
 
 // --- underlines --- //

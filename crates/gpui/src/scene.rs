@@ -24,7 +24,6 @@ pub type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
 #[expect(missing_docs)]
 pub type DrawOrder = u32;
 
-#[derive(Default)]
 #[expect(missing_docs)]
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
@@ -42,6 +41,36 @@ pub struct Scene {
     cache_regions_data: Vec<CacheRegion>,
     #[cfg(feature = "texture-cache")]
     active_cache_region: Option<(CacheRegionId, Bounds<ScaledPixels>, Hsla, usize, DrawOrder, Bounds<ScaledPixels>)>,
+    /// S502 fade overlay alpha read by the wgpu composite shader.
+    /// Default 1.0 = no fade. List::paint writes this each frame from
+    /// `ListState::fade_alpha`. f32 default would be 0.0 (black-screen
+    /// composite), so Scene needs a manual Default impl below.
+    #[cfg(feature = "texture-cache")]
+    pub composite_fade_alpha: f32,
+}
+
+impl Default for Scene {
+    fn default() -> Self {
+        Self {
+            paint_operations: Vec::new(),
+            primitive_bounds: BoundsTree::default(),
+            layer_stack: Vec::new(),
+            shadows: Vec::new(),
+            quads: Vec::new(),
+            paths: Vec::new(),
+            underlines: Vec::new(),
+            monochrome_sprites: Vec::new(),
+            subpixel_sprites: Vec::new(),
+            polychrome_sprites: Vec::new(),
+            surfaces: Vec::new(),
+            #[cfg(feature = "texture-cache")]
+            cache_regions_data: Vec::new(),
+            #[cfg(feature = "texture-cache")]
+            active_cache_region: None,
+            #[cfg(feature = "texture-cache")]
+            composite_fade_alpha: 1.0,
+        }
+    }
 }
 
 #[expect(missing_docs)]
@@ -62,6 +91,9 @@ impl Scene {
         {
             self.cache_regions_data.clear();
             self.active_cache_region = None;
+            // S502: reset fade alpha to no-op each frame; List::paint writes
+            // the controller-driven value when a fade is active.
+            self.composite_fade_alpha = 1.0;
         }
     }
 
