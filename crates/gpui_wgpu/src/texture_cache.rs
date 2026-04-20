@@ -486,6 +486,7 @@ impl TexturePool {
                 }
             }
 
+            #[cfg(feature = "texture-cache-debug")]
             log::debug!(
                 "classify region={} bin={:?} exit_frame={:?}",
                 region_id,
@@ -1145,63 +1146,41 @@ impl WgpuRenderer {
             let render_start = if debug { Some(Instant::now()) } else { None };
             let mini_scene = scene.extract_region_as_mini_scene(region);
 
-            // Primitive count comparison: ALWAYS log for every region capture.
-            // Comparing working items (Read cards) vs failing items (Thinking, Bash,
-            // Permission, AskUserQuestion) reveals if text sprites are missing at capture time.
+            // Per-type sprite counts — `prim_*` copies feed the F9 debug panel below.
             let q = mini_scene.quads.len() as u32;
             let m = mini_scene.monochrome_sprites.len() as u32;
             let s = mini_scene.subpixel_sprites.len() as u32;
             let p = mini_scene.paths.len() as u32;
-            let poly = mini_scene.polychrome_sprites.len() as u32;
-            let shadows = mini_scene.shadows.len() as u32;
-            let underlines = mini_scene.underlines.len() as u32;
-            let total = q + m + s + p + poly + shadows + underlines;
-            log::info!(
-                "event=capture_detail ix={} texture={}x{} total={} quads={} mono={} subpixel={} paths={} polychrome={} shadows={} underlines={} reused={}",
-                region_id, tex_width, tex_height, total, q, m, s, p, poly, shadows, underlines, reused
-            );
-            // Mini-scene diagnostic: region bounds + primitive counts for blank-texture debugging.
-            log::info!(
-                "event=mini_scene ix={} region_y={:.1} region_h={:.1} quads={} shadows={} mono={} subpixel={} poly={} underlines={} paths={} total={}",
-                region_id,
-                region.bounds.origin.y.0,
-                region.bounds.size.height.0,
-                q, shadows, m, s, poly, underlines, p, total,
-            );
-            // Per-sprite-type first Y position: reveals if primitives land outside texture bounds.
-            if let Some(first_mono) = mini_scene.monochrome_sprites.first() {
-                log::info!("event=mini_scene_sprite ix={} type=mono first_y={:.1} trans_y={:.1}",
-                    region_id, first_mono.bounds.origin.y.0, first_mono.transformation.translation[1]);
-            }
-            if let Some(first_quad) = mini_scene.quads.first() {
-                log::info!("event=mini_scene_sprite ix={} type=quad first_y={:.1}",
-                    region_id, first_quad.bounds.origin.y.0);
-            }
-            // Persist mini-scene data to file (ring buffer loses these on scroll flood).
+            let total = q
+                + m
+                + s
+                + p
+                + mini_scene.polychrome_sprites.len() as u32
+                + mini_scene.shadows.len() as u32
+                + mini_scene.underlines.len() as u32;
+            #[cfg(feature = "texture-cache-debug")]
             {
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/cs-mini-scene-log.txt") {
-                    writeln!(f, "event=mini_scene ix={} region_y={:.1} region_h={:.1} op_range={}..{} quads={} shadows={} mono={} subpixel={} poly={} underlines={} paths={} total={}",
-                        region_id,
-                        region.bounds.origin.y.0,
-                        region.bounds.size.height.0,
-                        region.paint_op_range.start,
-                        region.paint_op_range.end,
-                        mini_scene.quads.len(),
-                        mini_scene.shadows.len(),
-                        mini_scene.monochrome_sprites.len(),
-                        mini_scene.subpixel_sprites.len(),
-                        mini_scene.polychrome_sprites.len(),
-                        mini_scene.underlines.len(),
-                        mini_scene.paths.len(),
-                        mini_scene.quads.len() + mini_scene.shadows.len() + mini_scene.monochrome_sprites.len() + mini_scene.subpixel_sprites.len() + mini_scene.polychrome_sprites.len() + mini_scene.underlines.len() + mini_scene.paths.len(),
-                    ).ok();
-                    if let Some(m) = mini_scene.monochrome_sprites.first() {
-                        writeln!(f, "  sprite ix={} type=mono first_y={:.1} trans_y={:.1}", region_id, m.bounds.origin.y.0, m.transformation.translation[1]).ok();
-                    }
-                    if let Some(q) = mini_scene.quads.first() {
-                        writeln!(f, "  sprite ix={} type=quad first_y={:.1}", region_id, q.bounds.origin.y.0).ok();
-                    }
+                let poly = mini_scene.polychrome_sprites.len() as u32;
+                let shadows = mini_scene.shadows.len() as u32;
+                let underlines = mini_scene.underlines.len() as u32;
+                log::info!(
+                    "event=capture_detail ix={} texture={}x{} total={} quads={} mono={} subpixel={} paths={} polychrome={} shadows={} underlines={} reused={}",
+                    region_id, tex_width, tex_height, total, q, m, s, p, poly, shadows, underlines, reused
+                );
+                log::info!(
+                    "event=mini_scene ix={} region_y={:.1} region_h={:.1} quads={} shadows={} mono={} subpixel={} poly={} underlines={} paths={} total={}",
+                    region_id,
+                    region.bounds.origin.y.0,
+                    region.bounds.size.height.0,
+                    q, shadows, m, s, poly, underlines, p, total,
+                );
+                if let Some(first_mono) = mini_scene.monochrome_sprites.first() {
+                    log::info!("event=mini_scene_sprite ix={} type=mono first_y={:.1} trans_y={:.1}",
+                        region_id, first_mono.bounds.origin.y.0, first_mono.transformation.translation[1]);
+                }
+                if let Some(first_quad) = mini_scene.quads.first() {
+                    log::info!("event=mini_scene_sprite ix={} type=quad first_y={:.1}",
+                        region_id, first_quad.bounds.origin.y.0);
                 }
             }
 
@@ -1214,13 +1193,6 @@ impl WgpuRenderer {
                     "event=empty_recapture ix={} size={}x{} — stale HIT feedback, skipping",
                     region_id, tex_width, tex_height
                 );
-                // Proof logging: persist guard fire to file
-                {
-                    use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/cs-mini-scene-log.txt") {
-                        writeln!(f, "event=guard_fire ix={} region_h={:.1} action=remove_from_pool", region_id, tex_height as f32).ok();
-                    }
-                }
                 // Return the reused texture to free list if we grabbed one
                 if reused {
                     let sc = SizeClass::from_height(tex_height);
@@ -1436,12 +1408,9 @@ impl WgpuRenderer {
                 }
             }
 
-            // Proof logging: guard self-heal confirmation
-            if has_content && pool.guarded_ids.remove(&region.id.0) {
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/cs-mini-scene-log.txt") {
-                    writeln!(f, "event=guard_heal ix={} total={} action=fresh_capture_success", region_id, total).ok();
-                }
+            // Clear guard state on successful fresh capture.
+            if has_content {
+                pool.guarded_ids.remove(&region.id.0);
             }
             fresh_count += 1;
             if debug {
