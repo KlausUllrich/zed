@@ -1092,17 +1092,28 @@ impl WgpuRenderer {
                         }
                         continue;
                     }
-                    // Dimension mismatch or missing content — will re-capture below
-                    log::debug!(
-                        "event=dimension_mismatch ix={} cached_w={} cached_h={} tex_w={} tex_h={} has_content={} action=recapture",
-                        region_id, cached.width, cached.height, tex_width, tex_height, cached.has_content
-                    );
-                    // S498 INV-X4: Dimension mismatch triggers recapture loop.
-                    #[cfg(feature = "texture-cache-debug")]
+                    // S504: split emit — dim-mismatch and has_content=false are
+                    // distinct cases. Prior single-emit path misrepresented 99.7%
+                    // of fires as dimension mismatches when dims matched exactly
+                    // and only has_content differed (flux S504 investigation).
                     if cached.width != tex_width || cached.height != tex_height {
+                        log::debug!(
+                            "event=dimension_mismatch ix={} cached_w={} cached_h={} tex_w={} tex_h={} action=recapture",
+                            region_id, cached.width, cached.height, tex_width, tex_height
+                        );
+                        // S498 INV-X4: dimension mismatch triggers recapture loop.
+                        #[cfg(feature = "texture-cache-debug")]
                         log::warn!(
                             "event=INVARIANT_VIOLATION rule=X4 region={} cached_w={} cached_h={} actual_w={} actual_h={}",
                             region_id, cached.width, cached.height, tex_width, tex_height
+                        );
+                    } else {
+                        // Dims match, has_content=false — re-capture is driven by
+                        // an empty prior capture (total=0 primitives). Not an
+                        // X4 violation; no anomaly rule consumes this event.
+                        log::debug!(
+                            "event=empty_capture_retain ix={} tex_w={} tex_h={} action=recapture",
+                            region_id, tex_width, tex_height
                         );
                     }
                 }
