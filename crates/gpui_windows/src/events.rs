@@ -1151,6 +1151,9 @@ impl WindowsWindowInner {
         request_frame(RequestFrameOptions {
             require_presentation: false,
             force_render,
+            // Windows has no wp_presentation_time equivalent — matches X11 default.
+            // Wayland is the only platform that populates this from compositor feedback.
+            presentation_time_nanos: None,
         });
 
         self.state.callbacks.request_frame.set(Some(request_frame));
