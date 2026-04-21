@@ -217,10 +217,25 @@ impl WindowInvalidator {
         }
     }
 
+    // CS S504 (GH #90 round-3, rex §5): `#[track_caller]` + event-emit source
+    // attribution for the dirty-flow race. `defeated=T` means the notify arrived
+    // during draw_phase != None and was silently swallowed (the else branch). The
+    // caller location propagates via `#[track_caller]`; without a matching attribute
+    // on every intermediate fn (App::notify → Context::notify → cx.notify) the
+    // nearest attributed caller is logged — CS-side origin is logged separately
+    // via cx_notify_outcome for correlation.
+    #[track_caller]
     pub fn invalidate_view(&self, entity: EntityId, cx: &mut App) -> bool {
         let mut inner = self.inner.borrow_mut();
         inner.dirty_views.insert(entity);
-        if inner.draw_phase == DrawPhase::None {
+        let set_dirty = inner.draw_phase == DrawPhase::None;
+        #[cfg(feature = "texture-cache-debug")]
+        log::info!(
+            "event=invalidator_set_dirty source={} defeated={}",
+            core::panic::Location::caller(),
+            if set_dirty { "F" } else { "T" },
+        );
+        if set_dirty {
             inner.dirty = true;
             cx.push_effect(Effect::Notify { emitter: entity });
             true
@@ -2059,7 +2074,17 @@ impl Window {
     /// It will cause the window to redraw on the next frame, even if no other changes have occurred.
     ///
     /// If called from within a view, it will notify that view on the next frame. Otherwise, it will refresh the entire window.
+    // CS S504 (GH #90 round-3, rex §5): `#[track_caller]` + event-emit reveals
+    // which code path schedules the next-frame wake. Paired with
+    // invalidator_set_dirty in rex's round-3 trace analysis to answer
+    // "during a residual stall, which caller finally breaks the silence?"
+    #[track_caller]
     pub fn request_animation_frame(&self) {
+        #[cfg(feature = "texture-cache-debug")]
+        log::info!(
+            "event=raf_scheduled caller={}",
+            core::panic::Location::caller(),
+        );
         let entity = self.current_view();
         self.on_next_frame(move |_, cx| cx.notify(entity));
     }
