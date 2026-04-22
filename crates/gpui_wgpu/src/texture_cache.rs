@@ -939,7 +939,12 @@ impl WgpuRenderer {
         pool.globals_capacity = new_capacity;
     }
 
-    fn create_item_texture(&self, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    fn create_item_texture(
+        &self,
+        region_id: u32,
+        width: u32,
+        height: u32,
+    ) -> (wgpu::Texture, wgpu::TextureView) {
         let resources = self.resources();
         let texture = resources.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("item_cache_texture"),
@@ -957,7 +962,14 @@ impl WgpuRenderer {
                 | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // IP-1: Named view so wgpu validation errors identify the specific
+        // cache region. An empty label surfaces as `''` in panic messages and
+        // was the central blind spot in S506 (PLAN.md Option B, V2 invariant).
+        let view_label = format!("cache_item_{region_id}_{width}x{height}");
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some(&view_label),
+            ..Default::default()
+        });
         (texture, view)
     }
 
@@ -1148,7 +1160,7 @@ impl WgpuRenderer {
                         continue;
                     }
                     // NLL ends the &mut pool borrow here — create_item_texture can borrow &self
-                    let (t, v) = self.create_item_texture(tex_width, tex_height);
+                    let (t, v) = self.create_item_texture(region_id, tex_width, tex_height);
                     (t, v, false)
                 }
             };

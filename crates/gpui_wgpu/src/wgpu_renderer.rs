@@ -935,7 +935,11 @@ impl WgpuRenderer {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // IP-1: named view so wgpu validation errors identify this view by name.
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("path_intermediate_view"),
+            ..Default::default()
+        });
         (texture, view)
     }
 
@@ -963,7 +967,11 @@ impl WgpuRenderer {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // IP-1: named view so wgpu validation errors identify this view by name.
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("path_msaa_view"),
+            ..Default::default()
+        });
         Some((texture, view))
     }
 
@@ -1153,9 +1161,12 @@ impl WgpuRenderer {
         // Now that we know the surface is healthy, ensure intermediate textures exist
         self.ensure_intermediate_textures();
 
-        let frame_view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        // IP-1: named view so wgpu validation errors identify the swapchain
+        // frame view rather than surfacing `''` label.
+        let frame_view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("swapchain_frame_view"),
+            ..Default::default()
+        });
 
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
