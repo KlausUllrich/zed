@@ -509,6 +509,13 @@ impl TexturePool {
     /// Move an active entry to the free list (eviction without GPU deallocation).
     fn release_to_free_list(&mut self, region_id: u64) {
         if let Some(entry) = self.active.remove(&region_id) {
+            // Gap-NEW-1 site 5: active→free_list transition. Paired with any
+            // future texture_destroy that drains the free list (site 1).
+            #[cfg(feature = "texture-cache-debug")]
+            log::info!(
+                "event=texture_invalidate ix={} destination=free_list size={}x{}",
+                region_id, entry.width, entry.height
+            );
             let sc = entry.size_class;
             let free = FreeTexture {
                 texture: entry.texture,
@@ -530,6 +537,14 @@ impl TexturePool {
             if let Some(bucket) = self.free_list.get_mut(class) {
                 if let Some(freed) = bucket.pop() {
                     self.total_memory_bytes -= freed.memory_bytes;
+                    // Gap-NEW-1 site 1: free-list texture destroyed under budget
+                    // pressure. `ix=none` because free-list entries are identity-
+                    // less once released from active.
+                    #[cfg(feature = "texture-cache-debug")]
+                    log::info!(
+                        "event=texture_destroy ix=none reason=budget_free_drained class={:?} size={}x{} bytes={}",
+                        class, freed.width, freed.height, freed.memory_bytes
+                    );
                     drop(freed.texture);
                     return freed.memory_bytes;
                 }
@@ -542,6 +557,14 @@ impl TexturePool {
     fn destroy_active(&mut self, region_id: u64) {
         if let Some(entry) = self.active.remove(&region_id) {
             self.total_memory_bytes -= entry.memory_bytes;
+            // Gap-NEW-1 site 2: active-slot victim under budget pressure.
+            // Paired with the `event=eviction` emit that fires before this
+            // call in ensure_budget (see line ~605).
+            #[cfg(feature = "texture-cache-debug")]
+            log::info!(
+                "event=texture_destroy ix={} reason=budget_victim_priority bin={:?} item_index={} size={}x{}",
+                region_id, entry.priority_bin, entry.item_index, entry.width, entry.height
+            );
             drop(entry.texture);
         }
     }
@@ -645,6 +668,14 @@ impl TexturePool {
         // If replacing an existing entry, account for memory
         if let Some(old) = self.active.remove(&region_id) {
             self.total_memory_bytes -= old.memory_bytes;
+            // Gap-NEW-1 site 3: silent replace-path drop. RW3 smoking gun —
+            // if a bind group still references `old.view`, submit validates
+            // against a dropped texture after this line.
+            #[cfg(feature = "texture-cache-debug")]
+            log::info!(
+                "event=texture_destroy ix={} reason=replace_active old_size={}x{} old_bytes={}",
+                region_id, old.width, old.height, old.memory_bytes
+            );
             drop(old.texture);
         }
 
@@ -1228,6 +1259,15 @@ impl WgpuRenderer {
                 // Ensure this region is NOT in active pool — on next frame,
                 // has_cached_region() returns false → list.rs paints fresh
                 let pool = self.texture_pool.as_mut().unwrap();
+                // Gap-NEW-1 site 4: RW1 smoking gun. The mid-loop remove that
+                // sage's code-path analysis named as the race — drops texture
+                // + view via CacheEntry Drop while the encoder may still hold
+                // an Arc to the view.
+                #[cfg(feature = "texture-cache-debug")]
+                log::info!(
+                    "event=texture_destroy ix={} reason=stale_hit_cleanup size={}x{}",
+                    region.id.0, tex_width, tex_height
+                );
                 pool.active.remove(&region.id.0);
                 pool.guarded_ids.insert(region.id.0);
                 // Also clear the thread-local feedback so list.rs sees MISS immediately
