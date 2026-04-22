@@ -435,6 +435,12 @@ pub(crate) struct TexturePool {
     globals_entry_stride: u64,
     /// Current capacity of the globals buffer (number of entries).
     globals_capacity: u32,
+    /// IP-2 V1: every `region_id` that entered `process_cache_regions` this
+    /// frame. Cleared at the top of the function, pushed per-region in the
+    /// loop, checked pre-submit to detect mid-frame destroys (RW1 / RW3).
+    /// Only present under `texture-cache-debug` — zero cost in release.
+    #[cfg(feature = "texture-cache-debug")]
+    frame_regions_processed: Vec<u64>,
 }
 
 /// Memory statistics returned by `TexturePool::memory_stats()`.
@@ -451,6 +457,33 @@ impl TexturePool {
     /// Mark the start of a new frame. Advances the frame counter for LRU tracking.
     fn begin_frame(&mut self) {
         self.current_frame += 1;
+    }
+
+    /// IP-2 V1: return every `region_id` that entered this frame's
+    /// `process_cache_regions` but is no longer in `active`. A non-empty
+    /// vector means a cache entry was destroyed after the encoder already
+    /// bound its view — exactly the RW1 / RW3 race. Caller emits an
+    /// `INVARIANT_VIOLATION rule=V1` event per id and skips `queue.submit`.
+    ///
+    /// The one *intentional* removal this frame is the `empty_recapture`
+    /// guard at `texture_cache.rs:1231`. That ALSO emits an
+    /// `event=texture_destroy reason=stale_hit_cleanup` (Gap-NEW-1 site 4)
+    /// paired with the V1 violation — the two together confirm the race.
+    #[cfg(feature = "texture-cache-debug")]
+    pub(crate) fn check_pre_submit_liveness(&self) -> Vec<u64> {
+        self.frame_regions_processed
+            .iter()
+            .copied()
+            .filter(|id| !self.active.contains_key(id))
+            .collect()
+    }
+
+    /// IP-2 V1: drop any frame-scoped V1 state after submit. Called
+    /// unconditionally at the end of the draw function so the next frame
+    /// starts with an empty processed set regardless of whether submit fired.
+    #[cfg(feature = "texture-cache-debug")]
+    pub(crate) fn clear_frame_regions_processed(&mut self) {
+        self.frame_regions_processed.clear();
     }
 
     /// Reclassify all active entries into priority bins based on current viewport state.
@@ -936,6 +969,8 @@ impl WgpuRenderer {
             item_globals_buffer,
             globals_entry_stride: entry_stride,
             globals_capacity: capacity,
+            #[cfg(feature = "texture-cache-debug")]
+            frame_regions_processed: Vec::new(),
         });
     }
 
@@ -1013,6 +1048,15 @@ impl WgpuRenderer {
         scene: &Scene,
         instance_offset: &mut u64,
     ) -> bool {
+        // IP-2 V1: reset per-frame processed set unconditionally. Even on
+        // empty-regions frames we must clear so stale entries from a prior
+        // frame don't cause false V1 violations later. `if let Some` avoids
+        // forcing pool creation on frames where there's nothing to do.
+        #[cfg(feature = "texture-cache-debug")]
+        if let Some(pool) = self.texture_pool.as_mut() {
+            pool.frame_regions_processed.clear();
+        }
+
         let regions: Vec<_> = scene.cache_regions().to_vec();
         if regions.is_empty() {
             return true;
@@ -1082,6 +1126,15 @@ impl WgpuRenderer {
             let tex_width = (region.bounds.size.width.0.ceil() as u32).max(1);
             let tex_height = (region.bounds.size.height.0.ceil() as u32).max(1);
             let region_id = region.id.0 as u32;
+
+            // IP-2 V1: remember this region entered the pass. If it is NOT
+            // in `pool.active` at submit time, something removed it mid-frame.
+            #[cfg(feature = "texture-cache-debug")]
+            self.texture_pool
+                .as_mut()
+                .unwrap()
+                .frame_regions_processed
+                .push(region.id.0);
 
             // FR-5.1/EC-14: Skip items exceeding GPU max texture dimension.
             // Falls back to Fresh rendering (no caching attempt).
@@ -2031,6 +2084,19 @@ impl WgpuRenderer {
     /// Called on DPI change, window resize, or theme change.
     pub(crate) fn invalidate_texture_cache(&mut self) {
         if let Some(pool) = &mut self.texture_pool {
+            // Gap-NEW-1 Gate-B follow-up: mass-drop emit (sage's missed site).
+            // Fires on DPI change, window resize, theme change (RW5 territory).
+            // Paired with V1 so every destroy-class event that could invalidate
+            // a pending bind group is visible in the crash dump.
+            #[cfg(feature = "texture-cache-debug")]
+            {
+                let active_count = pool.active.len();
+                let free_count: usize = pool.free_list.values().map(|v| v.len()).sum();
+                log::info!(
+                    "event=texture_destroy ix=all reason=pool_purge active_count={} free_count={} bytes={}",
+                    active_count, free_count, pool.total_memory_bytes
+                );
+            }
             pool.active.clear();
             pool.free_list.clear();
             pool.total_memory_bytes = 0;

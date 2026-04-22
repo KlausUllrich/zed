@@ -1455,6 +1455,39 @@ impl WgpuRenderer {
             // CS S500: flush glyph atlas uploads queued during this frame's paint before GPU submits (sage atlas-proper-fix analysis)
             self.atlas.before_frame();
 
+            // IP-2 V1: pre-submit liveness assertion. If any region processed
+            // this frame is no longer in `pool.active`, something dropped its
+            // texture after the encoder already bound the view — exactly the
+            // RW1 / RW3 race. Emit INVARIANT_VIOLATION per offending region and
+            // SKIP the submit. The command buffer is dropped (frame goes blank
+            // or shows the previous swap-chain contents) and the next frame
+            // reconverges naturally. Strict improvement over the async 20-
+            // frame panic: sync detection, recoverable, with a named cause.
+            #[cfg(feature = "texture-cache-debug")]
+            {
+                let violations = self
+                    .texture_pool
+                    .as_ref()
+                    .map(|p| p.check_pre_submit_liveness())
+                    .unwrap_or_default();
+                if !violations.is_empty() {
+                    for rid in &violations {
+                        log::warn!(
+                            "event=INVARIANT_VIOLATION rule=V1 region_id={} reason=backing_destroyed",
+                            rid
+                        );
+                    }
+                    log::warn!(
+                        "event=V1_submit_skipped violations={} reason=backing_destroyed",
+                        violations.len()
+                    );
+                    if let Some(pool) = self.texture_pool.as_mut() {
+                        pool.clear_frame_regions_processed();
+                    }
+                    return;
+                }
+            }
+
             // CS S499: bracket queue.submit() to measure GPU command submission cost.
             // If this interval dominates the silent transition window, hypothesis A
             // (GPU backpressure / fence wait) is confirmed. If it's sub-millisecond,
