@@ -83,6 +83,17 @@ pub struct TextureCacheDebugFrame {
     pub pool: TextureCacheDebugPool,
     /// Lifecycle events this frame.
     pub events: Vec<TextureCacheDebugLifecycle>,
+    /// INV-X4 (dimension mismatch) violations observed during this frame's
+    /// `process_cache_regions`. Surfaced so CS's cache_circuit_breaker can see
+    /// fork-side invariant drift; S509 freeze had 3 X4 events that the breaker
+    /// was blind to. Always 0 when texture-cache-debug feature is off.
+    pub x4_violations: u32,
+    /// INV-V1 (backing destroyed pre-submit) violations observed during the
+    /// *previous* frame. One-frame lag is intrinsic: V1 fires in the renderer
+    /// after this debug frame has already been emitted, so the count is
+    /// parked on the pool and surfaced next frame (same pattern as
+    /// `composite_ms`). Always 0 when texture-cache-debug feature is off.
+    pub v1_violations: u32,
 }
 
 /// Per-item cache state within a frame.
@@ -441,6 +452,13 @@ pub(crate) struct TexturePool {
     /// Only present under `texture-cache-debug` — zero cost in release.
     #[cfg(feature = "texture-cache-debug")]
     frame_regions_processed: Vec<u64>,
+    /// V1 violations recorded since the last debug-frame emit. Written by
+    /// `wgpu_renderer.rs` when pre-submit liveness check fails; read+reset
+    /// in the next `process_cache_regions` debug emit (one-frame lag,
+    /// analogous to `prev_composite_ms`). Surfaces fork-side races into the
+    /// CS circuit breaker.
+    #[cfg(feature = "texture-cache-debug")]
+    pending_v1_violations: u32,
 }
 
 /// Memory statistics returned by `TexturePool::memory_stats()`.
@@ -484,6 +502,23 @@ impl TexturePool {
     #[cfg(feature = "texture-cache-debug")]
     pub(crate) fn clear_frame_regions_processed(&mut self) {
         self.frame_regions_processed.clear();
+    }
+
+    /// S510 Stream 2: park a V1 violation count observed during the renderer's
+    /// pre-submit liveness check. Saturating add so a pathological burst can't
+    /// wrap. The name says "park" because the count is held for one frame
+    /// (V1 fires after this frame's debug emit) — drained by
+    /// `take_pending_v1_violations` during the NEXT frame's emit.
+    #[cfg(feature = "texture-cache-debug")]
+    pub(crate) fn park_v1_violation_count(&mut self, n: u32) {
+        self.pending_v1_violations = self.pending_v1_violations.saturating_add(n);
+    }
+
+    /// S510 Stream 2: drain the pending V1 violation count for emit into
+    /// `TextureCacheDebugFrame`. Called once per debug-emit frame.
+    #[cfg(feature = "texture-cache-debug")]
+    pub(crate) fn take_pending_v1_violations(&mut self) -> u32 {
+        std::mem::take(&mut self.pending_v1_violations)
     }
 
     /// Reclassify all active entries into priority bins based on current viewport state.
@@ -971,6 +1006,8 @@ impl WgpuRenderer {
             globals_capacity: capacity,
             #[cfg(feature = "texture-cache-debug")]
             frame_regions_processed: Vec::new(),
+            #[cfg(feature = "texture-cache-debug")]
+            pending_v1_violations: 0,
         });
     }
 
@@ -1056,6 +1093,15 @@ impl WgpuRenderer {
         if let Some(pool) = self.texture_pool.as_mut() {
             pool.frame_regions_processed.clear();
         }
+
+        // S510 Stream 2: accumulate X4 (dimension-mismatch) violations over
+        // this frame's region iteration; surfaced via `TextureCacheDebugFrame`
+        // into CS's cache_circuit_breaker. Split declaration so `mut` only
+        // exists when the X4 increment site is compiled in.
+        #[cfg(feature = "texture-cache-debug")]
+        let mut x4_violations: u32 = 0;
+        #[cfg(not(feature = "texture-cache-debug"))]
+        let x4_violations: u32 = 0;
 
         let regions: Vec<_> = scene.cache_regions().to_vec();
         if regions.is_empty() {
@@ -1199,10 +1245,13 @@ impl WgpuRenderer {
                         );
                         // S498 INV-X4: dimension mismatch triggers recapture loop.
                         #[cfg(feature = "texture-cache-debug")]
-                        log::warn!(
-                            "event=INVARIANT_VIOLATION rule=X4 region={} cached_w={} cached_h={} actual_w={} actual_h={}",
-                            region_id, cached.width, cached.height, tex_width, tex_height
-                        );
+                        {
+                            log::warn!(
+                                "event=INVARIANT_VIOLATION rule=X4 region={} cached_w={} cached_h={} actual_w={} actual_h={}",
+                                region_id, cached.width, cached.height, tex_width, tex_height
+                            );
+                            x4_violations = x4_violations.saturating_add(1);
+                        }
                     } else {
                         // Dims match, has_content=false — re-capture is driven by
                         // an empty prior capture (total=0 primitives). Not an
@@ -1582,6 +1631,18 @@ impl WgpuRenderer {
             let fresh_ms = start
                 .map(|s| s.elapsed().as_secs_f32() * 1000.0)
                 .unwrap_or(0.0);
+            // S510 Stream 2: drain V1 violations parked by wgpu_renderer's
+            // pre-submit check last frame (one-frame lag, same pattern as
+            // `prev_composite_ms`). Gated: V1 detection and the pool field
+            // only exist under texture-cache-debug; stays 0 otherwise.
+            #[cfg(feature = "texture-cache-debug")]
+            let v1_violations = self
+                .texture_pool
+                .as_mut()
+                .map(|p| p.take_pending_v1_violations())
+                .unwrap_or(0);
+            #[cfg(not(feature = "texture-cache-debug"))]
+            let v1_violations: u32 = 0;
             let pool = self.texture_pool.as_ref().unwrap();
             let pool_stats = pool.debug_pool_stats();
 
@@ -1595,6 +1656,8 @@ impl WgpuRenderer {
                 items: debug_items,
                 pool: pool_stats,
                 events: debug_events,
+                x4_violations,
+                v1_violations,
             });
         }
 

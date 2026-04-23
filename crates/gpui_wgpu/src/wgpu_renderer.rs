@@ -1481,8 +1481,11 @@ impl WgpuRenderer {
                         "event=V1_submit_skipped violations={} reason=backing_destroyed",
                         violations.len()
                     );
+                    let v1_count = violations.len() as u32;
                     if let Some(pool) = self.texture_pool.as_mut() {
                         pool.clear_frame_regions_processed();
+                        // S510 Stream 2: park V1 count for emit next frame.
+                        pool.park_v1_violation_count(v1_count);
                     }
                     return;
                 }
