@@ -154,9 +154,12 @@ pub struct TextureCacheDebugPool {
     pub allocated: u32,
     /// Textures in the free list awaiting reuse.
     pub free: u32,
-    /// Total textures (allocated + free).
+    /// Total textures (allocated + free). Retired entries are excluded —
+    /// see `retired_count`.
     pub total: u32,
-    /// Total GPU memory (active + free) in MB.
+    /// Total GPU memory (active + free + retired) in MB. The retention tier
+    /// is included because `retire_entry` does not decrement
+    /// `total_memory_bytes`. See `retired_mb` for the retained-only portion.
     pub memory_mb: f32,
     /// Memory budget in MB.
     pub budget_mb: f32,
@@ -496,7 +499,9 @@ pub(crate) struct TexturePool {
     retired: Vec<RetiredEntry>,
     /// Current frame counter (incremented each frame).
     current_frame: u64,
-    /// Total GPU memory across active + free textures (bytes).
+    /// Total GPU memory across active + free + retired textures (bytes).
+    /// Retained entries contribute until `force_drop_oldest_retired` (budget
+    /// fallback) or `begin_frame` promotion + later `destroy_any_free`.
     total_memory_bytes: u64,
     /// Memory budget (bytes). Allocations exceeding this trigger eviction.
     budget_bytes: u64,
@@ -565,6 +570,10 @@ impl TexturePool {
     fn begin_frame(&mut self) {
         self.current_frame += 1;
 
+        // swap_remove idiom: do NOT increment `i` on removal — swap_remove
+        // moves the last element into slot `i`, so the same index must be
+        // re-examined on the next iteration to catch that newly-moved entry.
+        // Increment only on the non-remove branch.
         let current_frame = self.current_frame;
         let mut i = 0;
         while i < self.retired.len() {
@@ -794,6 +803,14 @@ impl TexturePool {
     }
 
     /// Destroy an active entry, reclaiming GPU memory.
+    ///
+    /// WARNING — V1-unsafe (per S511 Workaround D scope decision). The backing
+    /// is dropped synchronously even though a bind group from a recent frame
+    /// may still reference `view`. Only called from `ensure_budget` Phase 2,
+    /// which is the emergency path reached only after Phase 1a (free-list
+    /// drain) and Phase 1b (forced retired drain) have both exhausted. Rex's
+    /// Gate B covers this fallback explicitly; a narrowed-budget reproduction
+    /// can force engagement for testing.
     fn destroy_active(&mut self, region_id: u64) {
         if let Some(entry) = self.active.remove(&region_id) {
             self.total_memory_bytes -= entry.memory_bytes;
