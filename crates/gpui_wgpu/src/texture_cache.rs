@@ -29,6 +29,18 @@ const DEFAULT_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
 /// Frames an item can be outside viewport+buffer before becoming Distant (~0.5s at 60fps).
 const RECENT_WINDOW: u64 = 30;
 
+/// Workaround D — grace-period retention window (≈2s at 60fps).
+///
+/// When a cache entry is invalidated, its `wgpu::Texture` + `wgpu::TextureView`
+/// are held in the `retired` tier for this many frames before promotion to the
+/// free list. Any in-flight command buffer that referenced the view when the
+/// entry was invalidated is guaranteed to have completed before the backing is
+/// dropped, eliminating the V1 `backing_destroyed` race (GH #146 session-freeze,
+/// Cascade S509 analysis: 2020ms main-thread stall ≈ 121 frames).
+///
+/// 120 matches Cascade's empirical calibration from the S511 breaker trip.
+const RETENTION_FRAMES: u64 = 120;
+
 /// Bytes per pixel for RGBA8/BGRA8 surface formats.
 const BYTES_PER_PIXEL: u64 = 4;
 
@@ -98,6 +110,19 @@ pub struct TextureCacheDebugFrame {
     /// Same pattern as `composite_ms`. Always 0 when texture-cache-debug
     /// feature is off.
     pub v1_violations: u32,
+    /// Workaround D: snapshot of `retired` tier size this frame. Surfaced so
+    /// CS's F9 Cache tab can display retention pressure (expect a steady
+    /// population of ~dozens of entries under scroll, draining continuously
+    /// as `begin_frame` promotes expired entries to the free list).
+    /// Zero before the first invalidation; grows and steadies once caching
+    /// is active. Always populated — not feature-gated — so cs-debug can
+    /// verify D is working in release builds too.
+    pub retired_count: u32,
+    /// Workaround D: GPU memory held in the retention tier (MB). Part of
+    /// `memory_mb` above. Exceeds ~10 MB only under heavy invalidation
+    /// (e.g. full DPI flush). Over budget pressure, `retention_budget_drop`
+    /// events signal the pool draining retired entries early.
+    pub retired_mb: f32,
 }
 
 /// Per-item cache state within a frame.
@@ -144,6 +169,11 @@ pub struct TextureCacheDebugPool {
     pub bin_buffer: u32,
     pub bin_recent: u32,
     pub bin_distant: u32,
+    /// Workaround D: entries currently held in the retention tier
+    /// (invalidated but awaiting `RETENTION_FRAMES` grace period).
+    /// `retired_mb` is included in `memory_mb` above.
+    pub retired_count: u32,
+    pub retired_mb: f32,
 }
 
 /// Per-size-class pool statistics.
@@ -410,6 +440,36 @@ struct FreeTexture {
     memory_bytes: u64,
 }
 
+/// Workaround D — an invalidated texture held in the retention tier.
+///
+/// Entries enter `retired` from any of the four V1-relevant destroy sites
+/// (public `invalidate`, `evict_offscreen`, `insert` replace-branch, inline
+/// `stale_hit_cleanup` in `process_cache_regions`). They stay here for at
+/// least `RETENTION_FRAMES` before `begin_frame` promotes them to the free
+/// list, guaranteeing any in-flight GPU work bound to `view` has completed.
+///
+/// Under budget pressure, `force_drop_oldest_retired` will drop the
+/// longest-retained entry early; "oldest first" minimizes V1 risk because
+/// newer retirees are more likely still referenced by recent command buffers.
+struct RetiredEntry {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    width: u32,
+    height: u32,
+    memory_bytes: u64,
+    size_class: SizeClass,
+    /// `TexturePool::current_frame` at the moment of invalidation. Retention
+    /// expiry: `current_frame - invalidated_at_frame >= RETENTION_FRAMES`.
+    invalidated_at_frame: u64,
+    /// Identity preserved from the active entry, surfaced in trace events
+    /// so rex's Gate B can correlate retention_period_drop / retention_budget_drop
+    /// back to the originating region. Read only from the feature-gated trace
+    /// `log::info!` macros — keep the field unconditionally so release and
+    /// debug layouts match.
+    #[allow(dead_code)]
+    region_id: u64,
+}
+
 fn texture_memory_bytes(width: u32, height: u32) -> u64 {
     width as u64 * height as u64 * BYTES_PER_PIXEL
 }
@@ -426,6 +486,14 @@ pub(crate) struct TexturePool {
     active: HashMap<u64, CacheEntry>,
     /// Free textures bucketed by size class, available for reuse.
     free_list: HashMap<SizeClass, Vec<FreeTexture>>,
+    /// Workaround D — invalidated textures held for `RETENTION_FRAMES` before
+    /// promotion to `free_list`. See `RetiredEntry`. Vec not HashMap because
+    /// a region_id can be invalidated repeatedly within the retention window
+    /// (e.g. `insert` replacing an entry that is then replaced again before
+    /// 120 frames elapse); each invalidation generates a distinct retired
+    /// backing that must age independently. Scanned linearly by `begin_frame`
+    /// — pool sizes in practice stay in the low tens, so O(n) is fine.
+    retired: Vec<RetiredEntry>,
     /// Current frame counter (incremented each frame).
     current_frame: u64,
     /// Total GPU memory across active + free textures (bytes).
@@ -474,15 +542,114 @@ pub(crate) struct TexturePool {
 pub(crate) struct TextureCacheMemoryStats {
     pub active_count: u32,
     pub free_count: u32,
+    /// Workaround D: entries in the retention tier (invalidated, awaiting
+    /// `RETENTION_FRAMES` grace period). Memory is included in
+    /// `total_memory_bytes`.
+    pub retired_count: u32,
     pub total_memory_bytes: u64,
     pub budget_bytes: u64,
     pub eviction_count: u32,
 }
 
 impl TexturePool {
-    /// Mark the start of a new frame. Advances the frame counter for LRU tracking.
+    /// Mark the start of a new frame. Advances the frame counter for LRU tracking,
+    /// then promotes retention-expired entries from `retired` to `free_list`.
+    ///
+    /// Workaround D: after `RETENTION_FRAMES` have elapsed since invalidation,
+    /// any in-flight command buffer that referenced the retired view is
+    /// guaranteed to have completed, so the backing is safe to expose to
+    /// `try_reuse` (reuse is V1-safe — same backing, new content) and
+    /// `destroy_any_free` (drop is V1-safe — no in-flight references remain).
+    /// Emits `event=retention_period_drop` per promoted entry for rex's
+    /// trace-replay verification.
     fn begin_frame(&mut self) {
         self.current_frame += 1;
+
+        let current_frame = self.current_frame;
+        let mut i = 0;
+        while i < self.retired.len() {
+            let held = current_frame.saturating_sub(self.retired[i].invalidated_at_frame);
+            if held >= RETENTION_FRAMES {
+                let entry = self.retired.swap_remove(i);
+                #[cfg(feature = "texture-cache-debug")]
+                log::info!(
+                    "event=retention_period_drop ix={} destination=free_list size={}x{} frames_held={}",
+                    entry.region_id, entry.width, entry.height, held,
+                );
+                let sc = entry.size_class;
+                self.free_list.entry(sc).or_default().push(FreeTexture {
+                    texture: entry.texture,
+                    view: entry.view,
+                    width: entry.width,
+                    height: entry.height,
+                    memory_bytes: entry.memory_bytes,
+                });
+                // total_memory_bytes unchanged — texture moved, not destroyed.
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Workaround D: under budget pressure, force-drop the oldest retained
+    /// entry (lowest `invalidated_at_frame`) regardless of age. Returns bytes
+    /// freed, or 0 if `retired` is empty.
+    ///
+    /// Oldest-first minimizes V1 risk: the longer an entry has been retired,
+    /// the less likely any in-flight command buffer still references its view.
+    /// Still V1-UNSAFE in theory (retention promise broken for this entry) —
+    /// the alternative under true budget exhaustion is dropping a Visible
+    /// active entry, which is always worse. Rex's Gate B tests this path.
+    fn force_drop_oldest_retired(&mut self) -> u64 {
+        let oldest_idx = self
+            .retired
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, e)| e.invalidated_at_frame)
+            .map(|(i, _)| i);
+        if let Some(idx) = oldest_idx {
+            let entry = self.retired.swap_remove(idx);
+            let memory_bytes = entry.memory_bytes;
+            self.total_memory_bytes -= memory_bytes;
+            #[cfg(feature = "texture-cache-debug")]
+            {
+                let held = self.current_frame.saturating_sub(entry.invalidated_at_frame);
+                let frames_remaining = RETENTION_FRAMES.saturating_sub(held);
+                log::info!(
+                    "event=retention_budget_drop ix={} size={}x{} frames_held={} frames_remaining={} bytes={}",
+                    entry.region_id, entry.width, entry.height, held, frames_remaining, memory_bytes,
+                );
+            }
+            drop(entry.texture);
+            memory_bytes
+        } else {
+            0
+        }
+    }
+
+    /// Workaround D internal: retire an active entry by value. Sets
+    /// `invalidated_at_frame = current_frame` and appends to `retired`.
+    /// `total_memory_bytes` is unchanged — the backing stays counted until
+    /// destruction (via `force_drop_oldest_retired`) or promotion+drop
+    /// (via `begin_frame` → `destroy_any_free`).
+    fn retire_entry(&mut self, region_id: u64, entry: CacheEntry, reason: &'static str) {
+        #[cfg(feature = "texture-cache-debug")]
+        log::info!(
+            "event=texture_invalidate ix={} destination=retired reason={} size={}x{}",
+            region_id, reason, entry.width, entry.height,
+        );
+        #[cfg(not(feature = "texture-cache-debug"))]
+        let _ = reason; // avoid unused warn when feature off
+        self.retired.push(RetiredEntry {
+            texture: entry.texture,
+            view: entry.view,
+            width: entry.width,
+            height: entry.height,
+            memory_bytes: entry.memory_bytes,
+            size_class: entry.size_class,
+            invalidated_at_frame: self.current_frame,
+            region_id,
+        });
     }
 
     /// IP-2 V1: return every `region_id` that entered this frame's
@@ -584,26 +751,21 @@ impl TexturePool {
         Some(bucket.swap_remove(idx))
     }
 
-    /// Move an active entry to the free list (eviction without GPU deallocation).
-    fn release_to_free_list(&mut self, region_id: u64) {
+    /// Workaround D: move an active entry to the `retired` tier. The backing
+    /// stays alive (no GPU deallocation) for at least `RETENTION_FRAMES` before
+    /// `begin_frame` promotes it to `free_list`. Replaces the pre-D
+    /// active→free_list direct transition so in-flight command buffers can
+    /// never reference a destroyed backing (V1 / `backing_destroyed`).
+    ///
+    /// `reason` is surfaced in the trace event for rex's Gate B correlation.
+    /// Known callers: public `invalidate` (scroll-driven), `evict_offscreen`
+    /// (visibility-driven), `insert` replace-branch (re-capture same region
+    /// at different size), `process_cache_regions` stale_hit_cleanup
+    /// (Gap-NEW-1 site 4, the RW1 smoking gun), and `invalidate_texture_cache`
+    /// full flush (DPI / theme / resize).
+    fn release_to_retired(&mut self, region_id: u64, reason: &'static str) {
         if let Some(entry) = self.active.remove(&region_id) {
-            // Gap-NEW-1 site 5: active→free_list transition. Paired with any
-            // future texture_destroy that drains the free list (site 1).
-            #[cfg(feature = "texture-cache-debug")]
-            log::info!(
-                "event=texture_invalidate ix={} destination=free_list size={}x{}",
-                region_id, entry.width, entry.height
-            );
-            let sc = entry.size_class;
-            let free = FreeTexture {
-                texture: entry.texture,
-                view: entry.view,
-                width: entry.width,
-                height: entry.height,
-                memory_bytes: entry.memory_bytes,
-            };
-            self.free_list.entry(sc).or_default().push(free);
-            // total_memory_bytes unchanged — texture moved, not destroyed
+            self.retire_entry(region_id, entry, reason);
         }
     }
 
@@ -675,17 +837,32 @@ impl TexturePool {
     }
 
     /// Ensure memory budget allows `needed_bytes` of new allocation.
-    /// Two-phase eviction: (1) destroy free-list textures, (2) evict by priority bin
-    /// (Distant first, then Recent, then Buffer — VISIBLE items are never evicted).
+    /// Three-phase eviction (Workaround D added Phase 1b):
+    ///   (1a) destroy free-list textures — cheapest, V1-safe (post-retention).
+    ///   (1b) force-drop oldest retired textures — breaks retention promise for
+    ///        one entry, but oldest is least likely to still be in-flight.
+    ///   (2)  evict active by priority bin — Distant first, then Recent, then
+    ///        Buffer. VISIBLE items are never evicted. V1-UNSAFE and still
+    ///        direct-drop (per S511 scope decision — rex tests this path).
     /// Returns true if budget allows the allocation, false if only VISIBLE items remain.
     fn ensure_budget(&mut self, needed_bytes: u64, viewport_center_index: usize) -> bool {
         if self.total_memory_bytes + needed_bytes <= self.budget_bytes {
             return true;
         }
 
-        // Phase 1: destroy free-list textures (cheapest — no re-render needed)
+        // Phase 1a: destroy free-list textures (cheapest — no re-render needed, V1-safe)
         while self.total_memory_bytes + needed_bytes > self.budget_bytes {
             if self.destroy_any_free() == 0 {
+                break;
+            }
+        }
+
+        // Phase 1b (Workaround D): force-drop oldest retained entries under
+        // budget pressure. Oldest-first minimizes V1 risk — the longer an
+        // entry has been retired, the less likely any in-flight command buffer
+        // still references its view. Emits retention_budget_drop per drop.
+        while self.total_memory_bytes + needed_bytes > self.budget_bytes {
+            if self.force_drop_oldest_retired() == 0 {
                 break;
             }
         }
@@ -743,18 +920,14 @@ impl TexturePool {
         let memory_bytes = texture_memory_bytes(width, height);
         let size_class = SizeClass::from_height(height);
 
-        // If replacing an existing entry, account for memory
+        // Workaround D: if replacing an existing entry, route the old backing
+        // through the retention tier instead of dropping synchronously. Was
+        // Gap-NEW-1 site 3 / RW3 smoking gun — the synchronous `drop(old.texture)`
+        // while a bind group still referenced `old.view` was the canonical
+        // replace-path V1 vector. Memory accounting stays untouched for the
+        // old backing (counted in `retired`); only the new memory is added.
         if let Some(old) = self.active.remove(&region_id) {
-            self.total_memory_bytes -= old.memory_bytes;
-            // Gap-NEW-1 site 3: silent replace-path drop. RW3 smoking gun —
-            // if a bind group still references `old.view`, submit validates
-            // against a dropped texture after this line.
-            #[cfg(feature = "texture-cache-debug")]
-            log::info!(
-                "event=texture_destroy ix={} reason=replace_active old_size={}x{} old_bytes={}",
-                region_id, old.width, old.height, old.memory_bytes
-            );
-            drop(old.texture);
+            self.retire_entry(region_id, old, "replace_active");
         }
 
         self.total_memory_bytes += memory_bytes;
@@ -811,15 +984,19 @@ impl TexturePool {
 
     // ── Public API (for flux, axle, obedi) ───────────────────────────────────
 
-    /// Invalidate a specific cached region. Moves the texture to the free list
-    /// for potential reuse (does not destroy GPU resources).
+    /// Invalidate a specific cached region. Routes the texture through the
+    /// retention tier (Workaround D): held for `RETENTION_FRAMES` before
+    /// promotion to the free list, so in-flight command buffers cannot
+    /// reference a destroyed backing (V1 race). GPU resources are not
+    /// destroyed by this call.
     #[allow(dead_code)] // Public API for Stream 2 (flux) and Stream 4 (axle)
     pub fn invalidate(&mut self, region_id: u64) {
-        self.release_to_free_list(region_id);
+        self.release_to_retired(region_id, "invalidate");
     }
 
     /// Evict all textures for items not in the visible set.
-    /// Moves evicted textures to the free list. Returns the number evicted.
+    /// Moves evicted textures through the retention tier (Workaround D) for
+    /// eventual return to the free list. Returns the number evicted.
     ///
     /// Callers should include BOTH viewport AND overdraw item IDs in `visible_ids`.
     /// Overdraw items (those just outside the viewport, tracked by `ItemLayout.is_overdraw`
@@ -835,7 +1012,7 @@ impl TexturePool {
             .collect();
         let count = to_evict.len() as u32;
         for id in to_evict {
-            self.release_to_free_list(id);
+            self.release_to_retired(id, "evict_offscreen");
         }
         count
     }
@@ -851,6 +1028,7 @@ impl TexturePool {
         TextureCacheMemoryStats {
             active_count: self.active.len() as u32,
             free_count,
+            retired_count: self.retired.len() as u32,
             total_memory_bytes: self.total_memory_bytes,
             budget_bytes: self.budget_bytes,
             eviction_count: self.eviction_count,
@@ -920,6 +1098,9 @@ impl TexturePool {
             }
         }
 
+        let retired_count = self.retired.len() as u32;
+        let retired_bytes: u64 = self.retired.iter().map(|e| e.memory_bytes).sum();
+
         TextureCacheDebugPool {
             allocated: active_count,
             free: free_count,
@@ -932,6 +1113,8 @@ impl TexturePool {
             bin_buffer: bin_buf,
             bin_recent: bin_rec,
             bin_distant: bin_dist,
+            retired_count,
+            retired_mb: retired_bytes as f32 / (1024.0 * 1024.0),
         }
     }
 }
@@ -1005,6 +1188,7 @@ impl WgpuRenderer {
         self.texture_pool = Some(TexturePool {
             active: HashMap::new(),
             free_list: HashMap::new(),
+            retired: Vec::new(),
             current_frame: 0,
             total_memory_bytes: 0,
             budget_bytes: DEFAULT_BUDGET_BYTES,
@@ -1369,18 +1553,16 @@ impl WgpuRenderer {
                     });
                 }
                 // Ensure this region is NOT in active pool — on next frame,
-                // has_cached_region() returns false → list.rs paints fresh
+                // has_cached_region() returns false → list.rs paints fresh.
+                // Workaround D: route through retention (was Gap-NEW-1 site 4 /
+                // RW1 smoking gun — the mid-loop `active.remove` dropped texture
+                // + view via `CacheEntry` Drop while the encoder was still mid-
+                // flight with bind groups that pointed at `view`). The retire
+                // helper emits `texture_invalidate destination=retired
+                // reason=stale_hit_cleanup`; begin_frame will promote to
+                // free_list after RETENTION_FRAMES.
                 let pool = self.texture_pool.as_mut().unwrap();
-                // Gap-NEW-1 site 4: RW1 smoking gun. The mid-loop remove that
-                // sage's code-path analysis named as the race — drops texture
-                // + view via CacheEntry Drop while the encoder may still hold
-                // an Arc to the view.
-                #[cfg(feature = "texture-cache-debug")]
-                log::info!(
-                    "event=texture_destroy ix={} reason=stale_hit_cleanup size={}x{}",
-                    region.id.0, tex_width, tex_height
-                );
-                pool.active.remove(&region.id.0);
+                pool.release_to_retired(region.id.0, "stale_hit_cleanup");
                 pool.guarded_ids.insert(region.id.0);
                 // Also clear the thread-local feedback so list.rs sees MISS immediately
                 clear_cached_region(CacheRegionId(region.id.0));
@@ -1655,6 +1837,8 @@ impl WgpuRenderer {
             let v1_violations: u32 = 0;
             let pool = self.texture_pool.as_ref().unwrap();
             let pool_stats = pool.debug_pool_stats();
+            let retired_count = pool_stats.retired_count;
+            let retired_mb = pool_stats.retired_mb;
 
             emit_texture_cache_debug(TextureCacheDebugFrame {
                 fresh_count,
@@ -1666,6 +1850,8 @@ impl WgpuRenderer {
                 items: debug_items,
                 pool: pool_stats,
                 events: debug_events,
+                retired_count,
+                retired_mb,
                 x4_violations,
                 v1_violations,
             });
@@ -2153,26 +2339,43 @@ impl WgpuRenderer {
         }
     }
 
-    /// Invalidate all cached textures and free-list textures.
-    /// Called on DPI change, window resize, or theme change.
+    /// Invalidate all cached textures. Called on DPI change, window resize,
+    /// or theme change (RW5 territory).
+    ///
+    /// Workaround D: route every active entry through the retention tier
+    /// (V1-safe — in-flight submits survive the 120-frame grace period).
+    /// Free-list entries are dropped immediately because they are already
+    /// post-retention (V1-safe by construction). Pre-existing retired entries
+    /// continue aging on their original schedule rather than resetting.
+    ///
+    /// Memory accounting: active bytes migrate to retained and stay in
+    /// `total_memory_bytes`; free-list bytes are reclaimed now.
     pub(crate) fn invalidate_texture_cache(&mut self) {
         if let Some(pool) = &mut self.texture_pool {
-            // Gap-NEW-1 Gate-B follow-up: mass-drop emit (sage's missed site).
-            // Fires on DPI change, window resize, theme change (RW5 territory).
-            // Paired with V1 so every destroy-class event that could invalidate
-            // a pending bind group is visible in the crash dump.
             #[cfg(feature = "texture-cache-debug")]
             {
                 let active_count = pool.active.len();
                 let free_count: usize = pool.free_list.values().map(|v| v.len()).sum();
+                let retired_count = pool.retired.len();
                 log::info!(
-                    "event=texture_destroy ix=all reason=pool_purge active_count={} free_count={} bytes={}",
-                    active_count, free_count, pool.total_memory_bytes
+                    "event=texture_destroy ix=all reason=pool_purge active_count={} free_count={} retired_count={} bytes={}",
+                    active_count, free_count, retired_count, pool.total_memory_bytes,
                 );
             }
-            pool.active.clear();
+            // Active → retired (V1-safe; begin_frame will promote to free_list in 120 frames).
+            let region_ids: Vec<u64> = pool.active.keys().copied().collect();
+            for region_id in region_ids {
+                pool.release_to_retired(region_id, "pool_purge");
+            }
+            // Free-list → dropped (already post-retention).
+            let free_bytes: u64 = pool
+                .free_list
+                .values()
+                .flat_map(|v| v.iter())
+                .map(|t| t.memory_bytes)
+                .sum();
             pool.free_list.clear();
-            pool.total_memory_bytes = 0;
+            pool.total_memory_bytes = pool.total_memory_bytes.saturating_sub(free_bytes);
         }
     }
 
