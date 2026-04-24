@@ -15,6 +15,11 @@ path = "src/gpui_windows.rs"
 default = ["gpui/default"]
 test-support = ["gpui/test-support"]
 screen-capture = ["gpui/screen-capture", "scap"]
+# CS S512: diagnostic trace events (windows_frame_callback). Propagated from
+# gpui_platform -> gpui_windows alongside the existing gpui_linux feature so the
+# CS-side circuit breaker can read `since_last_frame_callback_ms()` regardless
+# of platform.
+texture-cache-debug = []
 
 [dependencies]
 gpui.workspace = true

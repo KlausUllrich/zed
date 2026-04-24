@@ -24,7 +24,16 @@ x11 = ["gpui_linux/x11"]
 # Safe on macOS/Windows: gpui_linux is a Linux/freebsd-only target dep above, and
 # Cargo ignores the feature activation on platforms where the dep is absent — same
 # pattern as `screen-capture` above (which references gpui_linux/screen-capture).
-texture-cache-debug = ["gpui_linux/texture-cache-debug"]
+# CS S512: extended to gpui_macos/gpui_windows so the circuit breaker's
+# main-thread stall probe has a frame-callback signal on every platform, not
+# only Wayland. `since_last_frame_callback_ms()` is the single signal the probe
+# reads; each platform's frame-arrival entrypoint updates it (Wayland
+# wl_callback::Done, macOS display-link step, Windows draw_window).
+texture-cache-debug = [
+    "gpui_linux/texture-cache-debug",
+    "gpui_macos/texture-cache-debug",
+    "gpui_windows/texture-cache-debug",
+]
 
 [dependencies]
 gpui.workspace = true

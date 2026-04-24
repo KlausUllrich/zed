@@ -1141,6 +1141,22 @@ impl WindowsWindowInner {
 
     #[inline]
     fn draw_window(&self, handle: HWND, force_render: bool) -> Option<isize> {
+        // CS S512: record main-thread frame-callback arrival so the CS-side
+        // circuit breaker's stall probe (`since_last_frame_callback_ms`) reflects
+        // actual main-thread cadence on Windows. Mirrors the Wayland hook at
+        // `gpui_linux/.../wayland/client.rs` wl_callback::Done dispatch. The
+        // VSyncProvider thread wakes on DwmFlush and posts RDW_INVALIDATE; the
+        // message pump delivers WM_PAINT here on the main thread.
+        #[cfg(feature = "texture-cache-debug")]
+        {
+            let since_last_ms =
+                gpui::record_frame_callback_arrival().unwrap_or(gpui::NO_PRIOR_SAMPLE);
+            log::info!(
+                "event=windows_frame_callback since_last_ms={:.1}",
+                since_last_ms
+            );
+        }
+
         let mut request_frame = self.state.callbacks.request_frame.take()?;
 
         if force_render {

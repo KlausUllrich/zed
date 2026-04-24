@@ -17,6 +17,11 @@ test-support = ["gpui/test-support"]
 runtime_shaders = []
 font-kit = ["dep:font-kit"]
 screen-capture = ["gpui/screen-capture"]
+# CS S512: diagnostic trace events (mac_frame_callback). Propagated from
+# gpui_platform -> gpui_macos alongside the existing gpui_linux feature so the
+# CS-side circuit breaker can read `since_last_frame_callback_ms()` regardless
+# of platform.
+texture-cache-debug = []
 
 [dependencies]
 gpui.workspace = true
