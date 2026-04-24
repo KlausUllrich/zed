@@ -464,11 +464,15 @@ struct RetiredEntry {
     /// `TexturePool::current_frame` at the moment of invalidation. Retention
     /// expiry: `current_frame - invalidated_at_frame >= RETENTION_FRAMES`.
     invalidated_at_frame: u64,
-    /// Identity preserved from the active entry, surfaced in trace events
-    /// so rex's Gate B can correlate retention_period_drop / retention_budget_drop
-    /// back to the originating region. Read only from the feature-gated trace
-    /// `log::info!` macros — keep the field unconditionally so release and
-    /// debug layouts match.
+    /// Identity preserved from the active entry. Used under
+    /// `texture-cache-debug` by the retention-drop trace events (so rex's
+    /// Gate B can correlate `retention_period_drop` /
+    /// `retention_budget_drop` back to the originating region) and by
+    /// `check_pre_submit_liveness` (to treat retired entries as alive for
+    /// V1 — S512 fork follow-up to D). `#[allow(dead_code)]` stays because
+    /// both readers are feature-gated; without `texture-cache-debug` the
+    /// field is unread but kept unconditionally so release and debug
+    /// struct layouts match.
     #[allow(dead_code)]
     region_id: u64,
 }
@@ -662,21 +666,32 @@ impl TexturePool {
     }
 
     /// IP-2 V1: return every `region_id` that entered this frame's
-    /// `process_cache_regions` but is no longer in `active`. A non-empty
-    /// vector means a cache entry was destroyed after the encoder already
-    /// bound its view — exactly the RW1 / RW3 race. Caller emits an
-    /// `INVARIANT_VIOLATION rule=V1` event per id and skips `queue.submit`.
+    /// `process_cache_regions` but is no longer alive in any tier of
+    /// `TexturePool` (neither `active` nor `retired`). A non-empty vector
+    /// means a cache entry's backing was destroyed after the encoder
+    /// already bound its view — exactly the RW1 / RW3 race. Caller emits
+    /// an `INVARIANT_VIOLATION rule=V1` event per id and skips
+    /// `queue.submit`.
     ///
-    /// The one *intentional* removal this frame is the `empty_recapture`
-    /// guard at `texture_cache.rs:1231`. That ALSO emits an
-    /// `event=texture_destroy reason=stale_hit_cleanup` (Gap-NEW-1 site 4)
-    /// paired with the V1 violation — the two together confirm the race.
+    /// **Retention-tier inclusion (S512 follow-up to Workaround D)**: an
+    /// entry whose backing was moved from `active` to `retired` is still
+    /// holding a live `wgpu::Texture` — that is the definition of
+    /// retention. Any `TextureView` the encoder's bind groups point at
+    /// stays valid for `RETENTION_FRAMES`. Treating a retired entry as
+    /// "destroyed" would false-fire V1 on every `stale_hit_cleanup` and
+    /// other retention route (S511 post-D trace analysis, hawk S512).
+    /// Real backing destruction still fires correctly: a genuinely-freed
+    /// id is in neither `active` nor `retired`. The `retired` scan is
+    /// O(n) over a Vec that stays in the low tens in practice.
     #[cfg(feature = "texture-cache-debug")]
     pub(crate) fn check_pre_submit_liveness(&self) -> Vec<u64> {
         self.frame_regions_processed
             .iter()
             .copied()
-            .filter(|id| !self.active.contains_key(id))
+            .filter(|id| {
+                !self.active.contains_key(id)
+                    && !self.retired.iter().any(|e| e.region_id == *id)
+            })
             .collect()
     }
 
