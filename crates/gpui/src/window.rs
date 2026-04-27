@@ -73,6 +73,7 @@ mod s503_trace {
     thread_local! {
         static LAST_FRAME_CALLBACK_AT: Cell<Option<Instant>> = const { Cell::new(None) };
         static LAST_FRAME_PRESENT_END_AT: Cell<Option<Instant>> = const { Cell::new(None) };
+        static LAST_SURFACE_COMMIT_AT: Cell<Option<Instant>> = const { Cell::new(None) };
         static REQUEST_FRAME_SEQ: Cell<u64> = const { Cell::new(0) };
         static LAST_COMMITTED_FRAME_SEQ: Cell<u64> = const { Cell::new(0) };
     }
@@ -143,6 +144,25 @@ mod s503_trace {
     /// paint_frame of the most recent surface commit.
     pub fn last_committed_frame_seq() -> u64 {
         LAST_COMMITTED_FRAME_SEQ.with(|c| c.get())
+    }
+
+    /// CS S514 P0: stamp the wall-clock instant of the most recent
+    /// `surface.commit()` so the next `request_frame_entry` can report
+    /// `since_commit_ms` — the wait between us handing a frame to the
+    /// compositor and the compositor waking us for the next frame.
+    /// Disambiguates compositor-pacing (large value) from GPUI scheduler
+    /// latency (callback-fast, draw-slow). Called from the wayland
+    /// `completed_frame()` impl immediately after `surface.commit()`.
+    pub fn record_surface_commit_at() {
+        LAST_SURFACE_COMMIT_AT.with(|c| c.set(Some(Instant::now())));
+    }
+
+    /// Milliseconds since the most recent `surface.commit()`. Read by the
+    /// `on_request_frame` closure to emit `since_commit_ms` on
+    /// `request_frame_entry`. None only on the first wake of the process
+    /// (before any commit has occurred).
+    pub fn since_last_surface_commit_ms() -> Option<f32> {
+        LAST_SURFACE_COMMIT_AT.with(|c| c.get().map(|t| t.elapsed().as_secs_f32() * 1000.0))
     }
 }
 
@@ -1337,11 +1357,19 @@ impl Window {
                 #[cfg(feature = "texture-cache-debug")]
                 let since_callback_ms =
                     since_last_frame_callback_ms().unwrap_or(NO_PRIOR_SAMPLE);
+                // CS S514 P0: gap from this wake's preceding `surface.commit()`
+                // to closure entry — the dominant unaccounted ~7 ms median in
+                // S513 smoke. Large value → compositor-side pacing (we wait on
+                // wl_callback). Small value → GPUI scheduler latency between
+                // callback and draw_start (the next bracket downstream).
+                #[cfg(feature = "texture-cache-debug")]
+                let since_commit_ms =
+                    since_last_surface_commit_ms().unwrap_or(NO_PRIOR_SAMPLE);
                 #[cfg(feature = "texture-cache-debug")]
                 log::info!(
                     "event=request_frame_entry paint_frame={} dirty={} force_render={} \
                      needs_present_flag={} next_frame_cbs={} \
-                     input_high_rate={} since_callback_ms={:.1}",
+                     input_high_rate={} since_callback_ms={:.1} since_commit_ms={:.1}",
                     paint_frame,
                     invalidator.is_dirty(),
                     request_frame_options.force_render,
@@ -1349,6 +1377,7 @@ impl Window {
                     next_frame_callbacks.borrow().len(),
                     input_rate_tracker.borrow().is_high_rate(),
                     since_callback_ms,
+                    since_commit_ms,
                 );
 
                 let thermal_state = handle

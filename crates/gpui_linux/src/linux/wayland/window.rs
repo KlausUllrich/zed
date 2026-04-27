@@ -1446,10 +1446,15 @@ impl PlatformWindow for WaylandWindow {
         // `paint_frame` is the current in-flight wake seq; stamping it into the
         // shared thread_local lets the async presentation-feedback handler tie
         // `Presented` events back to the commit that produced the buffer.
+        // CS S514 P0: also stamp the wall-clock instant of this commit so the
+        // next `request_frame_entry` can report `since_commit_ms` —
+        // disambiguates compositor pacing (large gap) from GPUI scheduler
+        // latency (gap small, but draw_start lags).
         #[cfg(feature = "texture-cache-debug")]
         {
             let paint_frame = gpui::current_request_frame_seq();
             gpui::record_surface_commit_seq(paint_frame);
+            gpui::record_surface_commit_at();
             log::info!(
                 "event=wayland_surface_commit paint_frame={} has_feedback_object={}",
                 paint_frame, has_feedback_object

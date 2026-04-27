@@ -1148,7 +1148,37 @@ impl WgpuRenderer {
 
         self.atlas.before_frame();
 
-        let frame = match self.resources().surface.get_current_texture() {
+        // CS S514 P0: bracket `surface.get_current_texture()` — under
+        // `PresentMode::Mailbox` with `desired_maximum_frame_latency: 2`, this
+        // call can still block on the GPU fence if the previous frame's
+        // commands haven't drained. S513 smoke measured a 1 ms median (p99
+        // = 3 ms) gap between gpui's `window_present_start` (in window.rs)
+        // and the `wgpu_submit_start` emit further down — almost all of that
+        // gap lives inside this acquire. Bracket confirms (or falsifies)
+        // swapchain backpressure as a tail-event source. `paint_frame` is
+        // captured once via `current_request_frame_seq()` (a thread_local
+        // read that doesn't advance the seq) so both emits describe the same
+        // wake, mirroring Move 3's `wgpu_submit_*` idiom.
+        #[cfg(feature = "texture-cache-debug")]
+        let paint_frame = gpui::current_request_frame_seq();
+        #[cfg(feature = "texture-cache-debug")]
+        let swapchain_acquire_started_at = std::time::Instant::now();
+        #[cfg(feature = "texture-cache-debug")]
+        log::info!(
+            "event=swapchain_acquire_start paint_frame={}",
+            paint_frame
+        );
+        let surface_texture = self.resources().surface.get_current_texture();
+        #[cfg(feature = "texture-cache-debug")]
+        {
+            let duration_ms =
+                swapchain_acquire_started_at.elapsed().as_secs_f32() * 1000.0;
+            log::info!(
+                "event=swapchain_acquire_end paint_frame={} duration_ms={:.1}",
+                paint_frame, duration_ms
+            );
+        }
+        let frame = match surface_texture {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
                 // Textures must be destroyed before the surface can be reconfigured.
