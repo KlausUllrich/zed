@@ -646,10 +646,14 @@ impl TexturePool {
     /// destruction (via `force_drop_oldest_retired`) or promotion+drop
     /// (via `begin_frame` → `destroy_any_free`).
     fn retire_entry(&mut self, region_id: u64, entry: CacheEntry, reason: &'static str) {
+        // S513 enrichment: agent= and type= let cs-trace-card.sh group invalidations
+        // by owning conversation and card variant. region_id alone can't distinguish
+        // contamination across conversations (Klaus's hypothesis F).
         #[cfg(feature = "texture-cache-debug")]
         log::info!(
-            "event=texture_invalidate ix={} destination=retired reason={} size={}x{}",
-            region_id, reason, entry.width, entry.height,
+            "event=texture_invalidate ix={} agent={} type={} destination=retired reason={} size={}x{}",
+            region_id, gpui::active_agent_str(), gpui::card_type_for_region(region_id),
+            reason, entry.width, entry.height,
         );
         #[cfg(not(feature = "texture-cache-debug"))]
         let _ = reason; // avoid unused warn when feature off
@@ -1465,16 +1469,21 @@ impl WgpuRenderer {
                     // of fires as dimension mismatches when dims matched exactly
                     // and only has_content differed (flux S504 investigation).
                     if cached.width != tex_width || cached.height != tex_height {
+                        // S513 enrichment: agent + type let max correlate drifts to
+                        // owning conversation (cross-agent contamination, hypothesis F)
+                        // and card variant (which types drive grow vs shrink drifts).
                         log::debug!(
-                            "event=dimension_mismatch ix={} cached_w={} cached_h={} tex_w={} tex_h={} action=recapture",
-                            region_id, cached.width, cached.height, tex_width, tex_height
+                            "event=dimension_mismatch ix={} agent={} type={} cached_w={} cached_h={} tex_w={} tex_h={} action=recapture",
+                            region_id, gpui::active_agent_str(), gpui::card_type_for_region(region_id as u64),
+                            cached.width, cached.height, tex_width, tex_height
                         );
                         // S498 INV-X4: dimension mismatch triggers recapture loop.
                         #[cfg(feature = "texture-cache-debug")]
                         {
                             log::warn!(
-                                "event=INVARIANT_VIOLATION rule=X4 region={} cached_w={} cached_h={} actual_w={} actual_h={}",
-                                region_id, cached.width, cached.height, tex_width, tex_height
+                                "event=INVARIANT_VIOLATION rule=X4 region={} agent={} type={} cached_w={} cached_h={} actual_w={} actual_h={}",
+                                region_id, gpui::active_agent_str(), gpui::card_type_for_region(region_id as u64),
+                                cached.width, cached.height, tex_width, tex_height
                             );
                             x4_violations = x4_violations.saturating_add(1);
                         }
@@ -1545,9 +1554,13 @@ impl WgpuRenderer {
                 let poly = mini_scene.polychrome_sprites.len() as u32;
                 let shadows = mini_scene.shadows.len() as u32;
                 let underlines = mini_scene.underlines.len() as u32;
+                // S513 enrichment: agent + type identify which conversation owns
+                // this capture and what card variant it represents — primary lens
+                // for hypothesis-F (cross-conversation contamination) analysis.
                 log::info!(
-                    "event=capture_detail ix={} texture={}x{} total={} quads={} mono={} subpixel={} paths={} polychrome={} shadows={} underlines={} reused={}",
-                    region_id, tex_width, tex_height, total, q, m, s, p, poly, shadows, underlines, reused
+                    "event=capture_detail ix={} agent={} type={} texture={}x{} total={} quads={} mono={} subpixel={} paths={} polychrome={} shadows={} underlines={} reused={}",
+                    region_id, gpui::active_agent_str(), gpui::card_type_for_region(region_id as u64),
+                    tex_width, tex_height, total, q, m, s, p, poly, shadows, underlines, reused
                 );
                 log::info!(
                     "event=mini_scene ix={} region_y={:.1} region_h={:.1} quads={} shadows={} mono={} subpixel={} poly={} underlines={} paths={} total={}",

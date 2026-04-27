@@ -26,7 +26,7 @@ use crate::{
     scene::PaintOperation,
 };
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 
 /// Unique identifier for a cache region (typically a list item index).
@@ -290,6 +290,179 @@ pub fn set_debug_tint(enabled: bool) {
 /// Called by the renderer in `draw_cached_regions`.
 pub fn is_debug_tint_enabled() -> bool {
     DEBUG_TINT_ENABLED.with(|cell| cell.get())
+}
+
+// --- S513 trace enrichment: active conversation owner + per-region card type ---
+// Threaded from CS each render pass so cache events fired in the renderer can
+// stamp `agent=<id>` (e.g. agent=max) and `type=<card_type>` (e.g. type=ToolCall).
+// CS calls `set_active_agent(None)` on conversation switch so events fired
+// before the next render don't leak the prior owner. Stale reads return "unknown".
+
+thread_local! {
+    static ACTIVE_AGENT_ID: RefCell<Option<String>> = const { RefCell::new(None) };
+    static CARD_TYPES: RefCell<HashMap<u64, &'static str>> = RefCell::new(HashMap::new());
+}
+
+/// Set the agent ID owning the active conversation. `None` clears the slot
+/// (use this on conversation switch before the new render call site populates it).
+/// Call sites: `ConversationView::render()` in cs-ui (per-frame).
+pub fn set_active_agent(agent: Option<String>) {
+    ACTIVE_AGENT_ID.with(|cell| *cell.borrow_mut() = agent);
+}
+
+/// Snapshot the active agent ID, or "unknown" when unset. Allocates a String —
+/// callers fold this into a `format!` arg, not a hot inner loop.
+pub fn active_agent_str() -> String {
+    ACTIVE_AGENT_ID
+        .with(|cell| cell.borrow().clone())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Replace the per-region card-type map. Map keys are list region_ids
+/// (CS item index + LIST_SPACER_OFFSET). Values are stable string literals
+/// from `ConversationItem::card_type_name()` so they're zero-allocation.
+/// Call sites: `ConversationView::render()` in cs-ui (per-frame).
+pub fn set_card_types(types: HashMap<u64, &'static str>) {
+    CARD_TYPES.with(|cell| *cell.borrow_mut() = types);
+}
+
+/// Lookup the card type for a region_id, falling back to "unknown" if
+/// the map hasn't been populated this frame (e.g. classic Zed list, or
+/// CS render hasn't run yet). Cheap — single HashMap read.
+pub fn card_type_for_region(region_id: u64) -> &'static str {
+    CARD_TYPES.with(|cell| cell.borrow().get(&region_id).copied().unwrap_or("unknown"))
+}
+
+// --- S513 perf instrumentation: per-frame timing accumulator + paint_timing_breakdown ---
+// Each existing per-phase event (layout_phase_end, frame_cache_summary, etc.)
+// records its numbers via `frame_perf_record_*`. WgpuRenderer::draw consolidates
+// the accumulator into one `event=paint_timing_breakdown` per painted frame
+// after `frame.present()` returns. Klaus reads this single line to compare
+// caching ON vs OFF without correlating four separate events.
+//
+// FPS rolling window: 60 samples (~0.4 s at 144 Hz, 1.0 s at 60 Hz). Chosen for
+// responsiveness while smoothing single-frame jitter; documented in delivery-notes.
+
+#[derive(Default, Clone, Copy)]
+struct FramePerf {
+    paint_frame: u64,
+    layout_ms: f32,
+    capture_ms: f32,
+    composite_ms: f32,
+    hit_count: u32,
+    miss_count: u32,
+    plain_count: u32,
+    /// True once a layout or paint phase has populated the accumulator this frame.
+    /// Suppresses spurious zero events on idle frames (e.g. presentation_feedback
+    /// firing without a corresponding paint).
+    have_data: bool,
+}
+
+thread_local! {
+    static FRAME_PERF: Cell<FramePerf> = const {
+        Cell::new(FramePerf {
+            paint_frame: 0, layout_ms: 0.0, capture_ms: 0.0, composite_ms: 0.0,
+            hit_count: 0, miss_count: 0, plain_count: 0, have_data: false,
+        })
+    };
+    static FRAME_PRESENT_TIMES_MS: RefCell<VecDeque<u128>> =
+        RefCell::new(VecDeque::with_capacity(64));
+}
+
+/// Record layout-phase duration for the consolidated paint_timing_breakdown.
+/// Called from `List::layout_items()` after the existing `layout_phase_end`
+/// event so caching-OFF baselines (where layout is the dominant cost) are
+/// still measured even when no cache events fire.
+pub fn frame_perf_record_layout(paint_frame: u64, layout_ms: f32) {
+    FRAME_PERF.with(|cell| {
+        let mut perf = cell.get();
+        perf.paint_frame = paint_frame;
+        perf.layout_ms = layout_ms;
+        perf.have_data = true;
+        cell.set(perf);
+    });
+}
+
+/// Record per-frame HIT / MISS / PLAIN counts for the consolidated event.
+/// Called from `List::paint()` alongside the existing `frame_cache_summary`.
+/// With caching disabled, hit/miss are 0 and plain reflects every painted
+/// item — the "OFF baseline" comparison Klaus needs.
+pub fn frame_perf_record_counts(paint_frame: u64, hit: u32, miss: u32, plain: u32) {
+    FRAME_PERF.with(|cell| {
+        let mut perf = cell.get();
+        perf.paint_frame = paint_frame;
+        perf.hit_count = hit;
+        perf.miss_count = miss;
+        perf.plain_count = plain;
+        perf.have_data = true;
+        cell.set(perf);
+    });
+}
+
+/// Record `process_cache_regions` capture-pass duration.
+pub fn frame_perf_record_capture(capture_ms: f32) {
+    FRAME_PERF.with(|cell| {
+        let mut perf = cell.get();
+        perf.capture_ms = capture_ms;
+        cell.set(perf);
+    });
+}
+
+/// Record `draw_cached_regions` composite-pass duration.
+pub fn frame_perf_record_composite(composite_ms: f32) {
+    FRAME_PERF.with(|cell| {
+        let mut perf = cell.get();
+        perf.composite_ms = composite_ms;
+        cell.set(perf);
+    });
+}
+
+/// Stamp present-end timestamp into the rolling FPS window and emit the
+/// consolidated `event=paint_timing_breakdown` line. `present_ms` is the
+/// wall-clock `frame.present()` duration measured by the renderer.
+///
+/// Call site: `WgpuRenderer::draw()` immediately after `frame.present()` returns.
+/// No-op for frames with no recorded layout/paint data — avoids spurious
+/// zero events on idle / presentation-feedback-only frames.
+pub fn frame_perf_emit_with_present(present_ms: f32) {
+    let perf = FRAME_PERF.with(|cell| {
+        let snapshot = cell.get();
+        cell.set(FramePerf::default());
+        snapshot
+    });
+    if !perf.have_data {
+        return;
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let fps_rolling = FRAME_PRESENT_TIMES_MS.with(|cell| {
+        let mut queue = cell.borrow_mut();
+        if queue.len() >= 60 {
+            queue.pop_front();
+        }
+        queue.push_back(now_ms);
+        if queue.len() < 2 {
+            0.0
+        } else {
+            let span_ms =
+                queue.back().unwrap().saturating_sub(*queue.front().unwrap()) as f32;
+            if span_ms <= 0.0 {
+                0.0
+            } else {
+                (queue.len() as f32 - 1.0) * 1000.0 / span_ms
+            }
+        }
+    });
+    let agent = active_agent_str();
+    log::info!(
+        "event=paint_timing_breakdown paint_frame={} agent={} layout_ms={:.1} capture_ms={:.1} composite_ms={:.1} present_ms={:.1} hit_count={} miss_count={} plain_count={} fps_rolling={:.1}",
+        perf.paint_frame, agent,
+        perf.layout_ms, perf.capture_ms, perf.composite_ms, present_ms,
+        perf.hit_count, perf.miss_count, perf.plain_count,
+        fps_rolling
+    );
 }
 
 /// A completed cache region annotation in the scene.

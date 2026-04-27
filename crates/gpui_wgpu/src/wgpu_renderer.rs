@@ -1231,9 +1231,17 @@ impl WgpuRenderer {
             // Pre-pass: render dirty cache regions to offscreen textures
             #[cfg(feature = "texture-cache")]
             if !scene.cache_regions().is_empty() {
+                // S513 perf: bracket the capture pass so paint_timing_breakdown
+                // can attribute time to capture vs composite vs present.
+                #[cfg(feature = "texture-cache-debug")]
+                let capture_started_at = std::time::Instant::now();
                 if !self.process_cache_regions(&mut encoder, scene, &mut instance_offset) {
                     overflow = true;
                 }
+                #[cfg(feature = "texture-cache-debug")]
+                gpui::frame_perf_record_capture(
+                    capture_started_at.elapsed().as_secs_f32() * 1000.0,
+                );
             }
 
             {
@@ -1307,6 +1315,8 @@ impl WgpuRenderer {
                                         "event=cache_composite_end duration_ms={:.1} source=interleaved",
                                         duration_ms
                                     );
+                                    // S513 perf: feed the consolidated paint_timing_breakdown.
+                                    gpui::frame_perf_record_composite(duration_ms);
                                 }
                                 cache_composited = true;
                             }
@@ -1421,6 +1431,8 @@ impl WgpuRenderer {
                             "event=cache_composite_end duration_ms={:.1} source=fallback",
                             duration_ms
                         );
+                        // S513 perf: feed the consolidated paint_timing_breakdown.
+                        gpui::frame_perf_record_composite(duration_ms);
                     }
                 }
             }
@@ -1540,6 +1552,10 @@ impl WgpuRenderer {
                     "event=frame_present_end duration_ms={:.1} path=normal",
                     duration_ms
                 );
+                // S513 perf: emit the consolidated paint_timing_breakdown event,
+                // pulling the layout / capture / composite / hit-miss-plain
+                // numbers stashed by earlier phases. Reset accumulator after.
+                gpui::frame_perf_emit_with_present(duration_ms);
             }
             return;
         }

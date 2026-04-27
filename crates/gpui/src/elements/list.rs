@@ -2063,6 +2063,10 @@ impl StateInner {
                     elapsed_ms, perf_rendered_count, perf_cached_count, render_ms, gpui_ms
                 );
             }
+            // S513 perf: feed the consolidated paint_timing_breakdown unconditionally
+            // (the >1 ms gate above suppresses the verbose log line, but the accumulator
+            // still wants the real number — even sub-1ms layouts matter for FPS analysis).
+            crate::frame_perf_record_layout(self.paint_frame_count, elapsed_ms);
         }
 
         LayoutItemsResponse {
@@ -2836,6 +2840,11 @@ impl Element for List {
             "event=frame_cache_summary paint_frame={} caching={} hit={} miss={} streaming={} transient={} plain={}",
             frame_count, caching_enabled, diag_hit, diag_miss, diag_streaming, diag_transient, diag_plain
         );
+        // S513 perf: feed the consolidated paint_timing_breakdown emitted at frame end.
+        // When caching is OFF, hit/miss are 0 and plain reflects every painted item —
+        // exactly the OFF baseline Klaus needs for the ON vs OFF FPS comparison.
+        #[cfg(feature = "texture-cache")]
+        crate::frame_perf_record_counts(frame_count, diag_hit, diag_miss, diag_plain);
         // Update prev_item_heights and cached_item_state_keys for next frame.
         // Single borrow_mut for both write-backs.
         #[cfg(feature = "texture-cache")]
