@@ -345,14 +345,50 @@ impl WgpuRenderer {
         // FPS halving problem: with Fifo, any frame exceeding the VSync budget drops to
         // the next slot (e.g. 144→72→48 FPS). Mailbox lets us present the most recent
         // frame at each VSync without blocking. Fall back to Fifo if unsupported.
-        let present_mode = if surface_caps
+        let mailbox_supported = surface_caps
             .present_modes
-            .contains(&wgpu::PresentMode::Mailbox)
-        {
+            .contains(&wgpu::PresentMode::Mailbox);
+        let present_mode = if mailbox_supported {
             wgpu::PresentMode::Mailbox
         } else {
             wgpu::PresentMode::Fifo
         };
+
+        // S513 Move 2 (max): log which present mode was actually chosen. If Klaus
+        // sees the Fifo cliff signature in trace data (frame work ~16-17ms causing
+        // 41-45 FPS at 144Hz instead of ~58 FPS), this line tells us whether the
+        // compositor advertises Mailbox at all. The list of all supported modes
+        // is included so we can pick a workaround if Mailbox is missing
+        // (e.g., FifoRelaxed or Immediate may be alternatives on some compositors).
+        #[cfg(feature = "texture-cache-debug")]
+        {
+            let supported: Vec<&'static str> = surface_caps
+                .present_modes
+                .iter()
+                .map(|m| match m {
+                    wgpu::PresentMode::Fifo => "Fifo",
+                    wgpu::PresentMode::FifoRelaxed => "FifoRelaxed",
+                    wgpu::PresentMode::Immediate => "Immediate",
+                    wgpu::PresentMode::Mailbox => "Mailbox",
+                    wgpu::PresentMode::AutoVsync => "AutoVsync",
+                    wgpu::PresentMode::AutoNoVsync => "AutoNoVsync",
+                })
+                .collect();
+            let chosen = match present_mode {
+                wgpu::PresentMode::Fifo => "Fifo",
+                wgpu::PresentMode::FifoRelaxed => "FifoRelaxed",
+                wgpu::PresentMode::Immediate => "Immediate",
+                wgpu::PresentMode::Mailbox => "Mailbox",
+                wgpu::PresentMode::AutoVsync => "AutoVsync",
+                wgpu::PresentMode::AutoNoVsync => "AutoNoVsync",
+            };
+            log::info!(
+                "event=present_mode_chosen chosen={} mailbox_supported={} all_modes={:?}",
+                chosen,
+                mailbox_supported,
+                supported
+            );
+        }
 
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
