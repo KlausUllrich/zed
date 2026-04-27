@@ -2586,6 +2586,20 @@ impl Window {
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();
 
+        // S513 Move 3: bracket the major phases of `draw_roots` so trace
+        // analysis can decompose the ~11ms "silent gap" between view_render_end
+        // and layout_phase_start documented in S513 FPS bottleneck findings.
+        // Sub-phase events emitted on this Cache topic so Klaus's existing
+        // analysis pipeline (cs-trace-card.sh + arming F9 → Cache) picks them up.
+        // paint_frame uses current_request_frame_seq() — the in-flight wake's
+        // correlator, matching window_draw_start / wayland_surface_commit etc.
+        #[cfg(feature = "texture-cache-debug")]
+        let prepaint_started_at = std::time::Instant::now();
+        #[cfg(feature = "texture-cache-debug")]
+        let frame_seq = current_request_frame_seq();
+        #[cfg(feature = "texture-cache-debug")]
+        log::info!("event=prepaint_start paint_frame={}", frame_seq);
+
         let _inspector_width: Pixels = rems(30.0).to_pixels(self.rem_size());
         let root_size = {
             #[cfg(any(feature = "inspector", debug_assertions))]
@@ -2606,7 +2620,24 @@ impl Window {
 
         // Layout all root elements.
         let mut root_element = self.root.as_ref().unwrap().clone().into_any();
+        // S513 Move 3: `prepaint_as_root` triggers Taffy layout + element-tree
+        // construction + text shaping recursively — per S480 perf, this is
+        // ~30%+ of CPU and the dominant component of the 11ms silent gap.
+        // Named `taffy_layout_*` after the dominant subsystem (matches the
+        // S480 perf-record terminology) but captures Taffy + element walk + text.
+        #[cfg(feature = "texture-cache-debug")]
+        let taffy_started_at = std::time::Instant::now();
+        #[cfg(feature = "texture-cache-debug")]
+        log::info!("event=taffy_layout_start paint_frame={}", frame_seq);
         root_element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
+        #[cfg(feature = "texture-cache-debug")]
+        {
+            let duration_ms = taffy_started_at.elapsed().as_secs_f32() * 1000.0;
+            log::info!(
+                "event=taffy_layout_end paint_frame={} duration_ms={:.2}",
+                frame_seq, duration_ms
+            );
+        }
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         let inspector_element = self.prepaint_inspector(_inspector_width, cx);
@@ -2631,10 +2662,40 @@ impl Window {
             tooltip_element = self.prepaint_tooltip(cx);
         }
 
+        // S513 Move 3: bounds-tree query — per S480 perf, ~5% of CPU.
+        // Single duration emit (no _start needed; the call is a single line).
+        #[cfg(feature = "texture-cache-debug")]
+        let hit_test_started_at = std::time::Instant::now();
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
+        #[cfg(feature = "texture-cache-debug")]
+        {
+            let duration_ms = hit_test_started_at.elapsed().as_secs_f32() * 1000.0;
+            log::info!(
+                "event=hit_test_end paint_frame={} duration_ms={:.2}",
+                frame_seq, duration_ms
+            );
+        }
+
+        // S513 Move 3: close prepaint phase, open paint phase.
+        // prepaint_end's duration covers EVERYTHING from set_phase(Prepaint)
+        // through the hit_test — i.e., taffy_layout + prepaint_deferred_draws
+        // + prepaint_tooltip/drag/prompt + hit_test combined.
+        #[cfg(feature = "texture-cache-debug")]
+        {
+            let duration_ms = prepaint_started_at.elapsed().as_secs_f32() * 1000.0;
+            log::info!(
+                "event=prepaint_end paint_frame={} duration_ms={:.2}",
+                frame_seq, duration_ms
+            );
+        }
 
         // Now actually paint the elements.
         self.invalidator.set_phase(DrawPhase::Paint);
+        #[cfg(feature = "texture-cache-debug")]
+        let paint_started_at = std::time::Instant::now();
+        #[cfg(feature = "texture-cache-debug")]
+        log::info!("event=paint_start paint_frame={}", frame_seq);
+
         root_element.paint(self, cx);
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -2652,6 +2713,15 @@ impl Window {
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector_hitbox(cx);
+
+        #[cfg(feature = "texture-cache-debug")]
+        {
+            let duration_ms = paint_started_at.elapsed().as_secs_f32() * 1000.0;
+            log::info!(
+                "event=paint_end paint_frame={} duration_ms={:.2}",
+                frame_seq, duration_ms
+            );
+        }
     }
 
     fn prepaint_tooltip(&mut self, cx: &mut App) -> Option<AnyElement> {
