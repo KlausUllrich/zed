@@ -345,36 +345,25 @@ impl WgpuRenderer {
         // FPS halving problem: with Fifo, any frame exceeding the VSync budget drops to
         // the next slot (e.g. 144→72→48 FPS). Mailbox lets us present the most recent
         // frame at each VSync without blocking. Fall back to Fifo if unsupported.
-        let mailbox_supported = surface_caps
+        let present_mode = if surface_caps
             .present_modes
-            .contains(&wgpu::PresentMode::Mailbox);
-        let present_mode = if mailbox_supported {
+            .contains(&wgpu::PresentMode::Mailbox)
+        {
             wgpu::PresentMode::Mailbox
         } else {
             wgpu::PresentMode::Fifo
         };
 
-        // S513 Move 2 (max): log which present mode was actually chosen. If Klaus
-        // sees the Fifo cliff signature in trace data (frame work ~16-17ms causing
-        // 41-45 FPS at 144Hz instead of ~58 FPS), this line tells us whether the
-        // compositor advertises Mailbox at all. The list of all supported modes
-        // is included so we can pick a workaround if Mailbox is missing
-        // (e.g., FifoRelaxed or Immediate may be alternatives on some compositors).
+        // S513 Move 2 (max): record the chosen present mode in cache_region's
+        // process-global slot so it lands on every paint_timing_breakdown line
+        // emitted during the session. The earlier one-shot `log::info!` at
+        // startup didn't reach the trace topic file (topic gets armed AFTER
+        // app startup via F9). Stamping the value into a process-global and
+        // including it on every per-frame line is more reliable: the moment
+        // Klaus arms the Cache topic the value appears on the next frame.
         #[cfg(feature = "texture-cache-debug")]
         {
-            let supported: Vec<&'static str> = surface_caps
-                .present_modes
-                .iter()
-                .map(|m| match m {
-                    wgpu::PresentMode::Fifo => "Fifo",
-                    wgpu::PresentMode::FifoRelaxed => "FifoRelaxed",
-                    wgpu::PresentMode::Immediate => "Immediate",
-                    wgpu::PresentMode::Mailbox => "Mailbox",
-                    wgpu::PresentMode::AutoVsync => "AutoVsync",
-                    wgpu::PresentMode::AutoNoVsync => "AutoNoVsync",
-                })
-                .collect();
-            let chosen = match present_mode {
+            let name: &'static str = match present_mode {
                 wgpu::PresentMode::Fifo => "Fifo",
                 wgpu::PresentMode::FifoRelaxed => "FifoRelaxed",
                 wgpu::PresentMode::Immediate => "Immediate",
@@ -382,12 +371,7 @@ impl WgpuRenderer {
                 wgpu::PresentMode::AutoVsync => "AutoVsync",
                 wgpu::PresentMode::AutoNoVsync => "AutoNoVsync",
             };
-            log::info!(
-                "event=present_mode_chosen chosen={} mailbox_supported={} all_modes={:?}",
-                chosen,
-                mailbox_supported,
-                supported
-            );
+            gpui::cache_region::set_present_mode_name(name);
         }
 
         let surface_config = wgpu::SurfaceConfiguration {

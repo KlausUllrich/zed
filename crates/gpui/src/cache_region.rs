@@ -320,6 +320,33 @@ pub fn active_agent_str() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+// --- S513 Move 2: chosen wgpu PresentMode at startup ---
+// Decided in `WgpuRenderer::new()` based on what the platform surface
+// advertises. Stamped once, read on every paint_timing_breakdown emission so
+// Klaus can see whether the build is using Mailbox (no vsync cliff) or Fifo
+// (cliff -> 144/3 = 48 FPS at 16-17ms frame work). Process-global because the
+// renderer chooses once per process and never changes.
+//
+// Use of `OnceLock` (cross-thread safe; one-shot write semantics) avoids the
+// thread_local re-read-on-each-thread surprise: paint and present run on
+// different threads in the wgpu pipeline.
+static PRESENT_MODE_NAME: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// Stamp the chosen wgpu present mode at app startup. First call wins; later
+/// calls (e.g. on monitor reconfiguration) are ignored — present_mode rarely
+/// changes mid-session and Klaus only needs the startup decision recorded.
+/// Call site: `WgpuRenderer::new()` in gpui_wgpu/src/wgpu_renderer.rs.
+pub fn set_present_mode_name(name: &'static str) {
+    let _ = PRESENT_MODE_NAME.set(name);
+}
+
+/// Snapshot the chosen present mode, or `"Unknown"` if `set_present_mode_name`
+/// wasn't called yet (which can only happen on frames painted before the
+/// renderer finished construction — should be impossible in practice).
+pub fn present_mode_str() -> &'static str {
+    PRESENT_MODE_NAME.get().copied().unwrap_or("Unknown")
+}
+
 /// Replace the per-region card-type map. Map keys are list region_ids
 /// (CS item index + LIST_SPACER_OFFSET). Values are stable string literals
 /// from `ConversationItem::card_type_name()` so they're zero-allocation.
@@ -469,9 +496,10 @@ pub fn frame_perf_emit_with_present(present_ms: f32) {
         }
     });
     let agent = active_agent_str();
+    let present_mode = present_mode_str();
     log::info!(
-        "event=paint_timing_breakdown paint_frame={} agent={} layout_ms={:.1} capture_ms={:.1} composite_ms={:.1} present_ms={:.1} hit_count={} miss_count={} plain_count={} fps_rolling={:.1}",
-        perf.paint_frame, agent,
+        "event=paint_timing_breakdown paint_frame={} agent={} present_mode={} layout_ms={:.1} capture_ms={:.1} composite_ms={:.1} present_ms={:.1} hit_count={} miss_count={} plain_count={} fps_rolling={:.1}",
+        perf.paint_frame, agent, present_mode,
         perf.layout_ms, perf.capture_ms, perf.composite_ms, present_ms,
         perf.hit_count, perf.miss_count, perf.plain_count,
         fps_rolling
