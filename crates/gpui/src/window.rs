@@ -2591,8 +2591,11 @@ impl Window {
         // and layout_phase_start documented in S513 FPS bottleneck findings.
         // Sub-phase events emitted on this Cache topic so Klaus's existing
         // analysis pipeline (cs-trace-card.sh + arming F9 → Cache) picks them up.
-        // paint_frame uses current_request_frame_seq() — the in-flight wake's
-        // correlator, matching window_draw_start / wayland_surface_commit etc.
+        // paint_frame uses current_request_frame_seq() — reads (does NOT
+        // increment) the in-flight wake's correlator, so it matches the same
+        // value already stamped by window_draw_start / wayland_surface_commit
+        // for this frame (calling next_request_frame_seq() here would create
+        // an orphan seq that pairs with no other event in the trace).
         #[cfg(feature = "texture-cache-debug")]
         let prepaint_started_at = std::time::Instant::now();
         #[cfg(feature = "texture-cache-debug")]
@@ -2624,7 +2627,10 @@ impl Window {
         // construction + text shaping recursively — per S480 perf, this is
         // ~30%+ of CPU and the dominant component of the 11ms silent gap.
         // Named `taffy_layout_*` after the dominant subsystem (matches the
-        // S480 perf-record terminology) but captures Taffy + element walk + text.
+        // S480 perf-record terminology + max's S513 task brief). The total
+        // wall time INCLUDES Taffy + element-tree construction + text shaping —
+        // a raw `grep taffy_layout_end duration_ms=…` reading is the combined
+        // cost, not Taffy alone.
         #[cfg(feature = "texture-cache-debug")]
         let taffy_started_at = std::time::Instant::now();
         #[cfg(feature = "texture-cache-debug")]
@@ -2642,6 +2648,10 @@ impl Window {
         #[cfg(any(feature = "inspector", debug_assertions))]
         let inspector_element = self.prepaint_inspector(_inspector_width, cx);
 
+        // Not separately bracketed: prepaint_deferred_draws + the overlay
+        // prepaint arms below (prompt/drag/tooltip). Per S480 perf these are
+        // <1% CPU; their cost is captured in `prepaint_end - taffy_layout_end -
+        // hit_test_end` by subtraction if a future analysis needs them.
         self.prepaint_deferred_draws(cx);
 
         let mut prompt_element = None;
