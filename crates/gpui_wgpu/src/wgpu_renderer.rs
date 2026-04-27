@@ -371,7 +371,7 @@ impl WgpuRenderer {
                 wgpu::PresentMode::AutoVsync => "AutoVsync",
                 wgpu::PresentMode::AutoNoVsync => "AutoNoVsync",
             };
-            gpui::cache_region::set_present_mode_name(name);
+            gpui::set_present_mode_name(name);
         }
 
         let surface_config = wgpu::SurfaceConfiguration {
