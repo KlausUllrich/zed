@@ -1478,6 +1478,9 @@ impl WgpuRenderer {
                             cached.width, cached.height, tex_width, tex_height
                         );
                         // S498 INV-X4: dimension mismatch triggers recapture loop.
+                        // Note: rule=X4 uses `region=` (not `ix=`) to match the pre-existing
+                        // INVARIANT_VIOLATION format consumed by sage's anomaly rules.
+                        // cs-trace-card.sh's PATTERN matches `region=N` so filter still works.
                         #[cfg(feature = "texture-cache-debug")]
                         {
                             log::warn!(

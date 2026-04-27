@@ -300,6 +300,8 @@ pub fn is_debug_tint_enabled() -> bool {
 
 thread_local! {
     static ACTIVE_AGENT_ID: RefCell<Option<String>> = const { RefCell::new(None) };
+    // Values are &'static str from `ConversationItem::card_type_name()` —
+    // zero-allocation per-frame map rebuild on the CS render side.
     static CARD_TYPES: RefCell<HashMap<u64, &'static str>> = RefCell::new(HashMap::new());
 }
 
@@ -373,6 +375,11 @@ thread_local! {
 /// Called from `List::layout_items()` after the existing `layout_phase_end`
 /// event so caching-OFF baselines (where layout is the dominant cost) are
 /// still measured even when no cache events fire.
+///
+/// NOTE: A layout pass without a following paint pass will still emit the
+/// consolidated event with zeroed hit/miss/plain counts — that's correct
+/// (layout-cost-only frame). Distinct from idle frames (no paint at all),
+/// which are suppressed by `have_data` because nothing recorded anything.
 pub fn frame_perf_record_layout(paint_frame: u64, layout_ms: f32) {
     FRAME_PERF.with(|cell| {
         let mut perf = cell.get();
@@ -400,6 +407,11 @@ pub fn frame_perf_record_counts(paint_frame: u64, hit: u32, miss: u32, plain: u3
 }
 
 /// Record `process_cache_regions` capture-pass duration.
+///
+/// Does NOT set `have_data` — capture-only with no preceding layout/counts
+/// would mean the renderer ran but the list never laid out or painted, which
+/// is impossible in practice. Only `record_layout` and `record_counts` gate
+/// emission; capture/composite are timing details on an already-painted frame.
 pub fn frame_perf_record_capture(capture_ms: f32) {
     FRAME_PERF.with(|cell| {
         let mut perf = cell.get();
@@ -409,6 +421,7 @@ pub fn frame_perf_record_capture(capture_ms: f32) {
 }
 
 /// Record `draw_cached_regions` composite-pass duration.
+/// Same `have_data` semantics as `frame_perf_record_capture` — see its docs.
 pub fn frame_perf_record_composite(composite_ms: f32) {
     FRAME_PERF.with(|cell| {
         let mut perf = cell.get();
@@ -422,8 +435,8 @@ pub fn frame_perf_record_composite(composite_ms: f32) {
 /// wall-clock `frame.present()` duration measured by the renderer.
 ///
 /// Call site: `WgpuRenderer::draw()` immediately after `frame.present()` returns.
-/// No-op for frames with no recorded layout/paint data — avoids spurious
-/// zero events on idle / presentation-feedback-only frames.
+/// No-op for frames where neither `record_layout` nor `record_counts` ran
+/// (idle / presentation-feedback-only frames) — avoids spurious zero events.
 pub fn frame_perf_emit_with_present(present_ms: f32) {
     let perf = FRAME_PERF.with(|cell| {
         let snapshot = cell.get();
