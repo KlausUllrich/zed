@@ -15,17 +15,42 @@
 //!   `is_per_cell_trace_enabled()` (toggled from cs-ui Render Cache sidepane), to
 //!   avoid trace-flood when not investigating cell-level cost.
 //!
-//! ## Architecture
+//! ## Architecture — Prepaint records, Paint reads
 //!
-//! - Vendor (gpui-component) marks per-card facts (markdown_render_ran,
-//!   state_update_writes, cell_count, has_table) into a thread-local recorder
-//!   while painting.
-//! - Fork (gpui list.rs paint loop) calls `begin_card` before each
-//!   `item.element.paint()` to reset the recorder and `end_card` after to
-//!   harvest the snapshot, then emits a `PerCardFrameEvent` via the registered
-//!   callback. After the loop, emits one `PerFrameSummaryEvent`.
-//! - cs-app registers the callback at startup; the callback forwards each event
-//!   to `cs_core::cs_log!(Subsystem::RenderCache, Level::Debug, "event=...")`.
+//! GPUI's element protocol runs in two phases: **PREPAINT** (where
+//! `Render::render` is invoked, the element tree is constructed, layout runs)
+//! and **PAINT** (where `Element::paint` walks the already-constructed tree
+//! and emits primitives). Vendor (gpui-component) instrumentation in
+//! `state.rs::TextViewState::render`, `text_view.rs::TextView::request_layout`,
+//! and `node.rs::render_table` ALL run during PREPAINT — by the time list.rs's
+//! paint loop runs, the element tree is built and vendor's record_X calls
+//! have already fired. The fork's `begin_card`/`end_card` brackets only
+//! surround PAINT, so they cannot capture vendor's prepaint-side fingerprints
+//! via a per-card recorder.
+//!
+//! Resolution: vendor instrumentation writes to **`PREPAINT_REGISTRY`**, a
+//! frame-keyed by-index HashMap, keyed by **`PREPAINT_CARD_IDX`** (a
+//! thread-local set by cs-ui's `render_item` closure at the start of each
+//! item via `enter_prepaint_card(idx)`). cs-app's paint-side `end_card` reads
+//! the registry by `current_card_index` (set by paint's `begin_card`) AND
+//! checks `frame_id == card_timeline::frame()` so only this frame's
+//! fingerprints survive (stale entries from prior frames are returned as
+//! defaults). For cards on HIT path where `render_item` doesn't run at all,
+//! the registry has no entry for the current frame → defaults returned →
+//! markdown_render_ran=false / writes=0 / cells=0, which is correct.
+//!
+//! - **Vendor (PREPAINT)** marks per-card facts via record_X functions that
+//!   look up `PREPAINT_CARD_IDX` and write to `PREPAINT_REGISTRY`.
+//! - **cs-ui (PREPAINT)** sets `PREPAINT_CARD_IDX` at the start of `render_item`
+//!   and clears at the end (or leaves set; next iteration overwrites).
+//!   Also writes `LAST_CARD_TYPE` and `LAST_CACHED_HEIGHT` directly by index.
+//! - **Fork (PAINT)** list.rs paint loop calls `begin_card` (sets
+//!   `current_card_index` for the cell-paint emit fallback path) → element
+//!   paint → `end_card` (reads PREPAINT_REGISTRY by index + frame_id) →
+//!   emits `PerCardFrameEvent`. After the loop, emits one
+//!   `PerFrameSummaryEvent`.
+//! - **cs-app** registers the callback at startup; the callback forwards each
+//!   event to `cs_core::cs_log!(Subsystem::RenderCache, Level::Debug, "event=...")`.
 //!
 //! ## Zero-overhead in production
 //!
@@ -243,6 +268,65 @@ thread_local! {
 static LAST_CARD_TYPE: LazyLock<Mutex<HashMap<usize, &'static str>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Card-index thread-local set by cs-ui's `render_item` closure during PREPAINT.
+/// Vendor (gpui-component) record_X functions read this to know which card is
+/// currently rendering. None when no `render_item` body is active. See module
+/// docs for full lifecycle.
+#[cfg(feature = "texture-cache-debug")]
+thread_local! {
+    static PREPAINT_CARD_IDX: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Per-card prepaint fingerprint recorded by vendor instrumentation. Frame-aware:
+/// `frame_id` is checked at read time so stale entries (from cards that weren't
+/// re-rendered this frame) return defaults. Reset on the first record_X call of
+/// a new frame for that card.
+#[derive(Clone, Copy, Debug, Default)]
+struct PrepaintFingerprint {
+    /// `card_timeline::frame()` value at the moment of the last record_X call
+    /// for this card. Used to gate stale reads in `end_card`.
+    frame_id: u64,
+    markdown_render_ran: bool,
+    state_update_writes: u32,
+    state_update_changed: u32,
+    has_table: bool,
+    cell_count: u32,
+}
+
+/// Frame-keyed by-index registry written by vendor record_X functions during
+/// PREPAINT, read by `end_card` during PAINT.
+#[cfg(feature = "texture-cache-debug")]
+static PREPAINT_REGISTRY: LazyLock<Mutex<HashMap<usize, PrepaintFingerprint>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Internal helper: reset-or-fetch a registry entry for the current frame.
+/// Returns a mutable handle (via callback) so the caller can update fields.
+/// Caller MUST hold `PREPAINT_CARD_IDX` set to the right index. Returns false
+/// when PREPAINT_CARD_IDX is None — callers skip the record on false.
+#[cfg(feature = "texture-cache-debug")]
+fn with_prepaint_entry<F: FnOnce(&mut PrepaintFingerprint)>(f: F) -> bool {
+    let idx = match PREPAINT_CARD_IDX.with(|c| c.get()) {
+        Some(idx) => idx,
+        None => return false,
+    };
+    let frame = crate::card_timeline::frame();
+    if let Ok(mut reg) = PREPAINT_REGISTRY.lock() {
+        let entry = reg.entry(idx).or_default();
+        // Frame transition: stale fingerprint from a prior frame; reset before
+        // applying the new record.
+        if entry.frame_id != frame {
+            *entry = PrepaintFingerprint {
+                frame_id: frame,
+                ..PrepaintFingerprint::default()
+            };
+        }
+        f(entry);
+        true
+    } else {
+        false
+    }
+}
+
 /// Atomic gate for per-cell paint events. Toggled at runtime from cs-ui
 /// (Render Cache sidepane sub-toggle). OFF by default; ON when Klaus clicks the
 /// "Render Cache (per-cell)" entry to investigate cell-level cost.
@@ -253,28 +337,17 @@ static PER_CELL_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 #[cfg(not(feature = "texture-cache-debug"))]
 static PER_CELL_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// Internal per-card scratch state, written by vendor instrumentation between
-/// `begin_card` and `end_card`. NOTE: `card_type` is NOT in this struct
-/// because `record_card_type` is called from cs-ui during PREPAINT (before
-/// `begin_card` runs during PAINT), so a per-card field would be cleared by
-/// the `begin_card` reset before `end_card` could harvest it. card_type is
-/// stored in `LAST_CARD_TYPE` keyed by card_index instead.
+/// Internal per-card scratch state during PAINT. Holds only the
+/// `current_card_index` (set by `begin_card`, read by the cell-paint emit's
+/// fallback path). All vendor-side per-card fingerprints
+/// (markdown_render_ran, state_update_writes, has_table, cell_count) live in
+/// `PREPAINT_REGISTRY` instead, keyed by card_index, because they're written
+/// during PREPAINT (before `begin_card` runs).
 #[derive(Clone, Default, Debug)]
 pub struct PerCardRecorder {
     /// Card index set by the most recent `begin_card`. `None` when no card paint
     /// is active.
     pub current_card_index: Option<usize>,
-    /// True if `TextViewState::render` ran during this card's paint.
-    pub markdown_render_ran: bool,
-    /// Count of `state.update(cx, ...)` writes attempted in `TextView::request_layout`.
-    pub state_update_writes: u32,
-    /// Of `state_update_writes`, how many actually changed the stored value.
-    pub state_update_changed: u32,
-    /// True if `render_table` ran during this card's paint.
-    pub has_table: bool,
-    /// Sum of cells across all tables painted during this card's paint
-    /// (rows × cols per table).
-    pub cell_count: u32,
 }
 
 /// Snapshot returned by `end_card` for inclusion in `PerCardFrameEvent`.
@@ -368,33 +441,49 @@ pub fn begin_card(card_index: usize) {
     }
 }
 
-/// Harvest and clear the per-card recorder. Call after `item.element.paint()` in
-/// the list paint loop. Returns the snapshot for inclusion in the
-/// `PerCardFrameEvent`. card_type is looked up from `LAST_CARD_TYPE` (populated
-/// by cs-ui's `record_card_type` during prepaint, keyed by card_index).
+/// Harvest the per-card snapshot. Call after `item.element.paint()` in the
+/// list paint loop. Returns the snapshot for inclusion in the
+/// `PerCardFrameEvent`. Reads:
+/// - `card_type` from `LAST_CARD_TYPE` (populated by cs-ui's
+///   `record_card_type` during prepaint).
+/// - Vendor fingerprints (markdown_render_ran, state_update_writes,
+///   state_update_changed, has_table, cell_count) from `PREPAINT_REGISTRY`,
+///   gated by `frame_id == card_timeline::frame()` so stale entries from
+///   prior frames return as defaults. For HIT cards (no `render_item` ran
+///   this frame), defaults are correct because no markdown render took place.
 #[inline]
 pub fn end_card() -> PerCardSnapshot {
     #[cfg(feature = "texture-cache-debug")]
     {
-        PER_CARD_RECORDER.with(|cell| {
+        let card_index = PER_CARD_RECORDER.with(|cell| {
             let mut rec = cell.borrow_mut();
-            let card_index = rec.current_card_index;
-            let card_type = card_index
-                .and_then(|idx| {
-                    LAST_CARD_TYPE.lock().ok().and_then(|m| m.get(&idx).copied())
-                })
-                .unwrap_or("Unknown");
-            let snap = PerCardSnapshot {
-                card_type,
-                markdown_render_ran: rec.markdown_render_ran,
-                state_update_writes: rec.state_update_writes,
-                state_update_changed: rec.state_update_changed,
-                has_table: rec.has_table,
-                cell_count: rec.cell_count,
-            };
+            let idx = rec.current_card_index;
             *rec = PerCardRecorder::default();
-            snap
-        })
+            idx
+        });
+        let card_type = card_index
+            .and_then(|idx| {
+                LAST_CARD_TYPE.lock().ok().and_then(|m| m.get(&idx).copied())
+            })
+            .unwrap_or("Unknown");
+        let current_frame = crate::card_timeline::frame();
+        let fingerprint = card_index
+            .and_then(|idx| {
+                PREPAINT_REGISTRY
+                    .lock()
+                    .ok()
+                    .and_then(|m| m.get(&idx).copied())
+            })
+            .filter(|fp| fp.frame_id == current_frame)
+            .unwrap_or_default();
+        PerCardSnapshot {
+            card_type,
+            markdown_render_ran: fingerprint.markdown_render_ran,
+            state_update_writes: fingerprint.state_update_writes,
+            state_update_changed: fingerprint.state_update_changed,
+            has_table: fingerprint.has_table,
+            cell_count: fingerprint.cell_count,
+        }
     }
     #[cfg(not(feature = "texture-cache-debug"))]
     {
@@ -470,34 +559,88 @@ pub fn last_cached_height(card_index: usize) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
-// Vendor-facing record API (called by gpui-component).
+// Prepaint scope API (called by cs-ui render_item closure).
 // ---------------------------------------------------------------------------
 
-/// Mark that `TextViewState::render` ran this frame for the current card. Called
-/// at the entry of vendor `state.rs` `TextViewState::render`.
+/// Set the active card index for PREPAINT-side vendor instrumentation. Called
+/// at the start of cs-ui's `render_item` closure for the items-lookup branch.
+/// Pair with `exit_prepaint_card` at closure exit (or rely on the next
+/// invocation overwriting; subsequent record_X calls outside any scope are
+/// safely guarded via `current_prepaint_card_index().is_some()`).
+#[inline]
+pub fn enter_prepaint_card(card_index: usize) {
+    #[cfg(feature = "texture-cache-debug")]
+    {
+        PREPAINT_CARD_IDX.with(|c| c.set(Some(card_index)));
+    }
+    #[cfg(not(feature = "texture-cache-debug"))]
+    {
+        let _ = card_index;
+    }
+}
+
+/// Clear the active card index after the render_item closure body completes.
+/// Optional — leaving it set is harmless because the next `enter_prepaint_card`
+/// overwrites it. Recommended to call when the closure exits an items-lookup
+/// branch and might be followed by emit sites that should NOT be attributed
+/// to this card.
+#[inline]
+pub fn exit_prepaint_card() {
+    #[cfg(feature = "texture-cache-debug")]
+    {
+        PREPAINT_CARD_IDX.with(|c| c.set(None));
+    }
+}
+
+/// Get the active prepaint card index. Used by vendor's per-cell paint emit
+/// (since cell_paint events fire DURING prepaint, before fork's begin_card has
+/// set the paint-side `current_card_index`). None when no `render_item` body
+/// is active.
+#[inline]
+pub fn current_prepaint_card_index() -> Option<usize> {
+    #[cfg(feature = "texture-cache-debug")]
+    {
+        PREPAINT_CARD_IDX.with(|c| c.get())
+    }
+    #[cfg(not(feature = "texture-cache-debug"))]
+    {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vendor-facing record API (called by gpui-component during PREPAINT).
+// All record_X functions write to PREPAINT_REGISTRY keyed by
+// PREPAINT_CARD_IDX, frame-keyed via card_timeline::frame().
+// ---------------------------------------------------------------------------
+
+/// Mark that `TextViewState::render` ran this frame for the active prepaint
+/// card. Called at the entry of vendor `state.rs::TextViewState::render`.
+/// No-op when called outside a `render_item` scope (PREPAINT_CARD_IDX is None).
 #[inline]
 pub fn record_markdown_render_ran() {
     #[cfg(feature = "texture-cache-debug")]
     {
-        PER_CARD_RECORDER.with(|cell| {
-            cell.borrow_mut().markdown_render_ran = true;
+        let _ = with_prepaint_entry(|fp| {
+            fp.markdown_render_ran = true;
         });
     }
 }
 
 /// Record one of the unconditional `state.update(cx, ...)` writes in vendor
-/// `text_view.rs::TextView::request_layout`. `changed = true` iff the prior value
-/// differed from the incoming value (compute that via `state.read(cx)` BEFORE
-/// calling `state.update`).
+/// `text_view.rs::TextView::request_layout`. `changed = true` iff the prior
+/// value differed from the incoming value (compute via `state.read(cx)` BEFORE
+/// calling `state.update`). No-op when called outside a `render_item` scope —
+/// prevents leaks from non-conversation TextView call sites (e.g.
+/// `write_viewer.rs` at startup).
 #[inline]
 pub fn record_state_update(changed: bool) {
     #[cfg(feature = "texture-cache-debug")]
     {
-        PER_CARD_RECORDER.with(|cell| {
-            let mut rec = cell.borrow_mut();
-            rec.state_update_writes = rec.state_update_writes.saturating_add(1);
+        let _ = with_prepaint_entry(|fp| {
+            fp.state_update_writes = fp.state_update_writes.saturating_add(1);
             if changed {
-                rec.state_update_changed = rec.state_update_changed.saturating_add(1);
+                fp.state_update_changed = fp.state_update_changed.saturating_add(1);
             }
         });
     }
@@ -507,17 +650,17 @@ pub fn record_state_update(changed: bool) {
     }
 }
 
-/// Record that the current card's body contains a markdown table. Called from
-/// vendor `node.rs::render_table` at function entry. `cell_count = rows × cols`.
+/// Record that the active prepaint card's body contains a markdown table.
+/// Called from vendor `node.rs::render_table` at function entry.
+/// `cell_count = rows × cols`. Multiple tables per card accumulate. No-op
+/// when called outside a `render_item` scope.
 #[inline]
 pub fn record_table(cell_count: u32) {
     #[cfg(feature = "texture-cache-debug")]
     {
-        PER_CARD_RECORDER.with(|cell| {
-            let mut rec = cell.borrow_mut();
-            rec.has_table = true;
-            // Multiple tables per card: accumulate cells across all of them.
-            rec.cell_count = rec.cell_count.saturating_add(cell_count);
+        let _ = with_prepaint_entry(|fp| {
+            fp.has_table = true;
+            fp.cell_count = fp.cell_count.saturating_add(cell_count);
         });
     }
     #[cfg(not(feature = "texture-cache-debug"))]
@@ -526,9 +669,10 @@ pub fn record_table(cell_count: u32) {
     }
 }
 
-/// Get the current card index (set by the most recent `begin_card`). None when
-/// no card paint is active. Used by vendor instrumentation that needs to emit
-/// per-cell events without explicit threading.
+/// Get the current paint-side card index (set by `begin_card`, read by the
+/// cell-paint emit's fallback path). None when no card paint is active.
+/// **For per-cell events, prefer `current_prepaint_card_index()`** since cell
+/// paint events fire during prepaint, before begin_card has set this field.
 #[inline]
 pub fn current_card_index() -> Option<usize> {
     #[cfg(feature = "texture-cache-debug")]

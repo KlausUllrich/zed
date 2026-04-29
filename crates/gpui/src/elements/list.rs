@@ -2931,6 +2931,17 @@ impl Element for List {
                             cache_clear_color,
                             fade_alpha,
                         );
+                        // S521 Bug 3: FADE branch is semantically PLAIN (caching
+                        // is OFF, fade overlay composites cached texture on top
+                        // of fresh DIRECT paint). Increment diag_plain so the
+                        // per-frame summary's plain count matches the per-card
+                        // events' cache_state=Plain emit immediately above.
+                        // Without this, a fade-overlay frame shows
+                        // visible=N plain=0 in summary but N cache_state=PLAIN
+                        // events — a real consistency bug surfaced by Klaus's
+                        // smoke trace at frame=13606.
+                        #[cfg(feature = "texture-cache")]
+                        { diag_plain += 1; }
                         #[cfg(feature = "texture-cache-debug")]
                         s521_emit_card_frame!(
                             crate::cache_telemetry::CacheState::Plain,
