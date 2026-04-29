@@ -254,17 +254,16 @@ static PER_CELL_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 static PER_CELL_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Internal per-card scratch state, written by vendor instrumentation between
-/// `begin_card` and `end_card`.
+/// `begin_card` and `end_card`. NOTE: `card_type` is NOT in this struct
+/// because `record_card_type` is called from cs-ui during PREPAINT (before
+/// `begin_card` runs during PAINT), so a per-card field would be cleared by
+/// the `begin_card` reset before `end_card` could harvest it. card_type is
+/// stored in `LAST_CARD_TYPE` keyed by card_index instead.
 #[derive(Clone, Default, Debug)]
 pub struct PerCardRecorder {
     /// Card index set by the most recent `begin_card`. `None` when no card paint
     /// is active.
     pub current_card_index: Option<usize>,
-    /// CS-side card-type label (e.g. "AgentMessage", "ToolCall"). Populated by
-    /// cs-ui's render_item closure via `record_card_type`. None for HIT frames
-    /// where `render_item` is skipped — the most-recent populated value is
-    /// served from `LAST_CARD_TYPE` cache instead.
-    pub card_type: Option<&'static str>,
     /// True if `TextViewState::render` ran during this card's paint.
     pub markdown_render_ran: bool,
     /// Count of `state.update(cx, ...)` writes attempted in `TextView::request_layout`.
@@ -281,9 +280,11 @@ pub struct PerCardRecorder {
 /// Snapshot returned by `end_card` for inclusion in `PerCardFrameEvent`.
 #[derive(Clone, Debug, Default)]
 pub struct PerCardSnapshot {
-    /// CS-side card-type label, served either from this paint's `record_card_type`
-    /// call or from the `LAST_CARD_TYPE` cache (HIT frames where `render_item`
-    /// is skipped).
+    /// CS-side card-type label, looked up by card_index from `LAST_CARD_TYPE`
+    /// (populated by cs-ui's `record_card_type` during prepaint). Returns
+    /// `"Unknown"` if no record exists for this index — only happens for the
+    /// first frame after the cache is cleared, since render_item runs every
+    /// frame for non-HIT cards and populates the cache.
     pub card_type: &'static str,
     /// True if `TextViewState::render` ran during this card's paint.
     pub markdown_render_ran: bool,
@@ -369,10 +370,8 @@ pub fn begin_card(card_index: usize) {
 
 /// Harvest and clear the per-card recorder. Call after `item.element.paint()` in
 /// the list paint loop. Returns the snapshot for inclusion in the
-/// `PerCardFrameEvent`. For HIT frames where vendor instrumentation didn't run,
-/// fields fall back to the last-recorded values from the `LAST_CARD_TYPE` cache
-/// (card_type only — other fields stay zero, which is correct for HIT since the
-/// markdown render genuinely didn't run).
+/// `PerCardFrameEvent`. card_type is looked up from `LAST_CARD_TYPE` (populated
+/// by cs-ui's `record_card_type` during prepaint, keyed by card_index).
 #[inline]
 pub fn end_card() -> PerCardSnapshot {
     #[cfg(feature = "texture-cache-debug")]
@@ -380,21 +379,11 @@ pub fn end_card() -> PerCardSnapshot {
         PER_CARD_RECORDER.with(|cell| {
             let mut rec = cell.borrow_mut();
             let card_index = rec.current_card_index;
-            let card_type = match rec.card_type {
-                Some(t) => {
-                    if let Some(idx) = card_index {
-                        if let Ok(mut map) = LAST_CARD_TYPE.lock() {
-                            map.insert(idx, t);
-                        }
-                    }
-                    t
-                }
-                None => card_index
-                    .and_then(|idx| {
-                        LAST_CARD_TYPE.lock().ok().and_then(|m| m.get(&idx).copied())
-                    })
-                    .unwrap_or("Unknown"),
-            };
+            let card_type = card_index
+                .and_then(|idx| {
+                    LAST_CARD_TYPE.lock().ok().and_then(|m| m.get(&idx).copied())
+                })
+                .unwrap_or("Unknown");
             let snap = PerCardSnapshot {
                 card_type,
                 markdown_render_ran: rec.markdown_render_ran,
@@ -413,21 +402,25 @@ pub fn end_card() -> PerCardSnapshot {
     }
 }
 
-/// Record the CS-side card-type label for the current card. Called from cs-ui's
-/// `render_item` closure inside `list(state, |index, ...| {...})` before
-/// returning the rendered element. Stable string literal so it can be stored
-/// in `&'static str`.
+/// Record the CS-side card-type label for a card. Called from cs-ui's
+/// `render_item` closure (which runs during PREPAINT, BEFORE the fork's
+/// `begin_card` resets the per-card recorder during PAINT). Therefore writes
+/// directly to the `LAST_CARD_TYPE` cache keyed by card_index — the
+/// per-card recorder's `card_type` field can't survive the recorder reset
+/// between prepaint and paint. `card_index` must match the value the fork's
+/// list.rs paint loop uses for `begin_card` (i.e. CS-UI passes
+/// `real_ix + LIST_SPACER_OFFSET`).
 #[inline]
-pub fn record_card_type(card_type: &'static str) {
+pub fn record_card_type(card_index: usize, card_type: &'static str) {
     #[cfg(feature = "texture-cache-debug")]
     {
-        PER_CARD_RECORDER.with(|cell| {
-            cell.borrow_mut().card_type = Some(card_type);
-        });
+        if let Ok(mut m) = LAST_CARD_TYPE.lock() {
+            m.insert(card_index, card_type);
+        }
     }
     #[cfg(not(feature = "texture-cache-debug"))]
     {
-        let _ = card_type;
+        let _ = (card_index, card_type);
     }
 }
 
