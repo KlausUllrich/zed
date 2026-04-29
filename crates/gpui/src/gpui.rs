@@ -42,6 +42,14 @@ pub mod queue;
 mod cache_region;
 /// Per-frame diagnostic for QuestionCard texture capture timeline.
 pub mod card_timeline;
+/// S521 cache-telemetry diagnostic surface.
+///
+/// Cross-crate instrumentation that answers "do table-containing AgentMessage
+/// cards reach the HIT path, and if not, why?" Vendor (gpui-component) marks
+/// per-card facts; fork (gpui list.rs) emits aggregated events to a callback
+/// registered by cs-app at startup. All emission is gated by the
+/// `texture-cache-debug` feature flag so production builds carry zero overhead.
+pub mod cache_telemetry;
 mod scene;
 mod shared_string;
 mod shared_uri;

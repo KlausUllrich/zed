@@ -1419,6 +1419,16 @@ impl WgpuRenderer {
                     "texture cache: item {} ({}x{}) exceeds max texture dimension {} — fallback to Fresh",
                     region_id, tex_width, tex_height, self.max_texture_size
                 );
+                // S521: surface the rejection into the cache_telemetry registry so
+                // list.rs's per-card-frame emit can flag this card as
+                // RejectedTooLarge. Captures the proposed dimensions so we can
+                // identify oversized cards from trace inspection alone.
+                #[cfg(feature = "texture-cache-debug")]
+                gpui::cache_telemetry::record_admission_outcome(
+                    region.id.0,
+                    gpui::cache_telemetry::AdmissionOutcome::RejectedTooLarge,
+                    (tex_width, tex_height),
+                );
                 if debug {
                     debug_items.push(TextureCacheDebugItem {
                         index: region_id,
@@ -1447,6 +1457,25 @@ impl WgpuRenderer {
                     if cached.width == tex_width && cached.height == tex_height && cached.has_content {
                         cached.last_used_frame = pool.current_frame;
                         cached_count += 1;
+                        // S521: surface "already cached" admission outcome so
+                        // list.rs's HIT-path emit can show `Admitted` for cards
+                        // that hit the cache (vs. cards mid-capture this frame).
+                        #[cfg(feature = "texture-cache-debug")]
+                        {
+                            gpui::cache_telemetry::record_admission_outcome(
+                                region.id.0,
+                                gpui::cache_telemetry::AdmissionOutcome::Admitted,
+                                (tex_width, tex_height),
+                            );
+                            gpui::cache_telemetry::record_texture_size(
+                                region.id.0,
+                                gpui::cache_telemetry::TextureSizeRecord {
+                                    bytes: texture_memory_bytes(tex_width, tex_height),
+                                    width: tex_width,
+                                    height: tex_height,
+                                },
+                            );
+                        }
                         if debug {
                             debug_items.push(TextureCacheDebugItem {
                                 index: region_id,
@@ -1719,6 +1748,23 @@ impl WgpuRenderer {
             } else {
                 pool.insert(region.id.0, texture, view, tex_width, tex_height, has_content);
             }
+            // S521: surface successful admission + texture size for list.rs.
+            #[cfg(feature = "texture-cache-debug")]
+            {
+                gpui::cache_telemetry::record_admission_outcome(
+                    region.id.0,
+                    gpui::cache_telemetry::AdmissionOutcome::Admitted,
+                    (tex_width, tex_height),
+                );
+                gpui::cache_telemetry::record_texture_size(
+                    region.id.0,
+                    gpui::cache_telemetry::TextureSizeRecord {
+                        bytes: texture_memory_bytes(tex_width, tex_height),
+                        width: tex_width,
+                        height: tex_height,
+                    },
+                );
+            }
 
             // Guard baseline tracking: record first successful primitive count,
             // warn on subsequent captures that drop below 30% of baseline.
@@ -1903,6 +1949,22 @@ impl WgpuRenderer {
                 x4_violations,
                 v1_violations,
             });
+        }
+
+        // S521: publish pool-wide aggregates for list.rs's per-frame summary
+        // emit. Always runs under texture-cache-debug, even when the F9 debug
+        // panel callback is unregistered.
+        #[cfg(feature = "texture-cache-debug")]
+        {
+            let pool = self.texture_pool.as_ref().unwrap();
+            let pool_stats = pool.debug_pool_stats();
+            gpui::cache_telemetry::set_texture_pool_summary(
+                gpui::cache_telemetry::TexturePoolSummary {
+                    total_textures_cached: pool_stats.total,
+                    total_texture_bytes: (pool_stats.memory_mb * 1024.0 * 1024.0) as u64,
+                    capacity_bytes: pool.budget_bytes,
+                },
+            );
         }
 
         true

@@ -2575,8 +2575,93 @@ impl Element for List {
         let mut diag_transient: u32 = 0;
         #[cfg(feature = "texture-cache")]
         let mut diag_plain: u32 = 0;
+        // S521 cache-telemetry: track per-frame summary state and bracket each
+        // card's paint to compute card_paint_ns. Visible to all branches via
+        // closures inside `with_content_mask`. Always feature-gated so production
+        // builds compile to zero overhead.
+        #[cfg(feature = "texture-cache-debug")]
+        let mut s521_cards_rejected_too_large: u32 = 0;
+        #[cfg(feature = "texture-cache-debug")]
+        let mut s521_frame_paint_total_ns: u64 = 0;
+        #[cfg(feature = "texture-cache-debug")]
+        let mut s521_total_visible_cards: u32 = 0;
         window.with_content_mask(content_mask, |window| {
             for item in &mut prepaint.layout.item_layouts {
+                // S521 cache-telemetry: bracket every per-card branch with a single
+                // begin_card + Instant. Each branch's `continue;` is preceded by an
+                // emit_per_card_frame call (via the s521_emit_card_frame macro
+                // defined below). Entirely under texture-cache-debug.
+                #[cfg(feature = "texture-cache-debug")]
+                let s521_card_paint_start = std::time::Instant::now();
+                #[cfg(feature = "texture-cache-debug")]
+                crate::cache_telemetry::begin_card(item.index);
+                // Local macro: condenses the 6-branch emit boilerplate. Captures
+                // surrounding identifiers (item, frame_count, visible_frames_snapshot,
+                // s521_card_paint_start, the s521_* accumulators) by lexical scope.
+                #[cfg(feature = "texture-cache-debug")]
+                macro_rules! s521_emit_card_frame {
+                    ($cache_state:expr, $admission:expr) => {{
+                        let card_paint_ns =
+                            s521_card_paint_start.elapsed().as_nanos() as u64;
+                        s521_frame_paint_total_ns =
+                            s521_frame_paint_total_ns.saturating_add(card_paint_ns);
+                        s521_total_visible_cards =
+                            s521_total_visible_cards.saturating_add(1);
+                        let snap = crate::cache_telemetry::end_card();
+                        let region_id_u64 = item.index as u64;
+                        let admission_record =
+                            crate::cache_telemetry::get_admission_record(region_id_u64);
+                        let texture_record =
+                            crate::cache_telemetry::get_texture_size(region_id_u64);
+                        // Branch-default admission, overridden by registry only when
+                        // the registry reports RejectedTooLarge (the latent failure
+                        // mode S521 specifically targets) — otherwise the branch is
+                        // a stronger signal than a stale registry entry.
+                        let admission_outcome = match admission_record {
+                            Some(r) if r.outcome ==
+                                crate::cache_telemetry::AdmissionOutcome::RejectedTooLarge =>
+                                crate::cache_telemetry::AdmissionOutcome::RejectedTooLarge,
+                            _ => $admission,
+                        };
+                        if matches!(
+                            admission_outcome,
+                            crate::cache_telemetry::AdmissionOutcome::RejectedTooLarge
+                        ) {
+                            s521_cards_rejected_too_large =
+                                s521_cards_rejected_too_large.saturating_add(1);
+                        }
+                        let texture_dimensions = match admission_record {
+                            Some(r) if r.proposed_dimensions != (0, 0) =>
+                                r.proposed_dimensions,
+                            _ => (texture_record.width, texture_record.height),
+                        };
+                        let visible_frames_count = visible_frames_snapshot
+                            .get(&item.index)
+                            .copied()
+                            .unwrap_or(0) as u32;
+                        let cached_height =
+                            crate::cache_telemetry::last_cached_height(item.index);
+                        let event = crate::cache_telemetry::PerCardFrameEvent {
+                            frame_id: frame_count,
+                            card_index: item.index,
+                            card_type: snap.card_type,
+                            has_table: snap.has_table,
+                            cache_state: $cache_state,
+                            admission_outcome,
+                            visible_frames_count,
+                            cached_height,
+                            texture_size_bytes: texture_record.bytes,
+                            texture_dimensions,
+                            card_layout_height: f32::from(item.size.height),
+                            markdown_render_ran_this_frame: snap.markdown_render_ran,
+                            state_update_writes_this_frame: snap.state_update_writes,
+                            state_update_changed_values: snap.state_update_changed,
+                            cell_count: snap.cell_count,
+                            card_paint_ns,
+                        };
+                        crate::cache_telemetry::emit_per_card_frame(&event);
+                    }};
+                }
                 #[cfg(feature = "texture-cache")]
                 if caching_enabled {
                     let is_traced = trace_items_snapshot.contains(&item.index);
@@ -2611,6 +2696,11 @@ impl Element for List {
                         current_frame_heights.insert(item.index, item.size.height);
                         diag_streaming += 1;
                         item.element.paint(window, cx);
+                        #[cfg(feature = "texture-cache-debug")]
+                        s521_emit_card_frame!(
+                            crate::cache_telemetry::CacheState::Streaming,
+                            crate::cache_telemetry::AdmissionOutcome::RejectedStreaming
+                        );
                         continue;
                     }
 
@@ -2675,6 +2765,11 @@ impl Element for List {
                                 .to_vec();
                             current_item_state_keys.insert(item.index, keys);
                         }
+                        #[cfg(feature = "texture-cache-debug")]
+                        s521_emit_card_frame!(
+                            crate::cache_telemetry::CacheState::Transient,
+                            crate::cache_telemetry::AdmissionOutcome::RejectedTransient
+                        );
                         continue;
                     }
 
@@ -2721,6 +2816,11 @@ impl Element for List {
                         }
                         window.begin_cache_region(region_id, item_bounds, cache_clear_color, bounds);
                         window.end_cache_region(region_id);
+                        #[cfg(feature = "texture-cache-debug")]
+                        s521_emit_card_frame!(
+                            crate::cache_telemetry::CacheState::Hit,
+                            crate::cache_telemetry::AdmissionOutcome::Admitted
+                        );
                         continue;
                     }
 
@@ -2786,6 +2886,11 @@ impl Element for List {
                     // does not read content_mask_stack.
                     window.content_mask_stack = ancestor_masks;
                     diag_miss += 1;
+                    #[cfg(feature = "texture-cache-debug")]
+                    s521_emit_card_frame!(
+                        crate::cache_telemetry::CacheState::Miss,
+                        crate::cache_telemetry::AdmissionOutcome::Admitted
+                    );
                     continue;
                 }
 
@@ -2826,6 +2931,11 @@ impl Element for List {
                             cache_clear_color,
                             fade_alpha,
                         );
+                        #[cfg(feature = "texture-cache-debug")]
+                        s521_emit_card_frame!(
+                            crate::cache_telemetry::CacheState::Plain,
+                            crate::cache_telemetry::AdmissionOutcome::RejectedNotEligible
+                        );
                         continue;
                     }
                 }
@@ -2833,6 +2943,11 @@ impl Element for List {
                 #[cfg(feature = "texture-cache")]
                 { diag_plain += 1; }
                 item.element.paint(window, cx);
+                #[cfg(feature = "texture-cache-debug")]
+                s521_emit_card_frame!(
+                    crate::cache_telemetry::CacheState::Plain,
+                    crate::cache_telemetry::AdmissionOutcome::RejectedNotEligible
+                );
             }
         });
         #[cfg(feature = "texture-cache")]
@@ -2840,6 +2955,34 @@ impl Element for List {
             "event=frame_cache_summary paint_frame={} caching={} hit={} miss={} streaming={} transient={} plain={}",
             frame_count, caching_enabled, diag_hit, diag_miss, diag_streaming, diag_transient, diag_plain
         );
+        // S521 cache-telemetry: per-frame summary emit. Pool-side aggregates
+        // come from gpui_wgpu's `set_texture_pool_summary` published earlier
+        // this frame in `process_cache_regions`.
+        #[cfg(feature = "texture-cache-debug")]
+        {
+            let pool = crate::cache_telemetry::texture_pool_summary();
+            let utilization_pct = if pool.capacity_bytes > 0 {
+                (pool.total_texture_bytes as f32 / pool.capacity_bytes as f32) * 100.0
+            } else {
+                0.0
+            };
+            let summary = crate::cache_telemetry::PerFrameSummaryEvent {
+                frame_id: frame_count,
+                total_visible_cards: s521_total_visible_cards,
+                cards_in_hit: diag_hit,
+                cards_in_miss: diag_miss,
+                cards_in_transient: diag_transient,
+                cards_in_streaming: diag_streaming,
+                cards_in_plain: diag_plain,
+                cards_rejected_too_large: s521_cards_rejected_too_large,
+                total_textures_cached: pool.total_textures_cached,
+                total_texture_bytes: pool.total_texture_bytes,
+                texture_pool_capacity_bytes: pool.capacity_bytes,
+                texture_pool_utilization_pct: utilization_pct,
+                frame_paint_total_ns: s521_frame_paint_total_ns,
+            };
+            crate::cache_telemetry::emit_per_frame_summary(&summary);
+        }
         // S513 perf: feed the consolidated paint_timing_breakdown emitted at frame end.
         // When caching is OFF, hit/miss are 0 and plain reflects every painted item —
         // exactly the OFF baseline Klaus needs for the ON vs OFF FPS comparison.
