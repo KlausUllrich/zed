@@ -284,6 +284,14 @@ struct StateInner {
     /// When true, items are annotated for GPU texture caching during paint.
     #[cfg(feature = "texture-cache")]
     caching_enabled: bool,
+    /// S521 Phase 2.7: the immediate fork-side cause of the most recent
+    /// `caching_enabled = false` transition. Snapshotted into the per-card-frame
+    /// event so the trace can attribute each `RejectedNotEligible` event to a
+    /// specific gate (ScrollStopped vs Splice vs Splice vs ...). Cleared to
+    /// `None` whenever `caching_enabled` flips to `true`. `None` at construction
+    /// is interpreted by the paint emit as `NeverEnabled`.
+    #[cfg(feature = "texture-cache-debug")]
+    last_disable_reason: Option<crate::cache_telemetry::NotEligibleReason>,
     /// Background color for offscreen texture clear (subpixel text needs opaque bg).
     #[cfg(feature = "texture-cache")]
     cache_clear_color: Hsla,
@@ -551,6 +559,8 @@ impl ListState {
             last_inertia_time: None,
             #[cfg(feature = "texture-cache")]
             caching_enabled: false,
+            #[cfg(feature = "texture-cache-debug")]
+            last_disable_reason: None,
             #[cfg(feature = "texture-cache")]
             cache_clear_color: Hsla::default(),
             #[cfg(feature = "texture-cache")]
@@ -720,6 +730,13 @@ impl ListState {
         #[cfg(feature = "texture-cache")]
         if state.caching_enabled {
             state.caching_enabled = false;
+            #[cfg(feature = "texture-cache-debug")]
+            {
+                state.last_disable_reason = Some(
+                    crate::cache_telemetry::take_pending_external_disable_reason()
+                        .unwrap_or(crate::cache_telemetry::NotEligibleReason::Splice),
+                );
+            }
             state.visible_frames.clear();
             state.cached_item_state_keys.clear();
             crate::clear_cached_region_ids();
@@ -773,6 +790,13 @@ impl ListState {
         #[cfg(feature = "texture-cache")]
         if state.caching_enabled {
             state.caching_enabled = false;
+            #[cfg(feature = "texture-cache-debug")]
+            {
+                state.last_disable_reason = Some(
+                    crate::cache_telemetry::take_pending_external_disable_reason()
+                        .unwrap_or(crate::cache_telemetry::NotEligibleReason::Splice),
+                );
+            }
             state.visible_frames.clear();
             state.cached_item_state_keys.clear();
             crate::clear_cached_region_ids();
@@ -1095,6 +1119,13 @@ impl ListState {
         #[cfg(feature = "texture-cache")]
         let old_top = state.logical_scroll_top;
         // EC-13: Clear frame counters — programmatic jump resets visibility.
+        // NOTE: this clears `visible_frames` only; it does NOT flip
+        // `caching_enabled`. After this call, affected cards re-emit as
+        // `cache_state=TRANSIENT` + `admission=RejectedTransient` for the next
+        // ~2 frames (per `TRANSIENT_SKIP_FRAMES`), NOT as `RejectedNotEligible`.
+        // Therefore there is intentionally no `last_disable_reason` write here
+        // — the disable-vs-clear distinction matters for the
+        // `NotEligibleReason` telemetry surface (see `cache_telemetry.rs`).
         #[cfg(feature = "texture-cache")]
         state.visible_frames.clear();
         let bounds = state.last_layout_bounds.unwrap_or_default();
@@ -1299,12 +1330,44 @@ impl ListState {
     /// Enable or disable GPU texture caching for list items during scroll.
     /// When enabled, items are annotated for render-to-texture capture.
     /// `clear_color` should be the card's opaque background color (for subpixel text).
+    /// `disable_reason` is recorded as the per-card-frame `NotEligibleReason`
+    /// when `enabled = false` (S521 Phase 2.7 diagnostic plumbing — every
+    /// external disable site declares its cause). MUST be `None` when
+    /// `enabled = true`. The parameter is unconditionally part of the
+    /// signature so callers compile cross-feature; its value is read only
+    /// when `texture-cache-debug` is enabled.
+    ///
+    /// Internal disable sites (`splice_focusable`, `splice_with_heights`,
+    /// `invalidate_all_item_caches`, `invalidate_all_caches`) write the
+    /// reason directly without going through this API.
     #[cfg(feature = "texture-cache")]
-    pub fn set_item_caching_enabled(&self, enabled: bool, clear_color: Hsla) {
+    pub fn set_item_caching_enabled(
+        &self,
+        enabled: bool,
+        clear_color: Hsla,
+        disable_reason: Option<crate::cache_telemetry::NotEligibleReason>,
+    ) {
         let mut inner = self.0.borrow_mut();
         let prev = inner.caching_enabled;
         inner.caching_enabled = enabled;
         inner.cache_clear_color = clear_color;
+        #[cfg(feature = "texture-cache-debug")]
+        {
+            // S521 Phase 2.7: track disable cause for telemetry. On enable,
+            // clear the reason (None signals "currently enabled"). On disable,
+            // store the caller-supplied reason; if caller passed None on a
+            // disable, leave the prior reason intact (defensive — every
+            // external disable should declare its cause, but we don't panic).
+            if enabled {
+                inner.last_disable_reason = None;
+            } else if disable_reason.is_some() {
+                inner.last_disable_reason = disable_reason;
+            }
+        }
+        #[cfg(not(feature = "texture-cache-debug"))]
+        {
+            let _ = disable_reason;
+        }
         // Clear stale height tracking on disable so re-enable starts with a clean slate.
         // Prevents spurious height_change events from stale index→height associations
         // after splice/invalidation changes item ordering.
@@ -1371,6 +1434,13 @@ impl ListState {
         let mut inner = self.0.borrow_mut();
         let prev = inner.caching_enabled;
         inner.caching_enabled = false;
+        #[cfg(feature = "texture-cache-debug")]
+        {
+            inner.last_disable_reason = Some(
+                crate::cache_telemetry::take_pending_external_disable_reason()
+                    .unwrap_or(crate::cache_telemetry::NotEligibleReason::ScrollStopped),
+            );
+        }
         inner.visible_frames.clear();
         inner.prev_item_heights.clear();
         inner.cached_item_state_keys.clear();
@@ -1421,6 +1491,13 @@ impl ListState {
         let mut inner = self.0.borrow_mut();
         let prev = inner.caching_enabled;
         inner.caching_enabled = false;
+        #[cfg(feature = "texture-cache-debug")]
+        {
+            inner.last_disable_reason = Some(
+                crate::cache_telemetry::take_pending_external_disable_reason()
+                    .unwrap_or(crate::cache_telemetry::NotEligibleReason::GlobalInvalidation),
+            );
+        }
         inner.visible_frames.clear();
         inner.streaming_items.clear();
         inner.prev_item_heights.clear();
@@ -2481,6 +2558,13 @@ impl Element for List {
         let cached_item_state_keys_snapshot;
         #[cfg(feature = "texture-cache")]
         let fade_alpha;
+        // S521 Phase 2.7: snapshot the immediate disable cause so per-card
+        // emit can attribute every PLAIN/RejectedNotEligible event to a
+        // specific gate. `None` means "currently enabled" (paint loop will
+        // not emit RejectedNotEligible) OR "never been enabled this session"
+        // (paint loop synthesizes `NotEligibleReason::NeverEnabled`).
+        #[cfg(feature = "texture-cache-debug")]
+        let last_disable_reason_snapshot;
         #[cfg(feature = "texture-cache")]
         {
             let mut state = self.state.0.borrow_mut();
@@ -2495,6 +2579,10 @@ impl Element for List {
             state.paint_frame_count += 1;
             frame_count = state.paint_frame_count;
             crate::card_timeline::bump_frame();
+            #[cfg(feature = "texture-cache-debug")]
+            {
+                last_disable_reason_snapshot = state.last_disable_reason;
+            }
         }
         // S502: publish the controller-driven fade alpha into the Scene so
         // the composite shader applies it via `globals.composite_fade_alpha`.
@@ -2641,6 +2729,22 @@ impl Element for List {
                             .unwrap_or(0) as u32;
                         let cached_height =
                             crate::cache_telemetry::last_cached_height(item.index);
+                        // S521 Phase 2.7: populate `not_eligible_reason` only
+                        // when this event is `RejectedNotEligible`. For PLAIN
+                        // emits where `last_disable_reason_snapshot` is `None`
+                        // (caching has never been enabled this session), we
+                        // synthesize `NeverEnabled`. For all other admission
+                        // outcomes the field stays `None`.
+                        let not_eligible_reason = if matches!(
+                            admission_outcome,
+                            crate::cache_telemetry::AdmissionOutcome::RejectedNotEligible
+                        ) {
+                            Some(last_disable_reason_snapshot.unwrap_or(
+                                crate::cache_telemetry::NotEligibleReason::NeverEnabled,
+                            ))
+                        } else {
+                            None
+                        };
                         let event = crate::cache_telemetry::PerCardFrameEvent {
                             frame_id: frame_count,
                             card_index: item.index,
@@ -2648,6 +2752,7 @@ impl Element for List {
                             has_table: snap.has_table,
                             cache_state: $cache_state,
                             admission_outcome,
+                            not_eligible_reason,
                             visible_frames_count,
                             cached_height,
                             texture_size_bytes: texture_record.bytes,

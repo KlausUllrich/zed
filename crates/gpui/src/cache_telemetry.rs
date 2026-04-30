@@ -88,11 +88,16 @@ pub enum AdmissionOutcome {
     RejectedTransient,
     /// HIT path — cached entry already present.
     RejectedAlreadyCached,
-    /// Splice cleared `visible_frames`; capture skipped this frame.
-    RejectedSpliceClear,
     /// `caching_enabled == false` — DIRECT/PLAIN paint with no admission attempt.
+    /// Pair with `NotEligibleReason` on `PerCardFrameEvent` for the specific cause.
     RejectedNotEligible,
 }
+
+// NOTE: `RejectedSpliceClear` was removed in S521 Phase 2.7. It was a dead
+// variant — never emitted by any call site. The splice-driven disable is now
+// surfaced via `NotEligibleReason::Splice` on `PerCardFrameEvent`, which
+// records the *immediate* fork-side cause of `caching_enabled == false`.
+// Investigation per Rule 30 confirmed no consumer matched on it.
 
 impl AdmissionOutcome {
     /// Compact string used in NDJSON payloads.
@@ -103,8 +108,65 @@ impl AdmissionOutcome {
             Self::RejectedStreaming => "RejectedStreaming",
             Self::RejectedTransient => "RejectedTransient",
             Self::RejectedAlreadyCached => "RejectedAlreadyCached",
-            Self::RejectedSpliceClear => "RejectedSpliceClear",
             Self::RejectedNotEligible => "RejectedNotEligible",
+        }
+    }
+}
+
+/// Specific cause for `AdmissionOutcome::RejectedNotEligible`. Recorded as
+/// `last_disable_reason` on `ListStateInner` whenever `caching_enabled` flips
+/// to `false`, snapshotted into the per-card-frame event during paint. `None`
+/// for frames where admission_outcome is anything other than `RejectedNotEligible`.
+///
+/// Purpose: subdivide the lumped "PLAIN/RejectedNotEligible" bucket so the
+/// trace tells us WHICH gate caused the card to be cache-ineligible. The
+/// 977/6604 events at `RejectedNotEligible` in Klaus's S521 smoke trace
+/// previously carried no causal information.
+///
+/// **Scope: only causes of `caching_enabled == false`.** This enum does NOT
+/// cover `visible_frames.clear()` events from `scroll_to()` / `scroll_to_max()`.
+/// Those clears reset the per-item visible-frames counter; the next frame's
+/// affected cards emit `cache_state=TRANSIENT` + `admission=RejectedTransient`,
+/// not `RejectedNotEligible`. See the comment at the `visible_frames.clear()`
+/// site in `scroll_to_max()` for the disable-vs-clear distinction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotEligibleReason {
+    /// `set_item_caching_enabled(true)` has never been called this session —
+    /// either the global `ITEM_CACHING_ENABLED` atomic is `false` (S506
+    /// hotfix default) so view.rs never propagates an enable to the fork,
+    /// or the session simply hasn't reached a scroll/drag start yet.
+    NeverEnabled,
+    /// User explicitly disabled via F9 / Diagnostics panel toggle. Plumbed
+    /// from `cache_circuit_breaker::set_user_enabled(false)` through the
+    /// `disable_reason` parameter on `set_item_caching_enabled`.
+    UserDisabled,
+    /// Circuit breaker auto-tripped on violation density or surface health.
+    /// Plumbed from `cache_circuit_breaker::trip()` through the
+    /// `disable_reason` parameter on `set_item_caching_enabled`.
+    BreakerTripped,
+    /// Scroll animation ended normally (`velocity_converged`, `boundary_stop`,
+    /// `drag_end`, etc.) — `invalidate_all_item_caches()` flipped
+    /// `caching_enabled` to false. The expected steady-state at-rest cause.
+    ScrollStopped,
+    /// `splice_focusable()` or `splice_with_heights()` shifted item indices,
+    /// invalidating the entire cache. Frames immediately following a splice
+    /// are PLAIN until caching is re-enabled.
+    Splice,
+    /// `invalidate_all_caches()` — DPI / font / theme change forced a
+    /// global cache flush.
+    GlobalInvalidation,
+}
+
+impl NotEligibleReason {
+    /// Compact string used in NDJSON payloads.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NeverEnabled => "NeverEnabled",
+            Self::UserDisabled => "UserDisabled",
+            Self::BreakerTripped => "BreakerTripped",
+            Self::ScrollStopped => "ScrollStopped",
+            Self::Splice => "Splice",
+            Self::GlobalInvalidation => "GlobalInvalidation",
         }
     }
 }
@@ -149,6 +211,9 @@ pub struct PerCardFrameEvent {
     /// capture attempt). `Admitted` for HIT and successful MISS; `RejectedTooLarge`
     /// for cards that exceeded `max_texture_dimension_2d`; etc.
     pub admission_outcome: AdmissionOutcome,
+    /// Specific cause when `admission_outcome == RejectedNotEligible`. `None`
+    /// otherwise. Subdivides the lumped PLAIN bucket — see `NotEligibleReason`.
+    pub not_eligible_reason: Option<NotEligibleReason>,
     pub visible_frames_count: u32,
     /// `-1.0` if no cached_height yet (pre-stabilization).
     pub cached_height: f32,
@@ -275,6 +340,63 @@ static LAST_CARD_TYPE: LazyLock<Mutex<HashMap<usize, &'static str>>> =
 #[cfg(feature = "texture-cache-debug")]
 thread_local! {
     static PREPAINT_CARD_IDX: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// S521 Phase 2.7: thread-local "pending" disable reason set by cs-ui code
+/// that disables caching INDIRECTLY (i.e. via the cs-ui `ITEM_CACHING_ENABLED`
+/// atomic, not via the fork's `set_item_caching_enabled` API). The next
+/// fork-side disable event consumes this — picking up `BreakerTripped` or
+/// `UserDisabled` instead of the natural site-specific reason
+/// (e.g. `ScrollStopped` from `invalidate_all_item_caches`). The "next fork
+/// disable" is typically the scroll-stop call following a breaker trip;
+/// without this thread-local, the trace would attribute that disable to
+/// `ScrollStopped` and lose the actual root cause.
+///
+/// Lifecycle:
+/// 1. cs-ui calls `set_pending_external_disable_reason(BreakerTripped)`
+///    BEFORE flipping the cs-ui atomic.
+/// 2. The atomic flips; the fork's `caching_enabled` is still whatever it was.
+/// 3. Next scroll-stop / splice / global-invalidation on the fork side calls
+///    `take_pending_external_disable_reason()` and uses the returned `Some(X)`
+///    in preference to the site's natural reason.
+/// 4. If consumed: thread-local cleared. If no fork-side disable happens
+///    before the next external set, the new reason overwrites the stale one.
+#[cfg(feature = "texture-cache-debug")]
+thread_local! {
+    static PENDING_EXTERNAL_DISABLE_REASON: Cell<Option<NotEligibleReason>> =
+        const { Cell::new(None) };
+}
+
+/// Set the pending external disable reason. Called by cs-ui breaker trips
+/// and user-toggle paths immediately BEFORE flipping the cs-ui caching
+/// atomic. See `PENDING_EXTERNAL_DISABLE_REASON` lifecycle docs.
+#[inline]
+pub fn set_pending_external_disable_reason(reason: NotEligibleReason) {
+    #[cfg(feature = "texture-cache-debug")]
+    {
+        PENDING_EXTERNAL_DISABLE_REASON.with(|c| c.set(Some(reason)));
+    }
+    #[cfg(not(feature = "texture-cache-debug"))]
+    {
+        let _ = reason;
+    }
+}
+
+/// Consume the pending external disable reason if present, returning it and
+/// clearing the thread-local. Called by every fork-side disable site
+/// (`splice_focusable`, `splice_with_heights`, `invalidate_all_item_caches`,
+/// `invalidate_all_caches`) BEFORE writing its own natural reason. If `Some`,
+/// the external cause supersedes the site's natural cause.
+#[inline]
+pub fn take_pending_external_disable_reason() -> Option<NotEligibleReason> {
+    #[cfg(feature = "texture-cache-debug")]
+    {
+        PENDING_EXTERNAL_DISABLE_REASON.with(|c| c.take())
+    }
+    #[cfg(not(feature = "texture-cache-debug"))]
+    {
+        None
+    }
 }
 
 /// Per-card prepaint fingerprint recorded by vendor instrumentation. Frame-aware:
