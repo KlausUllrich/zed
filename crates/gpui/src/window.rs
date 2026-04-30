@@ -916,7 +916,12 @@ pub(crate) struct Frame {
 /// Made `pub` (with private fields) in S523 (L1) so `cs-conversation-list` can hold ranges
 /// across frames as opaque tokens. External code cannot construct one — only receive it
 /// via `Window::prepaint_index()`.
+//
+// `PartialEq + Eq + Debug` are gated to test contexts so external test code
+// can assert chain-forward range equality (see `cs-conversation-list` M2c
+// multi-card chain stability test). Zero production impact.
 #[derive(Clone, Default)]
+#[cfg_attr(any(test, feature = "test-support"), derive(PartialEq, Eq, Debug))]
 pub struct PrepaintStateIndex {
     pub(crate) hitboxes_index: usize,
     pub(crate) tooltips_index: usize,
@@ -932,7 +937,12 @@ pub struct PrepaintStateIndex {
 /// that range at a new scroll position.
 ///
 /// Made `pub` (with private fields) in S523 (L1) — see `PrepaintStateIndex` for rationale.
+//
+// `PartialEq + Eq + Debug` are gated to test contexts so external test code
+// can assert chain-forward range equality. See `PrepaintStateIndex` for
+// rationale.
 #[derive(Clone, Default)]
+#[cfg_attr(any(test, feature = "test-support"), derive(PartialEq, Eq, Debug))]
 pub struct PaintIndex {
     pub(crate) scene_index: usize,
     pub(crate) mouse_listeners_index: usize,

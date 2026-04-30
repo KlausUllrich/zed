@@ -419,7 +419,15 @@ struct FrameCache {
 /// Made `pub` (with private fields) in S523 (L1) so it can appear inside the
 /// also-`pub` `PrepaintStateIndex` and `PaintIndex` types. External code
 /// cannot construct one — only receive it via the layout-tracking APIs.
+//
+// `PartialEq + Eq + Debug` are gated to test contexts so external test code
+// can assert chain-forward range equality on `PrepaintStateIndex` /
+// `PaintIndex` (whose Range<T>::len() is otherwise inexpressible without
+// PartialEq on the index type). Zero production impact; structural equality
+// over usize fields is the natural semantic match. See `cs-conversation-list`
+// M2c-class chain-forward assertion for the consumer.
 #[derive(Clone, Default)]
+#[cfg_attr(any(test, feature = "test-support"), derive(PartialEq, Eq, Debug))]
 pub struct LineLayoutIndex {
     pub(crate) lines_index: usize,
     pub(crate) wrapped_lines_index: usize,
