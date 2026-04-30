@@ -22,9 +22,18 @@ use std::path::Path as StdPath;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// Default memory budget: 128MB (was 64MB; increased to reduce eviction thrash
-/// during fast scroll through 100+ cards — see GH #76).
-const DEFAULT_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
+/// Default memory budget: 1 GB (raised from 128MB at S522).
+///
+/// S522 trace evidence: pool stable at ~25% utilization on a ~30-card workload
+/// extrapolates to ~966 KB / card on average. Typical daily-driver scrollback
+/// (200+ cards) would exceed 128 MB and trigger eviction under normal use.
+/// On modern hardware (8-32 GB GPU memory typical), 1 GB is 3-12% of capacity —
+/// negligible cost, eliminates eviction risk for large scrollbacks.
+///
+/// History: 64 MB initial → 128 MB (GH #76, eviction thrash on 100+ cards) →
+/// 1 GB (S522, after S521 diagnostic surfaced under-provisioning extrapolation).
+/// See `tasks/_simmering/render-cache-and-fps/research/S522-*` for trace data.
+const DEFAULT_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Frames an item can be outside viewport+buffer before becoming Distant (~0.5s at 60fps).
 const RECENT_WINDOW: u64 = 30;
