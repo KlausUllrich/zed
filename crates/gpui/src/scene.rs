@@ -376,30 +376,58 @@ impl Primitive {
     }
 
     /// Translate all position data by the given offset.
-    /// Used by list render caching to replay paint operations at a new scroll position.
+    ///
+    /// Translates BOTH the primitive's bounds AND its content_mask. The mask is
+    /// in window coordinates and is set at paint time from the parent's clip
+    /// stack — when the primitive is replayed at a different scroll position,
+    /// the mask must move with it or the GPU shader culls primitives that now
+    /// fall outside the stale clip rect (visible symptom: text or quads
+    /// disappearing at scroll positions where the cached mask lies above/below
+    /// the visible area). The pre-S523 implementation only translated bounds;
+    /// `replay_with_y_offset` was shipped in S478 but never exercised in
+    /// production for moved-bounds replay until ConversationList (S523), so the
+    /// gap was latent. See: tasks/conversation-list/DECISIONS.md D14.
     pub fn translate(&mut self, offset: Point<ScaledPixels>) {
         match self {
-            Primitive::Shadow(s) => s.bounds.origin += offset,
-            Primitive::Quad(q) => q.bounds.origin += offset,
+            Primitive::Shadow(s) => {
+                s.bounds.origin += offset;
+                s.content_mask.bounds.origin += offset;
+            }
+            Primitive::Quad(q) => {
+                q.bounds.origin += offset;
+                q.content_mask.bounds.origin += offset;
+            }
             Primitive::Path(p) => {
                 p.bounds.origin += offset;
+                p.content_mask.bounds.origin += offset;
                 for vertex in &mut p.vertices {
                     vertex.xy_position += offset;
                 }
             }
-            Primitive::Underline(u) => u.bounds.origin += offset,
+            Primitive::Underline(u) => {
+                u.bounds.origin += offset;
+                u.content_mask.bounds.origin += offset;
+            }
             Primitive::MonochromeSprite(s) => {
                 s.bounds.origin += offset;
+                s.content_mask.bounds.origin += offset;
                 s.transformation.translation[0] += offset.x.0;
                 s.transformation.translation[1] += offset.y.0;
             }
             Primitive::SubpixelSprite(s) => {
                 s.bounds.origin += offset;
+                s.content_mask.bounds.origin += offset;
                 s.transformation.translation[0] += offset.x.0;
                 s.transformation.translation[1] += offset.y.0;
             }
-            Primitive::PolychromeSprite(s) => s.bounds.origin += offset,
-            Primitive::Surface(s) => s.bounds.origin += offset,
+            Primitive::PolychromeSprite(s) => {
+                s.bounds.origin += offset;
+                s.content_mask.bounds.origin += offset;
+            }
+            Primitive::Surface(s) => {
+                s.bounds.origin += offset;
+                s.content_mask.bounds.origin += offset;
+            }
         }
     }
 

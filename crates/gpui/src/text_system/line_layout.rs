@@ -414,12 +414,17 @@ struct FrameCache {
     used_wrapped_lines_by_hash: Vec<Arc<HashedCacheKey>>,
 }
 
+/// Index into the text layout cache at a particular point in time.
+///
+/// Made `pub` (with private fields) in S523 (L1) so it can appear inside the
+/// also-`pub` `PrepaintStateIndex` and `PaintIndex` types. External code
+/// cannot construct one — only receive it via the layout-tracking APIs.
 #[derive(Clone, Default)]
-pub(crate) struct LineLayoutIndex {
-    lines_index: usize,
-    wrapped_lines_index: usize,
-    lines_by_hash_index: usize,
-    wrapped_lines_by_hash_index: usize,
+pub struct LineLayoutIndex {
+    pub(crate) lines_index: usize,
+    pub(crate) wrapped_lines_index: usize,
+    pub(crate) lines_by_hash_index: usize,
+    pub(crate) wrapped_lines_by_hash_index: usize,
 }
 
 impl LineLayoutCache {

@@ -770,6 +770,18 @@ impl Hitbox {
     pub fn should_handle_scroll(&self, window: &Window) -> bool {
         self.id.should_handle_scroll(window)
     }
+
+    /// Translate the hitbox's bounds and content_mask by the given offset.
+    ///
+    /// Used by ConversationList layout-cache replay (S523, L1 path) to
+    /// reposition a cached hitbox to a new scroll position without re-running
+    /// paint. Both the hit-test rectangle and the clip rect must move together
+    /// so hover/click/selection still register correctly when the card has
+    /// scrolled.
+    pub fn translate(&mut self, offset: Point<Pixels>) {
+        self.bounds.origin += offset;
+        self.content_mask.bounds.origin += offset;
+    }
 }
 
 /// How the hitbox affects mouse behavior.
@@ -896,25 +908,39 @@ pub(crate) struct Frame {
     pub(crate) tab_stops: TabStopMap,
 }
 
+/// Index into the prepaint buffers (hitboxes, tooltips, deferred draws, dispatch tree, etc.)
+/// at a particular point in time. Pair `start..end` indices identify the range of prepaint
+/// data emitted between two snapshot points; `Window::reuse_prepaint_with_y_offset` replays
+/// that range at a new scroll position.
+///
+/// Made `pub` (with private fields) in S523 (L1) so `cs-conversation-list` can hold ranges
+/// across frames as opaque tokens. External code cannot construct one — only receive it
+/// via `Window::prepaint_index()`.
 #[derive(Clone, Default)]
-pub(crate) struct PrepaintStateIndex {
-    hitboxes_index: usize,
-    tooltips_index: usize,
-    deferred_draws_index: usize,
-    dispatch_tree_index: usize,
-    accessed_element_states_index: usize,
-    line_layout_index: LineLayoutIndex,
+pub struct PrepaintStateIndex {
+    pub(crate) hitboxes_index: usize,
+    pub(crate) tooltips_index: usize,
+    pub(crate) deferred_draws_index: usize,
+    pub(crate) dispatch_tree_index: usize,
+    pub(crate) accessed_element_states_index: usize,
+    pub(crate) line_layout_index: LineLayoutIndex,
 }
 
+/// Index into the paint buffers (scene primitives, mouse listeners, input handlers, etc.)
+/// at a particular point in time. Pair `start..end` indices identify the range of paint
+/// data emitted between two snapshot points; `Window::reuse_paint_with_y_offset` replays
+/// that range at a new scroll position.
+///
+/// Made `pub` (with private fields) in S523 (L1) — see `PrepaintStateIndex` for rationale.
 #[derive(Clone, Default)]
-pub(crate) struct PaintIndex {
-    scene_index: usize,
-    mouse_listeners_index: usize,
-    input_handlers_index: usize,
-    cursor_styles_index: usize,
-    accessed_element_states_index: usize,
-    tab_handle_index: usize,
-    line_layout_index: LineLayoutIndex,
+pub struct PaintIndex {
+    pub(crate) scene_index: usize,
+    pub(crate) mouse_listeners_index: usize,
+    pub(crate) input_handlers_index: usize,
+    pub(crate) cursor_styles_index: usize,
+    pub(crate) accessed_element_states_index: usize,
+    pub(crate) tab_handle_index: usize,
+    pub(crate) line_layout_index: LineLayoutIndex,
 }
 
 impl Frame {
@@ -2939,7 +2965,12 @@ impl Window {
         sorted_indices
     }
 
-    pub(crate) fn prepaint_index(&self) -> PrepaintStateIndex {
+    /// Snapshot the current prepaint-buffer indices.
+    ///
+    /// Made `pub` in S523 (L1) so external elements (e.g. `cs-conversation-list`)
+    /// can capture a `start..end` range across `prepaint` to later replay via
+    /// `reuse_prepaint_with_y_offset`.
+    pub fn prepaint_index(&self) -> PrepaintStateIndex {
         PrepaintStateIndex {
             hitboxes_index: self.next_frame.hitboxes.len(),
             tooltips_index: self.next_frame.tooltip_requests.len(),
@@ -3001,7 +3032,10 @@ impl Window {
         );
     }
 
-    pub(crate) fn paint_index(&self) -> PaintIndex {
+    /// Snapshot the current paint-buffer indices.
+    ///
+    /// Made `pub` in S523 (L1) — see `prepaint_index` for rationale.
+    pub fn paint_index(&self) -> PaintIndex {
         PaintIndex {
             scene_index: self.next_frame.scene.len(),
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
@@ -3048,6 +3082,176 @@ impl Window {
         self.next_frame.scene.replay(
             range.start.scene_index..range.end.scene_index,
             &self.rendered_frame.scene,
+        );
+    }
+
+    /// Replay a previously-captured prepaint range with a Y-offset applied.
+    ///
+    /// Used by ConversationList layout-cache replay (S523, L1 path) to reposition
+    /// a card's cached prepaint state — hitboxes, deferred draws, tooltip slots,
+    /// element-state references, dispatch subtree, text layouts — to a new scroll
+    /// position without re-running the card's `prepaint` body.
+    ///
+    /// The translation rules per buffer:
+    /// - **Hitboxes**: cloned and translated (`Hitbox::translate`) — bounds AND
+    ///   content_mask move together.
+    /// - **Tooltip requests**: `take()`d as-is — `TooltipRequest` carries no
+    ///   positional data; tooltips position themselves at hover time relative
+    ///   to the hovered hitbox.
+    /// - **Accessed element states**: cloned (no positional data).
+    /// - **Text layouts**: reused via `reuse_layouts` (shaped lines are
+    ///   position-independent — Y position is added when they're inserted into
+    ///   the scene as primitives, and `Scene::replay_with_y_offset` handles
+    ///   that during the paint phase).
+    /// - **Dispatch subtree**: reused via `reuse_subtree` with `refresh_node_id`
+    ///   on parent links. HitboxIds are stable across frames so subtree
+    ///   structure is unchanged.
+    /// - **Deferred draws**: cloned with `content_mask` and `absolute_offset`
+    ///   both translated by `y_offset`.
+    ///
+    /// `y_offset == Pixels::ZERO` early-returns to `reuse_prepaint` for zero overhead.
+    pub fn reuse_prepaint_with_y_offset(
+        &mut self,
+        range: Range<PrepaintStateIndex>,
+        y_offset: Pixels,
+    ) {
+        if y_offset == Pixels::ZERO {
+            return self.reuse_prepaint(range);
+        }
+        let offset_pixels = point(Pixels::ZERO, y_offset);
+
+        self.next_frame.hitboxes.extend(
+            self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
+                .iter()
+                .map(|hitbox| {
+                    let mut hitbox = hitbox.clone();
+                    hitbox.translate(offset_pixels);
+                    hitbox
+                }),
+        );
+        self.next_frame.tooltip_requests.extend(
+            self.rendered_frame.tooltip_requests
+                [range.start.tooltips_index..range.end.tooltips_index]
+                .iter_mut()
+                .map(|request| request.take()),
+        );
+        self.next_frame.accessed_element_states.extend(
+            self.rendered_frame.accessed_element_states[range.start.accessed_element_states_index
+                ..range.end.accessed_element_states_index]
+                .iter()
+                .map(|(id, type_id)| (id.clone(), *type_id)),
+        );
+        self.text_system
+            .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
+
+        let reused_subtree = self.next_frame.dispatch_tree.reuse_subtree(
+            range.start.dispatch_tree_index..range.end.dispatch_tree_index,
+            &mut self.rendered_frame.dispatch_tree,
+            self.focus,
+        );
+
+        if reused_subtree.contains_focus() {
+            self.next_frame.focus = self.focus;
+        }
+
+        self.next_frame.deferred_draws.extend(
+            self.rendered_frame.deferred_draws
+                [range.start.deferred_draws_index..range.end.deferred_draws_index]
+                .iter()
+                .map(|deferred_draw| DeferredDraw {
+                    current_view: deferred_draw.current_view,
+                    parent_node: reused_subtree.refresh_node_id(deferred_draw.parent_node),
+                    element_id_stack: deferred_draw.element_id_stack.clone(),
+                    text_style_stack: deferred_draw.text_style_stack.clone(),
+                    content_mask: deferred_draw.content_mask.as_ref().map(|mask| {
+                        let mut mask = mask.clone();
+                        mask.bounds.origin += offset_pixels;
+                        mask
+                    }),
+                    rem_size: deferred_draw.rem_size,
+                    priority: deferred_draw.priority,
+                    element: None,
+                    absolute_offset: deferred_draw.absolute_offset + offset_pixels,
+                    prepaint_range: deferred_draw.prepaint_range.clone(),
+                    paint_range: deferred_draw.paint_range.clone(),
+                }),
+        );
+    }
+
+    /// Replay a previously-captured paint range with a Y-offset applied.
+    ///
+    /// Used by ConversationList layout-cache replay (S523, L1 path) to reposition
+    /// a card's cached scene primitives + interactive state — cursor styles,
+    /// input handlers, mouse listeners, element-state references, tab stops,
+    /// text layouts, scene primitives — to a new scroll position without
+    /// re-running the card's `paint` body.
+    ///
+    /// The translation rules per buffer:
+    /// - **Cursor styles**: cloned (positions are derived from referenced
+    ///   hitboxes, which were translated in `reuse_prepaint_with_y_offset`).
+    /// - **Input handlers**: `take()`d — `PlatformInputHandler` is focus-tracked,
+    ///   not Y-positioned.
+    /// - **Mouse listeners**: `take()`d — `AnyMouseListener` is `Box<dyn FnMut>`,
+    ///   not cloneable. They reference HitboxIds (stable), not bounds, so no
+    ///   translation is needed. The frame-to-frame `take()`/re-emit chain
+    ///   preserves them across consecutive visible frames; offscreen-and-back
+    ///   requires a rebuild of the card per the L1 design (see
+    ///   tasks/conversation-list/DECISIONS.md D14).
+    /// - **Accessed element states**: cloned (no positional data).
+    /// - **Tab stops**: replayed as-is (focus order is HitboxId-keyed).
+    /// - **Text layouts**: reused via `reuse_layouts`.
+    /// - **Scene primitives**: replayed via `Scene::replay_with_y_offset` —
+    ///   each primitive's `Primitive::translate` updates BOTH bounds AND
+    ///   content_mask (the latter fixed in S523 — pre-fix, replayed primitives
+    ///   were silently culled at scroll positions where the cached mask lay
+    ///   outside the visible area).
+    ///
+    /// `y_offset == Pixels::ZERO` early-returns to `reuse_paint` for zero overhead.
+    pub fn reuse_paint_with_y_offset(
+        &mut self,
+        range: Range<PaintIndex>,
+        y_offset: Pixels,
+    ) {
+        if y_offset == Pixels::ZERO {
+            return self.reuse_paint(range);
+        }
+        let scaled_offset = ScaledPixels(y_offset.0 * self.scale_factor);
+
+        self.next_frame.cursor_styles.extend(
+            self.rendered_frame.cursor_styles
+                [range.start.cursor_styles_index..range.end.cursor_styles_index]
+                .iter()
+                .cloned(),
+        );
+        self.next_frame.input_handlers.extend(
+            self.rendered_frame.input_handlers
+                [range.start.input_handlers_index..range.end.input_handlers_index]
+                .iter_mut()
+                .map(|handler| handler.take()),
+        );
+        self.next_frame.mouse_listeners.extend(
+            self.rendered_frame.mouse_listeners
+                [range.start.mouse_listeners_index..range.end.mouse_listeners_index]
+                .iter_mut()
+                .map(|listener| listener.take()),
+        );
+        self.next_frame.accessed_element_states.extend(
+            self.rendered_frame.accessed_element_states[range.start.accessed_element_states_index
+                ..range.end.accessed_element_states_index]
+                .iter()
+                .map(|(id, type_id)| (id.clone(), *type_id)),
+        );
+        self.next_frame.tab_stops.replay(
+            &self.rendered_frame.tab_stops.insertion_history
+                [range.start.tab_handle_index..range.end.tab_handle_index],
+        );
+
+        self.text_system
+            .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
+        self.next_frame.scene.replay_with_y_offset(
+            range.start.scene_index..range.end.scene_index,
+            &self.rendered_frame.scene,
+            scaled_offset,
         );
     }
 
