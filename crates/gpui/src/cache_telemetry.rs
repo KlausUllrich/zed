@@ -309,7 +309,17 @@ fn with_prepaint_entry<F: FnOnce(&mut PrepaintFingerprint)>(f: F) -> bool {
         Some(idx) => idx,
         None => return false,
     };
-    let frame = crate::card_timeline::frame();
+    // S521 Bug 2b: anticipate the `bump_frame()` that runs at the START of
+    // `list.rs::fn paint()` (line ~2497) — the SOLE call site in the codebase.
+    // Vendor instrumentation runs during PREPAINT (BEFORE that bump), so writes
+    // here would tag fingerprints with FRAME=N. `end_card()` runs during PAINT
+    // (AFTER the bump) and reads FRAME=N+1; without this `+ 1`, the frame_id
+    // filter at line ~477 rejects every fingerprint as stale, and the
+    // md_render/writes/changed/cells fields emit as zero on every card.
+    // Encodes the single-bump-per-frame invariant — if a second `bump_frame()`
+    // is ever added in the GPUI fork, this asymmetric `+ 1` will misalign and
+    // the resulting all-zero regression points back to this comment.
+    let frame = crate::card_timeline::frame() + 1;
     if let Ok(mut reg) = PREPAINT_REGISTRY.lock() {
         let entry = reg.entry(idx).or_default();
         // Frame transition: stale fingerprint from a prior frame; reset before
