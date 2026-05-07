@@ -409,16 +409,21 @@ impl Primitive {
                 u.content_mask.bounds.origin += offset;
             }
             Primitive::MonochromeSprite(s) => {
+                // S530 C1 (S483 sprite double-offset fix, RE-APPLIED S531 after
+                // cargo reset --hard wiped local commit a27ff24fcb during a build):
+                // Do NOT update transformation.translation. The GPU shader sums
+                // bounds.origin + transformation.translation; updating both at
+                // replay time produces 2× scroll delta vs quads (visible symptom:
+                // background scrolls but text/sprites do not move with cards).
+                // See: project-docs/knowledge-base/patterns/rust/gpui-scene-level-render-cache.md
+                // lines 54-72 and tasks/conversation-list/research/S530-chap-scroll-paint-coordination.md.
                 s.bounds.origin += offset;
                 s.content_mask.bounds.origin += offset;
-                s.transformation.translation[0] += offset.x.0;
-                s.transformation.translation[1] += offset.y.0;
             }
             Primitive::SubpixelSprite(s) => {
+                // S530 C1 (same pattern as MonochromeSprite above) — re-applied S531.
                 s.bounds.origin += offset;
                 s.content_mask.bounds.origin += offset;
-                s.transformation.translation[0] += offset.x.0;
-                s.transformation.translation[1] += offset.y.0;
             }
             Primitive::PolychromeSprite(s) => {
                 s.bounds.origin += offset;
