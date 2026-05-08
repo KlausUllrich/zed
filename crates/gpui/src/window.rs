@@ -3341,6 +3341,38 @@ impl Window {
         }
     }
 
+    /// Invoke `f` with the entire content mask stack temporarily replaced by a
+    /// single full-bounds mask. Saves the ancestor stack, pushes `replacement`,
+    /// runs `f`, then restores the saved stack.
+    ///
+    /// Differs from [`Window::with_content_mask`], which INTERSECTS the new mask
+    /// with the current stack and pushes. This method REPLACES the entire stack.
+    ///
+    /// Used during chained-replay cache MISS / Fresh capture (e.g. `gpui::List`
+    /// MISS at `elements/list.rs`, `cs-conversation-list` Fresh re-entry at
+    /// `card.rs`): ancestor viewport masks would cause primitive insertion to
+    /// silently drop content outside the viewport (`scene.rs:116-124`), leaving
+    /// the cache with a partial range that replays as a blank card. Display-side
+    /// viewport clipping is applied separately at replay time, so the capture
+    /// must see all primitives in the captured range.
+    ///
+    /// **Panic safety**: if `f` panics, the stack is left replaced rather than
+    /// restored. Acceptable because GPUI panics are app-fatal — same posture as
+    /// the original `gpui::List` MISS-capture pattern this helper extracts.
+    #[inline]
+    pub fn with_content_mask_stack_replaced<R>(
+        &mut self,
+        replacement: ContentMask<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint_or_prepaint();
+        let ancestors = std::mem::take(&mut self.content_mask_stack);
+        self.content_mask_stack.push(replacement);
+        let result = f(self);
+        self.content_mask_stack = ancestors;
+        result
+    }
+
     /// Updates the global element offset relative to the current offset. This is used to implement
     /// scrolling. This method should only be called during the prepaint phase of element drawing.
     pub fn with_element_offset<R>(
