@@ -251,7 +251,8 @@ impl WindowInvalidator {
         let set_dirty = inner.draw_phase == DrawPhase::None;
         #[cfg(feature = "texture-cache-debug")]
         log::info!(
-            "event=invalidator_set_dirty source={} defeated={}",
+            "event=invalidator_set_dirty entity={:?} source={} defeated={}",
+            entity,
             core::panic::Location::caller(),
             if set_dirty { "F" } else { "T" },
         );
@@ -2676,6 +2677,12 @@ impl Window {
 
     fn invalidate_entities(&mut self) {
         let mut views = self.invalidator.take_views();
+        #[cfg(feature = "texture-cache-debug")]
+        log::info!(
+            "event=invalidator_drain count={} entities={:?}",
+            views.len(),
+            views
+        );
         for entity in views.drain() {
             self.mark_view_dirty(entity);
         }

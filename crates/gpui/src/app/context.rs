@@ -226,7 +226,15 @@ impl<'a, T: 'static> Context<'a, T> {
     }
 
     /// Tell GPUI that this entity has changed and observers of it should be notified.
+    #[track_caller]
     pub fn notify(&mut self) {
+        #[cfg(feature = "texture-cache-debug")]
+        log::info!(
+            "event=cx_notify_source entity={:?} type={} caller={}",
+            self.entity_state.entity_id,
+            std::any::type_name::<T>(),
+            core::panic::Location::caller(),
+        );
         self.app.notify(self.entity_state.entity_id);
     }
 
