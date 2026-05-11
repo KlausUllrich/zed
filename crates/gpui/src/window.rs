@@ -2524,6 +2524,61 @@ impl Window {
         self.invalidator.set_dirty(false);
         self.requested_autoscroll = None;
 
+        // CS S537 Lever 1: gate per-frame draw on dirty_views=0 && !refreshing.
+        // When no Render-tree entity is dirty and no full-refresh is pending,
+        // skip prepaint + Taffy + paint sub-phases entirely and reuse the prior
+        // frame's scene via the existing `present_only` path at window.rs ~1503.
+        //
+        // Empirical evidence (S537 trace /tmp/cs-trace-10050/, sage axis-2 §1.2):
+        // dirty_views=0 on 1306/1306 painted frames; taffy_layout averaging
+        // 3.07 ms per frame regardless. The 2 inter-frame
+        // `invalidator_set_dirty defeated=F` events dirty non-Render-tree
+        // state entities — they trigger `will_draw=true` via
+        // `WindowInvalidator.is_dirty()` (window.rs:1471) but
+        // `invalidate_entities()` filters them out via `mark_view_dirty()`
+        // before they reach `Window.dirty_views`. This gate codifies what
+        // gpui's existing per-entity reuse path at view.rs:159 already does
+        // for individual Render entities.
+        //
+        // Correctness invariant (path (ii) per trac dispatch): this gate
+        // assumes `App.pending_effects` is empty at Window::draw entry —
+        // i.e., `App::update` calls `flush_effects` (app.rs:898) before
+        // any draw is issued. `pending_effects` is module-private to
+        // `gpui::app` at pin 53bd92111d so it is not accessible from this
+        // module without widening visibility. If that ordering invariant
+        // ever changes, the gate must additionally check
+        // `cx.pending_effects.is_empty()` (after exposing it via
+        // `pub(crate)` or an accessor method) — OR the gate must be
+        // removed.
+        //
+        // Reference: users/klaus/tasks/conversation-list/research/S537-axis2-sage-empirical-trace-decomposition.md §7.1
+        if self.dirty_views.is_empty() && !self.refreshing {
+            #[cfg(feature = "texture-cache-debug")]
+            log::info!("event=window_draw_skipped dirty_views=0 refreshing=false");
+            // Maintain the invariants the post-`draw_roots` tail (lines
+            // ~2543-2586) would have set, so the next compositor callback
+            // can hit the existing present_only path at window.rs:1503-1506
+            // with the prior frame's `rendered_frame.scene`:
+            //   - `needs_present=true` gates the present_only mechanism
+            //   - `invalidator` phase resets to `None` for next frame's
+            //     defeated-dirty-tracking logic at window.rs:240-264
+            // Operations skipped on this path (each is safe to skip when no
+            // work was done): input handler take/set (no draw_roots →
+            // nothing to swap), `layout_engine.clear` (empty entering — the
+            // last drawn frame cleared it, this gated frame added no
+            // requests), `text_system().finish_frame` (no shaping happened),
+            // `next_frame.finish` + frame swap (rendered_frame stays as
+            // the prior scene, which is exactly what present_only re-
+            // presents), focus-path comparison (refreshing=false implies
+            // focus didn't change — bounds_changed/activate would have
+            // forced refreshing=true), record_entities_accessed +
+            // reset_cursor_style (no entities accessed; cursor depends on
+            // hit-test which didn't run).
+            self.needs_present.set(true);
+            self.invalidator.set_phase(DrawPhase::None);
+            return ArenaClearNeeded::new(&cx.element_arena);
+        }
+
         // Restore the previously-used input handler.
         if let Some(input_handler) = self.platform_window.take_input_handler() {
             self.rendered_frame.input_handlers.push(Some(input_handler));
