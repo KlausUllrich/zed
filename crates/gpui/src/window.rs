@@ -2552,6 +2552,12 @@ impl Window {
         // removed.
         //
         // Reference: users/klaus/tasks/conversation-list/research/S537-axis2-sage-empirical-trace-decomposition.md §7.1
+        #[cfg(feature = "texture-cache-debug")]
+        log::info!(
+            "event=window_draw_gate_check dirty_views={} refreshing={}",
+            self.dirty_views.len(),
+            self.refreshing
+        );
         if self.dirty_views.is_empty() && !self.refreshing {
             #[cfg(feature = "texture-cache-debug")]
             log::info!("event=window_draw_skipped dirty_views=0 refreshing=false");
