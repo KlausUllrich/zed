@@ -1116,6 +1116,11 @@ pub struct Window {
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
+    /// CS S538 Hop 2 Tracer A: per-entity last-seen Taffy-input hash.
+    /// Populated lazily on `request_layout`; persists across frames (no per-frame clear).
+    /// Used only by the `entity_taffy_input` event under `texture-cache-debug`.
+    #[cfg(feature = "texture-cache-debug")]
+    pub(crate) entity_taffy_input_hashes: FxHashMap<EntityId, u64>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     default_prevented: bool,
@@ -1689,6 +1694,8 @@ impl Window {
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
             dirty_views: FxHashSet::default(),
+            #[cfg(feature = "texture-cache-debug")]
+            entity_taffy_input_hashes: FxHashMap::default(),
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
             default_prevented: true,
@@ -1766,12 +1773,30 @@ impl Window {
     fn mark_view_dirty(&mut self, view_id: EntityId) {
         // Mark ancestor views as dirty. If already in the `dirty_views` set, then all its ancestors
         // should already be dirty.
+        // CS S538 Hop 2 Tracer B: preserve the originating leaf id (the loop shadows `view_id`)
+        // and emit one `ancestor_walk_step` per iteration so we can attribute spurious ancestors.
+        #[cfg(feature = "texture-cache-debug")]
+        let leaf_entity = view_id;
+        #[cfg(feature = "texture-cache-debug")]
+        let mut step: usize = 0;
         for view_id in self
             .rendered_frame
             .dispatch_tree
             .view_path_reversed(view_id)
         {
-            if !self.dirty_views.insert(view_id) {
+            let already_dirty = !self.dirty_views.insert(view_id);
+            #[cfg(feature = "texture-cache-debug")]
+            {
+                log::info!(
+                    "event=ancestor_walk_step root_entity={:?} step={} walking_entity={:?} already_dirty={}",
+                    leaf_entity,
+                    step,
+                    view_id,
+                    already_dirty,
+                );
+                step += 1;
+            }
+            if already_dirty {
                 break;
             }
         }
@@ -1840,7 +1865,17 @@ impl Window {
     }
 
     /// Mark the window as dirty, scheduling it to be redrawn on the next frame.
+    // CS S538 Hop 2 Tracer C: `#[track_caller]` makes `Location::caller()` resolve to the call
+    // site (e.g. an event handler in `crates/gpui/src/elements/div.rs`), letting us count which
+    // of duo's 12 refresh-call-sites actually fire under real workloads. Emit BEFORE the
+    // `not_drawing()` guard so we also see calls silenced by draw-phase coalescing.
+    #[track_caller]
     pub fn refresh(&mut self) {
+        #[cfg(feature = "texture-cache-debug")]
+        log::info!(
+            "event=window_refresh_called caller={}",
+            core::panic::Location::caller(),
+        );
         if self.invalidator.not_drawing() {
             self.refreshing = true;
             self.invalidator.set_dirty(true);
@@ -4458,6 +4493,27 @@ impl Window {
         cx.layout_id_buffer.extend(children);
         let rem_size = self.rem_size();
         let scale_factor = self.scale_factor();
+
+        // CS S538 Hop 2 Tracer A: log this entity's Taffy input (style + child count) and
+        // whether it changed vs the last call attributed to the same entity. Per-entity keying
+        // means intra-frame multi-element renders have last-wins semantics; analysis aggregates
+        // across frames. Hash via seahash over the Debug repr — Style has no `Hash` derive.
+        #[cfg(feature = "texture-cache-debug")]
+        if let Some(entity_id) = self.rendered_entity_stack.last().copied() {
+            let children_count = cx.layout_id_buffer.len();
+            let style_hash = seahash::hash(
+                format!("{:?}|{}", style, children_count).as_bytes(),
+            );
+            let prev_hash = self.entity_taffy_input_hashes.insert(entity_id, style_hash);
+            let changed_from_prev = prev_hash != Some(style_hash);
+            log::info!(
+                "event=entity_taffy_input entity={:?} style_hash={} children_count={} changed_from_prev={}",
+                entity_id,
+                style_hash,
+                children_count,
+                changed_from_prev,
+            );
+        }
 
         self.layout_engine.as_mut().unwrap().request_layout(
             style,
