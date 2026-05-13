@@ -628,8 +628,12 @@ impl ListState {
             }
         }
 
-        // Invalidate scene caches: spliced items are gone, items after have shifted.
-        state.item_scene_cache.clear();
+        // Invalidate scene caches for items at/after the splice point — their
+        // indices shifted or they were replaced. Items before the splice point
+        // are unchanged and their cached scenes remain valid. Preserving these
+        // entries prevents full re-render of visible items during scroll when
+        // new items are appended at the end (the common streaming case).
+        state.item_scene_cache.retain(|&index, _| index < old_range.start);
     }
 
     /// Like [`Self::splice`], but each new item carries an estimated height for
@@ -674,8 +678,12 @@ impl ListState {
             }
         }
 
-        // Invalidate scene caches: spliced items are gone, items after have shifted.
-        state.item_scene_cache.clear();
+        // Invalidate scene caches for items at/after the splice point — their
+        // indices shifted or they were replaced. Items before the splice point
+        // are unchanged and their cached scenes remain valid. Preserving these
+        // entries prevents full re-render of visible items during scroll when
+        // new items are appended at the end (the common streaming case).
+        state.item_scene_cache.retain(|&index, _| index < old_range.start);
     }
 
     /// Set a handler that will be called when the list is scrolled.
@@ -900,13 +908,16 @@ impl ListState {
                 // jumps when items are re-measured with large height deltas
                 // (e.g., scroll-up through items with estimated heights).
                 // The lerp (30%) tracks streaming growth well for small deltas.
-                // The cap (5px/frame) prevents visible jumps on large one-time
-                // deltas: 5px in total-height space ≈ <0.1px in thumb size.
+                // Proportional cap (0.5% of live height) scales with content size:
+                // 5000px content → 25px/frame, 50000px → 250px/frame.
+                // The old fixed 5px/frame cap caused visible thumb lag during fast
+                // scroll — at 60fps it tracked only 300px/s, but height deltas of
+                // 50-200px/frame are common during scroll through estimated items.
                 let smoothed = match state.smoothed_scrollbar_height {
                     Some(prev) => {
                         let delta = live_height - prev;
                         let lerp_step = delta * 0.3;
-                        let max_step = px(5.0);
+                        let max_step = Pixels(live_height.0 * 0.005);
                         let step = if lerp_step.0.abs() > max_step.0 {
                             Pixels(max_step.0 * lerp_step.0.signum())
                         } else {
