@@ -192,7 +192,17 @@ impl Scene {
         if y_offset == ScaledPixels(0.0) {
             return self.replay(range, prev_scene);
         }
-        let offset = point(ScaledPixels(0.0), y_offset);
+        // Floor y_offset to integer ScaledPixels to preserve the integer-pixel
+        // invariant established at fresh paint by `paint_glyph` (window.rs:
+        // `glyph_origin.map(|px| px.floor())`). Without the snap, replayed
+        // subpixel-AA glyphs land at fractional ScaledPixel rows, producing
+        // cap-top/descender 1-2px clip + cyan/red LCD-subpixel chromatic banding
+        // (cs-app issue #162). The floored offset propagates additively through
+        // `Primitive::translate` to every variant's bounds + content_mask;
+        // flooring at this single site covers all downstream translations.
+        // See: cs-app GH #162; fix landed S542; rex research:
+        //   tasks/conversation-list/research/S542-rex-162-paint-cache-replay-subpixel-bleed.md §2.
+        let offset = point(ScaledPixels(0.0), y_offset.floor());
         for operation in &prev_scene.paint_operations[range] {
             match operation {
                 PaintOperation::Primitive(primitive) => {
