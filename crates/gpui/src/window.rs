@@ -19,8 +19,6 @@ use crate::{
     WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
     point, prelude::*, px, rems, size, transparent_black,
 };
-#[cfg(feature = "texture-cache")]
-use crate::CacheRegionId;
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
 #[cfg(target_os = "macos")]
@@ -56,118 +54,6 @@ use std::{
     time::Duration,
 };
 use uuid::Uuid;
-
-// CS S503 (GH #90): shared thread-local trace state for the 1.5s
-// transition-outlier investigation. The on_request_frame closure (gpui), the
-// wayland dispatch handler (gpui_linux), and the wgpu frame-present path
-// (gpui_wgpu) all run on the main thread and each hold a timestamp the others
-// need to partition the dispatch → wake → draw → present → feedback pipeline.
-// All state and API feature-gated under `texture-cache-debug`; zero cost in
-// release builds. `pub use` re-exports the helpers at the crate root so sibling
-// crates can call `gpui::record_frame_callback_arrival()` etc.
-#[cfg(feature = "texture-cache-debug")]
-mod s503_trace {
-    use std::cell::Cell;
-    use std::time::Instant;
-
-    thread_local! {
-        static LAST_FRAME_CALLBACK_AT: Cell<Option<Instant>> = const { Cell::new(None) };
-        static LAST_FRAME_PRESENT_END_AT: Cell<Option<Instant>> = const { Cell::new(None) };
-        static LAST_SURFACE_COMMIT_AT: Cell<Option<Instant>> = const { Cell::new(None) };
-        static REQUEST_FRAME_SEQ: Cell<u64> = const { Cell::new(0) };
-        static LAST_COMMITTED_FRAME_SEQ: Cell<u64> = const { Cell::new(0) };
-    }
-
-    /// Sentinel emitted into trace lines when an `Option<f32>` metric has no
-    /// prior sample yet (first wake of the session). Chosen negative so it's
-    /// grep-distinguishable from any real millisecond gap — real gaps are
-    /// always ≥ 0 — and still sorts sensibly against numeric values.
-    pub const NO_PRIOR_SAMPLE: f32 = -1.0;
-
-    /// Called by gpui_linux when a `wl_callback::Done` arrives. Returns the
-    /// gap (ms) since the previous arrival — None only on the first wake of
-    /// the process. Powers the `since_last_ms` field on `wayland_frame_callback`.
-    pub fn record_frame_callback_arrival() -> Option<f32> {
-        LAST_FRAME_CALLBACK_AT.with(|c| {
-            let now = Instant::now();
-            let prev = c.replace(Some(now));
-            prev.map(|t| now.duration_since(t).as_secs_f32() * 1000.0)
-        })
-    }
-
-    /// Milliseconds since the last frame-callback arrival. Read by the
-    /// on_request_frame closure to emit `since_callback_ms` — distinguishes
-    /// C1 (compositor silent) from CS-main-blocked (Done fired, closure late).
-    pub fn since_last_frame_callback_ms() -> Option<f32> {
-        LAST_FRAME_CALLBACK_AT.with(|c| c.get().map(|t| t.elapsed().as_secs_f32() * 1000.0))
-    }
-
-    /// Called by gpui_wgpu when `frame.present()` returns.
-    pub fn record_frame_present_end() {
-        LAST_FRAME_PRESENT_END_AT.with(|c| c.set(Some(Instant::now())));
-    }
-
-    /// Milliseconds since the last frame.present() completion. Read by the
-    /// wayland presentation-feedback handler to emit `since_present_ms` —
-    /// compositor-internal display queueing latency (C4 detector).
-    pub fn since_last_frame_present_end_ms() -> Option<f32> {
-        LAST_FRAME_PRESENT_END_AT.with(|c| c.get().map(|t| t.elapsed().as_secs_f32() * 1000.0))
-    }
-
-    /// Monotonic request-frame sequence. Used as `paint_frame=N` on
-    /// request_frame_entry / request_frame_decision so downstream events
-    /// (window_draw_start, wayland_surface_commit, …) can be correlated to
-    /// the wake that initiated them. Distinct from ListState::paint_frame_count,
-    /// which only increments when list.paint actually runs.
-    pub fn next_request_frame_seq() -> u64 {
-        REQUEST_FRAME_SEQ.with(|c| {
-            let n = c.get().wrapping_add(1);
-            c.set(n);
-            n
-        })
-    }
-
-    /// Current in-flight request-frame sequence without incrementing. Read by
-    /// wayland_surface_commit (which runs in-wake — same seq as the entry that
-    /// started it).
-    pub fn current_request_frame_seq() -> u64 {
-        REQUEST_FRAME_SEQ.with(|c| c.get())
-    }
-
-    /// Stamp the paint_frame of the wake that issued the most recent commit.
-    /// Read later by the async presentation-feedback handler so `Presented`
-    /// events can be tied back to the wake whose buffer they describe.
-    pub fn record_surface_commit_seq(seq: u64) {
-        LAST_COMMITTED_FRAME_SEQ.with(|c| c.set(seq));
-    }
-
-    /// paint_frame of the most recent surface commit.
-    pub fn last_committed_frame_seq() -> u64 {
-        LAST_COMMITTED_FRAME_SEQ.with(|c| c.get())
-    }
-
-    /// CS S514 P0: stamp the wall-clock instant of the most recent
-    /// `surface.commit()` so the next `request_frame_entry` can report
-    /// `since_commit_ms` — the wait between us handing a frame to the
-    /// compositor and the compositor waking us for the next frame.
-    /// Disambiguates compositor-pacing (large value) from GPUI scheduler
-    /// latency (callback-fast, draw-slow). Called from the wayland
-    /// `completed_frame()` impl immediately after `surface.commit()`.
-    pub fn record_surface_commit_at() {
-        LAST_SURFACE_COMMIT_AT.with(|c| c.set(Some(Instant::now())));
-    }
-
-    /// Milliseconds since the most recent `surface.commit()`. Read by the
-    /// `on_request_frame` closure to emit `since_commit_ms` on
-    /// `request_frame_entry`. None only on the first wake of the process
-    /// (before any commit has occurred).
-    pub fn since_last_surface_commit_ms() -> Option<f32> {
-        LAST_SURFACE_COMMIT_AT.with(|c| c.get().map(|t| t.elapsed().as_secs_f32() * 1000.0))
-    }
-}
-
-#[cfg(feature = "texture-cache-debug")]
-pub use s503_trace::*;
 
 mod prompts;
 
@@ -237,26 +123,10 @@ impl WindowInvalidator {
         }
     }
 
-    // CS S504 (GH #90 round-3, rex §5): `#[track_caller]` + event-emit source
-    // attribution for the dirty-flow race. `defeated=T` means the notify arrived
-    // during draw_phase != None and was silently swallowed (the else branch). The
-    // caller location propagates via `#[track_caller]`; without a matching attribute
-    // on every intermediate fn (App::notify → Context::notify → cx.notify) the
-    // nearest attributed caller is logged — CS-side origin is logged separately
-    // via cx_notify_outcome for correlation.
-    #[track_caller]
     pub fn invalidate_view(&self, entity: EntityId, cx: &mut App) -> bool {
         let mut inner = self.inner.borrow_mut();
         inner.dirty_views.insert(entity);
-        let set_dirty = inner.draw_phase == DrawPhase::None;
-        #[cfg(feature = "texture-cache-debug")]
-        log::info!(
-            "event=invalidator_set_dirty entity={:?} source={} defeated={}",
-            entity,
-            core::panic::Location::caller(),
-            if set_dirty { "F" } else { "T" },
-        );
-        if set_dirty {
+        if inner.draw_phase == DrawPhase::None {
             inner.dirty = true;
             cx.push_effect(Effect::Notify { emitter: entity });
             true
@@ -1054,22 +924,12 @@ impl Frame {
     }
 
     pub(crate) fn finish(&mut self, prev_frame: &mut Self) {
-        let states_before = prev_frame.element_states.len();
         for element_state_key in &self.accessed_element_states {
             if let Some((element_state_key, element_state)) =
                 prev_frame.element_states.remove_entry(element_state_key)
             {
                 self.element_states.insert(element_state_key, element_state);
             }
-        }
-        let dropped = prev_frame.element_states.len();
-        if dropped > 0 {
-            crate::card_timeline::log_event(&format!(
-                "[state_gc] states_before={} states_after={} dropped={}",
-                states_before,
-                states_before - dropped,
-                dropped,
-            ));
         }
 
         self.scene.finish();
@@ -1116,11 +976,6 @@ pub struct Window {
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
-    /// CS S538 Hop 2 Tracer A: per-entity last-seen Taffy-input hash.
-    /// Populated lazily on `request_layout`; persists across frames (no per-frame clear).
-    /// Used only by the `entity_taffy_input` event under `texture-cache-debug`.
-    #[cfg(feature = "texture-cache-debug")]
-    pub(crate) entity_taffy_input_hashes: FxHashMap<EntityId, u64>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     default_prevented: bool,
@@ -1388,40 +1243,6 @@ impl Window {
             let next_frame_callbacks = next_frame_callbacks.clone();
             let input_rate_tracker = input_rate_tracker.clone();
             move |request_frame_options| {
-                // CS S503 (GH #90): wake-entry telemetry. Emit BEFORE the thermal
-                // check so every compositor wake is observable, even on the early-
-                // return path. `paint_frame` correlates with downstream events
-                // emitted later in this wake; `since_callback_ms` is the gap from
-                // wl_callback::Done arrival to this closure entry (distinguishes
-                // C1 compositor-silent from CS-main-blocked).
-                #[cfg(feature = "texture-cache-debug")]
-                let paint_frame = next_request_frame_seq();
-                #[cfg(feature = "texture-cache-debug")]
-                let since_callback_ms =
-                    since_last_frame_callback_ms().unwrap_or(NO_PRIOR_SAMPLE);
-                // CS S514 P0: gap from this wake's preceding `surface.commit()`
-                // to closure entry — the dominant unaccounted ~7 ms median in
-                // S513 smoke. Large value → compositor-side pacing (we wait on
-                // wl_callback). Small value → GPUI scheduler latency between
-                // callback and draw_start (the next bracket downstream).
-                #[cfg(feature = "texture-cache-debug")]
-                let since_commit_ms =
-                    since_last_surface_commit_ms().unwrap_or(NO_PRIOR_SAMPLE);
-                #[cfg(feature = "texture-cache-debug")]
-                log::info!(
-                    "event=request_frame_entry paint_frame={} dirty={} force_render={} \
-                     needs_present_flag={} next_frame_cbs={} \
-                     input_high_rate={} since_callback_ms={:.1} since_commit_ms={:.1}",
-                    paint_frame,
-                    invalidator.is_dirty(),
-                    request_frame_options.force_render,
-                    needs_present.get(),
-                    next_frame_callbacks.borrow().len(),
-                    input_rate_tracker.borrow().is_high_rate(),
-                    since_callback_ms,
-                    since_commit_ms,
-                );
-
                 let thermal_state = handle
                     .update(&mut cx, |_, _, cx| cx.thermal_state())
                     .log_err();
@@ -1435,20 +1256,6 @@ impl Window {
                     if let Some(last_frame) = last_frame_time
                         && now.duration_since(last_frame) < Duration::from_micros(16667)
                     {
-                        // CS S503 (GH #90, sage rev #3): the thermal early-return
-                        // skips complete_frame → surface.commit, which leaves the
-                        // wayland compositor unnotified. Currently unreachable on
-                        // Linux (ThermalState always Nominal per kb S481), but a
-                        // future regression would be silently mis-attributed to
-                        // compositor behavior without this emit. `since_callback_ms`
-                        // included so all `request_frame_decision` emits share one
-                        // schema — keeps grep/jq readers honest.
-                        #[cfg(feature = "texture-cache-debug")]
-                        log::info!(
-                            "event=request_frame_decision paint_frame={} action=thermal_return \
-                             state={:?} since_callback_ms={:.1}",
-                            paint_frame, thermal_state, since_callback_ms
-                        );
                         return;
                     }
                 }
@@ -1471,32 +1278,7 @@ impl Window {
                     || needs_present.get()
                     || (active.get() && input_rate_tracker.borrow_mut().is_high_rate());
 
-                // CS S503 (GH #90): cache dirty once so the decision emit and the
-                // branch predicate read identical values (narrow race tolerance).
-                let is_dirty = invalidator.is_dirty();
-                let will_draw = is_dirty || request_frame_options.force_render;
-
-                #[cfg(feature = "texture-cache-debug")]
-                {
-                    let action: &'static str = if will_draw {
-                        "draw"
-                    } else if needs_present {
-                        "present_only"
-                    } else {
-                        "skip"
-                    };
-                    log::info!(
-                        "event=request_frame_decision paint_frame={} action={} dirty={} \
-                         force_render={} needs_present={}",
-                        paint_frame,
-                        action,
-                        is_dirty,
-                        request_frame_options.force_render,
-                        needs_present
-                    );
-                }
-
-                if will_draw {
+                if invalidator.is_dirty() || request_frame_options.force_render {
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
@@ -1694,8 +1476,6 @@ impl Window {
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
             dirty_views: FxHashSet::default(),
-            #[cfg(feature = "texture-cache-debug")]
-            entity_taffy_input_hashes: FxHashMap::default(),
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
             default_prevented: true,
@@ -1773,30 +1553,12 @@ impl Window {
     fn mark_view_dirty(&mut self, view_id: EntityId) {
         // Mark ancestor views as dirty. If already in the `dirty_views` set, then all its ancestors
         // should already be dirty.
-        // CS S538 Hop 2 Tracer B: preserve the originating leaf id (the loop shadows `view_id`)
-        // and emit one `ancestor_walk_step` per iteration so we can attribute spurious ancestors.
-        #[cfg(feature = "texture-cache-debug")]
-        let leaf_entity = view_id;
-        #[cfg(feature = "texture-cache-debug")]
-        let mut step: usize = 0;
         for view_id in self
             .rendered_frame
             .dispatch_tree
             .view_path_reversed(view_id)
         {
-            let already_dirty = !self.dirty_views.insert(view_id);
-            #[cfg(feature = "texture-cache-debug")]
-            {
-                log::info!(
-                    "event=ancestor_walk_step root_entity={:?} step={} walking_entity={:?} already_dirty={}",
-                    leaf_entity,
-                    step,
-                    view_id,
-                    already_dirty,
-                );
-                step += 1;
-            }
-            if already_dirty {
+            if !self.dirty_views.insert(view_id) {
                 break;
             }
         }
@@ -1865,17 +1627,7 @@ impl Window {
     }
 
     /// Mark the window as dirty, scheduling it to be redrawn on the next frame.
-    // CS S538 Hop 2 Tracer C: `#[track_caller]` makes `Location::caller()` resolve to the call
-    // site (e.g. an event handler in `crates/gpui/src/elements/div.rs`), letting us count which
-    // of duo's 12 refresh-call-sites actually fire under real workloads. Emit BEFORE the
-    // `not_drawing()` guard so we also see calls silenced by draw-phase coalescing.
-    #[track_caller]
     pub fn refresh(&mut self) {
-        #[cfg(feature = "texture-cache-debug")]
-        log::info!(
-            "event=window_refresh_called caller={}",
-            core::panic::Location::caller(),
-        );
         if self.invalidator.not_drawing() {
             self.refreshing = true;
             self.invalidator.set_dirty(true);
@@ -2175,17 +1927,7 @@ impl Window {
     /// It will cause the window to redraw on the next frame, even if no other changes have occurred.
     ///
     /// If called from within a view, it will notify that view on the next frame. Otherwise, it will refresh the entire window.
-    // CS S504 (GH #90 round-3, rex §5): `#[track_caller]` + event-emit reveals
-    // which code path schedules the next-frame wake. Paired with
-    // invalidator_set_dirty in rex's round-3 trace analysis to answer
-    // "during a residual stall, which caller finally breaks the silence?"
-    #[track_caller]
     pub fn request_animation_frame(&self) {
-        #[cfg(feature = "texture-cache-debug")]
-        log::info!(
-            "event=raf_scheduled caller={}",
-            core::panic::Location::caller(),
-        );
         let entity = self.current_view();
         self.on_next_frame(move |_, cx| cx.notify(entity));
     }
@@ -2542,18 +2284,6 @@ impl Window {
         // This ensures that multiple test Apps have isolated arenas.
         let _arena_scope = ElementArenaScope::enter(&cx.element_arena);
 
-        // CS S499: bracket the entirety of Window::draw so trace analysis can
-        // separate "inside draw" time (paint-pipeline cost) from "outside draw"
-        // time (wgpu submit / compositor wait) in the silent CACHE->DIRECT window.
-        #[cfg(feature = "texture-cache-debug")]
-        let window_draw_started_at = std::time::Instant::now();
-        #[cfg(feature = "texture-cache-debug")]
-        log::info!(
-            "event=window_draw_start dirty_views={} refreshing={}",
-            self.dirty_views.len(),
-            self.refreshing
-        );
-
         self.invalidate_entities();
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
@@ -2588,15 +2318,7 @@ impl Window {
         // removed.
         //
         // Reference: users/klaus/tasks/conversation-list/research/S537-axis2-sage-empirical-trace-decomposition.md §7.1
-        #[cfg(feature = "texture-cache-debug")]
-        log::info!(
-            "event=window_draw_gate_check dirty_views={} refreshing={}",
-            self.dirty_views.len(),
-            self.refreshing
-        );
         if self.dirty_views.is_empty() && !self.refreshing {
-            #[cfg(feature = "texture-cache-debug")]
-            log::info!("event=window_draw_skipped dirty_views=0 refreshing=false");
             // Maintain the invariants the post-`draw_roots` tail (lines
             // ~2543-2586) would have set, so the next compositor callback
             // can hit the existing present_only path at window.rs:1503-1506
@@ -2682,17 +2404,6 @@ impl Window {
         self.invalidator.set_phase(DrawPhase::None);
         self.needs_present.set(true);
 
-        // CS S499: close the bracket opened at window_draw_start above.
-        #[cfg(feature = "texture-cache-debug")]
-        {
-            let duration_ms = window_draw_started_at.elapsed().as_secs_f32() * 1000.0;
-            log::info!(
-                "event=window_draw_end duration_ms={:.1} needs_present={}",
-                duration_ms,
-                self.needs_present.get()
-            );
-        }
-
         ArenaClearNeeded::new(&cx.element_arena)
     }
 
@@ -2712,12 +2423,6 @@ impl Window {
 
     fn invalidate_entities(&mut self) {
         let mut views = self.invalidator.take_views();
-        #[cfg(feature = "texture-cache-debug")]
-        log::info!(
-            "event=invalidator_drain count={} entities={:?}",
-            views.len(),
-            views
-        );
         for entity in views.drain() {
             self.mark_view_dirty(entity);
         }
@@ -2726,50 +2431,14 @@ impl Window {
 
     #[profiling::function]
     fn present(&self) {
-        // CS S499: bracket `platform_window.draw(&scene)` — this is GPUI's handoff
-        // to the Linux platform layer, which on wayland/wgpu eventually calls
-        // queue.submit() + frame.present() inside the wgpu renderer. Separating
-        // this span from wgpu_submit_start/end (measured inside the wgpu crate)
-        // isolates the cost of the platform-window indirection from GPU submission.
-        #[cfg(feature = "texture-cache-debug")]
-        let window_present_started_at = std::time::Instant::now();
-        #[cfg(feature = "texture-cache-debug")]
-        log::info!("event=window_present_start");
-
         self.platform_window.draw(&self.rendered_frame.scene);
         self.needs_present.set(false);
         profiling::finish_frame!();
-
-        #[cfg(feature = "texture-cache-debug")]
-        {
-            let duration_ms = window_present_started_at.elapsed().as_secs_f32() * 1000.0;
-            log::info!(
-                "event=window_present_end duration_ms={:.1}",
-                duration_ms
-            );
-        }
     }
 
     fn draw_roots(&mut self, cx: &mut App) {
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();
-
-        // S513 Move 3: bracket the major phases of `draw_roots` so trace
-        // analysis can decompose the ~11ms "silent gap" between view_render_end
-        // and layout_phase_start documented in S513 FPS bottleneck findings.
-        // Sub-phase events emitted on this Cache topic so Klaus's existing
-        // analysis pipeline (cs-trace-card.sh + arming F9 → Cache) picks them up.
-        // paint_frame uses current_request_frame_seq() — reads (does NOT
-        // increment) the in-flight wake's correlator, so it matches the same
-        // value already stamped by window_draw_start / wayland_surface_commit
-        // for this frame (calling next_request_frame_seq() here would create
-        // an orphan seq that pairs with no other event in the trace).
-        #[cfg(feature = "texture-cache-debug")]
-        let prepaint_started_at = std::time::Instant::now();
-        #[cfg(feature = "texture-cache-debug")]
-        let frame_seq = current_request_frame_seq();
-        #[cfg(feature = "texture-cache-debug")]
-        log::info!("event=prepaint_start paint_frame={}", frame_seq);
 
         let _inspector_width: Pixels = rems(30.0).to_pixels(self.rem_size());
         let root_size = {
@@ -2791,35 +2460,11 @@ impl Window {
 
         // Layout all root elements.
         let mut root_element = self.root.as_ref().unwrap().clone().into_any();
-        // S513 Move 3: `prepaint_as_root` triggers Taffy layout + element-tree
-        // construction + text shaping recursively — per S480 perf, this is
-        // ~30%+ of CPU and the dominant component of the 11ms silent gap.
-        // Named `taffy_layout_*` after the dominant subsystem (matches the
-        // S480 perf-record terminology + max's S513 task brief). The total
-        // wall time INCLUDES Taffy + element-tree construction + text shaping —
-        // a raw `grep taffy_layout_end duration_ms=…` reading is the combined
-        // cost, not Taffy alone.
-        #[cfg(feature = "texture-cache-debug")]
-        let taffy_started_at = std::time::Instant::now();
-        #[cfg(feature = "texture-cache-debug")]
-        log::info!("event=taffy_layout_start paint_frame={}", frame_seq);
         root_element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
-        #[cfg(feature = "texture-cache-debug")]
-        {
-            let duration_ms = taffy_started_at.elapsed().as_secs_f32() * 1000.0;
-            log::info!(
-                "event=taffy_layout_end paint_frame={} duration_ms={:.2}",
-                frame_seq, duration_ms
-            );
-        }
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         let inspector_element = self.prepaint_inspector(_inspector_width, cx);
 
-        // Not separately bracketed: prepaint_deferred_draws + the overlay
-        // prepaint arms below (prompt/drag/tooltip). Per S480 perf these are
-        // <1% CPU; their cost is captured in `prepaint_end - taffy_layout_end -
-        // hit_test_end` by subtraction if a future analysis needs them.
         self.prepaint_deferred_draws(cx);
 
         let mut prompt_element = None;
@@ -2840,40 +2485,10 @@ impl Window {
             tooltip_element = self.prepaint_tooltip(cx);
         }
 
-        // S513 Move 3: bounds-tree query — per S480 perf, ~5% of CPU.
-        // Single duration emit (no _start needed; the call is a single line).
-        #[cfg(feature = "texture-cache-debug")]
-        let hit_test_started_at = std::time::Instant::now();
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
-        #[cfg(feature = "texture-cache-debug")]
-        {
-            let duration_ms = hit_test_started_at.elapsed().as_secs_f32() * 1000.0;
-            log::info!(
-                "event=hit_test_end paint_frame={} duration_ms={:.2}",
-                frame_seq, duration_ms
-            );
-        }
-
-        // S513 Move 3: close prepaint phase, open paint phase.
-        // prepaint_end's duration covers EVERYTHING from set_phase(Prepaint)
-        // through the hit_test — i.e., taffy_layout + prepaint_deferred_draws
-        // + prepaint_tooltip/drag/prompt + hit_test combined.
-        #[cfg(feature = "texture-cache-debug")]
-        {
-            let duration_ms = prepaint_started_at.elapsed().as_secs_f32() * 1000.0;
-            log::info!(
-                "event=prepaint_end paint_frame={} duration_ms={:.2}",
-                frame_seq, duration_ms
-            );
-        }
 
         // Now actually paint the elements.
         self.invalidator.set_phase(DrawPhase::Paint);
-        #[cfg(feature = "texture-cache-debug")]
-        let paint_started_at = std::time::Instant::now();
-        #[cfg(feature = "texture-cache-debug")]
-        log::info!("event=paint_start paint_frame={}", frame_seq);
-
         root_element.paint(self, cx);
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -2891,15 +2506,6 @@ impl Window {
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector_hitbox(cx);
-
-        #[cfg(feature = "texture-cache-debug")]
-        {
-            let duration_ms = paint_started_at.elapsed().as_secs_f32() * 1000.0;
-            log::info!(
-                "event=paint_end paint_frame={} duration_ms={:.2}",
-                frame_seq, duration_ms
-            );
-        }
     }
 
     fn prepaint_tooltip(&mut self, cx: &mut App) -> Option<AnyElement> {
@@ -3773,32 +3379,6 @@ impl Window {
         }
     }
 
-    /// Extend `next_frame.accessed_element_states` with an arbitrary set of keys
-    /// so that `Frame::finish` preserves the matching element states across the
-    /// next frame boundary. Used by `List` during HIT frames to keep a cached
-    /// item's `TextViewState` (and other per-element state) alive across frames
-    /// where `element.paint` is skipped. Without this, a card that spends
-    /// multiple frames on the cache HIT path loses its element state, and the
-    /// first DIRECT paint after transition re-creates it from scratch — causing
-    /// a 1-frame shell-only render while an async parse task repopulates
-    /// content (S500 size-jump flicker).
-    ///
-    /// Narrower than `reuse_prepaint` / `reuse_paint`: touches only element
-    /// state, NOT hitboxes, dispatch tree, text layouts, cursor styles, or
-    /// mouse listeners. Those would be stale for a card whose element did not
-    /// paint this frame.
-    ///
-    /// Calling with unknown keys is a no-op — the state simply isn't there to
-    /// preserve. Duplicate keys are harmless — `Frame::finish` uses
-    /// `remove_entry`, so a key already moved on a prior pass is a no-op on
-    /// subsequent passes.
-    #[cfg(feature = "texture-cache")]
-    pub fn keep_element_states_alive(&mut self, keys: &[(GlobalElementId, TypeId)]) {
-        self.next_frame
-            .accessed_element_states
-            .extend(keys.iter().cloned());
-    }
-
     /// A variant of `with_element_state` that allows the element's id to be optional. This is a convenience
     /// method for elements where the element id may or may not be assigned. Prefer using `with_element_state`
     /// when the element is guaranteed to have an id.
@@ -3875,39 +3455,6 @@ impl Window {
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
         });
-    }
-
-    /// Mark the start of a cacheable region in the scene.
-    /// The renderer may capture all primitives between begin and end to an offscreen
-    /// GPU texture for reuse during scroll. The `clear_color` is used to clear the
-    /// offscreen texture before rendering (required for correct subpixel text).
-    ///
-    /// This method should only be called as part of the paint phase of element drawing.
-    #[cfg(feature = "texture-cache")]
-    pub fn begin_cache_region(
-        &mut self,
-        id: CacheRegionId,
-        bounds: Bounds<Pixels>,
-        clear_color: Hsla,
-        viewport_clip: Bounds<Pixels>,
-    ) {
-        self.invalidator.debug_assert_paint();
-        let scale_factor = self.scale_factor();
-        self.next_frame.scene.begin_cache_region(
-            id,
-            bounds.scale(scale_factor),
-            clear_color,
-            viewport_clip.scale(scale_factor),
-        );
-    }
-
-    /// Mark the end of the current cache region.
-    ///
-    /// This method should only be called as part of the paint phase of element drawing.
-    #[cfg(feature = "texture-cache")]
-    pub fn end_cache_region(&mut self, id: CacheRegionId) {
-        self.invalidator.debug_assert_paint();
-        self.next_frame.scene.end_cache_region(id);
     }
 
     /// Creates a new painting layer for the specified bounds. A "layer" is a batch
@@ -4493,27 +4040,6 @@ impl Window {
         cx.layout_id_buffer.extend(children);
         let rem_size = self.rem_size();
         let scale_factor = self.scale_factor();
-
-        // CS S538 Hop 2 Tracer A: log this entity's Taffy input (style + child count) and
-        // whether it changed vs the last call attributed to the same entity. Per-entity keying
-        // means intra-frame multi-element renders have last-wins semantics; analysis aggregates
-        // across frames. Hash via seahash over the Debug repr — Style has no `Hash` derive.
-        #[cfg(feature = "texture-cache-debug")]
-        if let Some(entity_id) = self.rendered_entity_stack.last().copied() {
-            let children_count = cx.layout_id_buffer.len();
-            let style_hash = seahash::hash(
-                format!("{:?}|{}", style, children_count).as_bytes(),
-            );
-            let prev_hash = self.entity_taffy_input_hashes.insert(entity_id, style_hash);
-            let changed_from_prev = prev_hash != Some(style_hash);
-            log::info!(
-                "event=entity_taffy_input entity={:?} style_hash={} children_count={} changed_from_prev={}",
-                entity_id,
-                style_hash,
-                children_count,
-                changed_from_prev,
-            );
-        }
 
         self.layout_engine.as_mut().unwrap().request_layout(
             style,

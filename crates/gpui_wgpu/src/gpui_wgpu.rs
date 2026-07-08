@@ -8,10 +8,3 @@ pub use wgpu;
 pub use wgpu_atlas::*;
 pub use wgpu_context::*;
 pub use wgpu_renderer::{GpuContext, WgpuRenderer, WgpuSurfaceConfig};
-#[cfg(feature = "texture-cache")]
-pub use wgpu_renderer::{
-    set_texture_cache_debug_callback, TextureCacheDebugFrame, TextureCacheDebugItem,
-    TextureCacheDebugLifecycle, TextureCacheDebugPool,
-    set_eviction_callback, TextureEvictionEvent,
-    set_quality_guard_callback, QualityGuardEvent,
-};

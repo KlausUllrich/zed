@@ -14,8 +14,6 @@ path = "src/gpui_wgpu.rs"
 [features]
 default = []
 font-kit = ["dep:font-kit"]
-texture-cache = ["gpui/texture-cache", "dep:png"]
-texture-cache-debug = ["texture-cache", "gpui/texture-cache-debug"]
 
 [dependencies]
 gpui.workspace = true
@@ -33,9 +31,6 @@ smallvec.workspace = true
 swash = "0.2.6"
 gpui_util.workspace = true
 wgpu.workspace = true
-
-# Optional: texture dump diagnostic (PNG export of cached GPU textures)
-png = { version = "0.17", optional = true }
 
 # Optional: only needed on platforms with multiple font sources (e.g. Linux)
 # WARNING: If you change this, you must also publish a new version of zed-font-kit to crates.io

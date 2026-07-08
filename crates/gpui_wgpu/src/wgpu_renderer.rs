@@ -13,27 +13,12 @@ use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-#[cfg(feature = "texture-cache")]
-#[path = "texture_cache.rs"]
-mod texture_cache;
-#[cfg(feature = "texture-cache")]
-pub use texture_cache::{
-    set_texture_cache_debug_callback, TextureCacheDebugFrame, TextureCacheDebugItem,
-    TextureCacheDebugLifecycle, TextureCacheDebugPool,
-    set_eviction_callback, TextureEvictionEvent,
-    set_quality_guard_callback, QualityGuardEvent,
-};
-
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GlobalParams {
     viewport_size: [f32; 2],
     premultiplied_alpha: u32,
-    /// Fade alpha applied to cached-texture composites in `fs_composite`.
-    /// 1.0 = full opacity (no fade). Written each frame from
-    /// `Scene::composite_fade_alpha`. Occupies the same 4-byte slot the
-    /// former std140 `pad` did — no uniform-buffer resize required.
-    composite_fade_alpha: f32,
+    pad: u32,
 }
 
 #[repr(C)]
@@ -94,11 +79,6 @@ struct WgpuPipelines {
     shadows: wgpu::RenderPipeline,
     path_rasterization: wgpu::RenderPipeline,
     paths: wgpu::RenderPipeline,
-    /// Composites standalone cached textures with correct [0,1] UV mapping.
-    /// Unlike `paths` (which derives UV from screen position for the window-sized
-    /// intermediate), this pipeline uses unit_vertex as UV directly.
-    #[cfg(feature = "texture-cache")]
-    composite: wgpu::RenderPipeline,
     underlines: wgpu::RenderPipeline,
     mono_sprites: wgpu::RenderPipeline,
     subpixel_sprites: Option<wgpu::RenderPipeline>,
@@ -159,10 +139,6 @@ pub struct WgpuRenderer {
     last_error: Arc<Mutex<Option<String>>>,
     failed_frame_count: u32,
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    #[cfg(feature = "texture-cache")]
-    texture_pool: Option<texture_cache::TexturePool>,
-    #[cfg(feature = "texture-cache")]
-    pending_timeline_dumps: Vec<texture_cache::PendingTimelineDump>,
 }
 
 impl WgpuRenderer {
@@ -354,26 +330,6 @@ impl WgpuRenderer {
             wgpu::PresentMode::Fifo
         };
 
-        // S513 Move 2 (max): record the chosen present mode in cache_region's
-        // process-global slot so it lands on every paint_timing_breakdown line
-        // emitted during the session. The earlier one-shot `log::info!` at
-        // startup didn't reach the trace topic file (topic gets armed AFTER
-        // app startup via F9). Stamping the value into a process-global and
-        // including it on every per-frame line is more reliable: the moment
-        // Klaus arms the Cache topic the value appears on the next frame.
-        #[cfg(feature = "texture-cache-debug")]
-        {
-            let name: &'static str = match present_mode {
-                wgpu::PresentMode::Fifo => "Fifo",
-                wgpu::PresentMode::FifoRelaxed => "FifoRelaxed",
-                wgpu::PresentMode::Immediate => "Immediate",
-                wgpu::PresentMode::Mailbox => "Mailbox",
-                wgpu::PresentMode::AutoVsync => "AutoVsync",
-                wgpu::PresentMode::AutoNoVsync => "AutoNoVsync",
-            };
-            gpui::set_present_mode_name(name);
-        }
-
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
@@ -526,10 +482,6 @@ impl WgpuRenderer {
             last_error,
             failed_frame_count: 0,
             device_lost: context.device_lost_flag(),
-            #[cfg(feature = "texture-cache")]
-            texture_pool: None,
-            #[cfg(feature = "texture-cache")]
-            pending_timeline_dumps: Vec::new(),
         })
     }
 
@@ -816,29 +768,6 @@ impl WgpuRenderer {
             &shader_module,
         );
 
-        // Composite pipeline: draws cached item textures back onto the framebuffer.
-        // Uses PREMULTIPLIED_ALPHA_BLENDING (One/OneMinusSrcAlpha on both channels).
-        // The fs_composite fragment shader handles both surface alpha modes —
-        // see shaders.wgsl for the full alpha path analysis. Unlike paths_blend
-        // (which uses additive alpha for intermediate accumulation), composite
-        // needs proper over-compositing on both channels.
-        #[cfg(feature = "texture-cache")]
-        let composite = create_pipeline(
-            "composite",
-            "vs_composite",
-            "fs_composite",
-            &layouts.globals,
-            &layouts.instances_with_texture,
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(wgpu::ColorTargetState {
-                format: surface_format,
-                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            1,
-            &shader_module,
-        );
-
         let underlines = create_pipeline(
             "underlines",
             "vs_underline",
@@ -925,8 +854,6 @@ impl WgpuRenderer {
             shadows,
             path_rasterization,
             paths,
-            #[cfg(feature = "texture-cache")]
-            composite,
             underlines,
             mono_sprites,
             subpixel_sprites,
@@ -1148,36 +1075,7 @@ impl WgpuRenderer {
 
         self.atlas.before_frame();
 
-        // CS S514 P0: bracket `surface.get_current_texture()` — under
-        // `PresentMode::Mailbox` with `desired_maximum_frame_latency: 2`, this
-        // call can still block on the GPU fence if the previous frame's
-        // commands haven't drained. S513 smoke measured a 1 ms median (p99
-        // = 3 ms) gap between gpui's `window_present_start` (in window.rs)
-        // and the `wgpu_submit_start` emit further down — almost all of that
-        // gap lives inside this acquire. Bracket confirms (or falsifies)
-        // swapchain backpressure as a tail-event source. `paint_frame` is
-        // captured once via `current_request_frame_seq()` (a thread_local
-        // read that doesn't advance the seq) so both emits describe the same
-        // wake, mirroring Move 3's `wgpu_submit_*` idiom.
-        #[cfg(feature = "texture-cache-debug")]
-        let paint_frame = gpui::current_request_frame_seq();
-        #[cfg(feature = "texture-cache-debug")]
-        let swapchain_acquire_started_at = std::time::Instant::now();
-        #[cfg(feature = "texture-cache-debug")]
-        log::info!(
-            "event=swapchain_acquire_start paint_frame={}",
-            paint_frame
-        );
         let surface_texture = self.resources().surface.get_current_texture();
-        #[cfg(feature = "texture-cache-debug")]
-        {
-            let duration_ms =
-                swapchain_acquire_started_at.elapsed().as_secs_f32() * 1000.0;
-            log::info!(
-                "event=swapchain_acquire_end paint_frame={} duration_ms={:.1}",
-                paint_frame, duration_ms
-            );
-        }
         let frame = match surface_texture {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
@@ -1237,10 +1135,7 @@ impl WgpuRenderer {
             } else {
                 0
             },
-            // S502: fade alpha for cached-texture composites. List::paint
-            // writes scene.composite_fade_alpha each frame from the
-            // controller's tick value. Default 1.0 = no fade.
-            composite_fade_alpha: scene.composite_fade_alpha,
+            pad: 0,
         };
 
         let path_globals = GlobalParams {
@@ -1278,22 +1173,6 @@ impl WgpuRenderer {
                         label: Some("main_encoder"),
                     });
 
-            // Pre-pass: render dirty cache regions to offscreen textures
-            #[cfg(feature = "texture-cache")]
-            if !scene.cache_regions().is_empty() {
-                // S513 perf: bracket the capture pass so paint_timing_breakdown
-                // can attribute time to capture vs composite vs present.
-                #[cfg(feature = "texture-cache-debug")]
-                let capture_started_at = std::time::Instant::now();
-                if !self.process_cache_regions(&mut encoder, scene, &mut instance_offset) {
-                    overflow = true;
-                }
-                #[cfg(feature = "texture-cache-debug")]
-                gpui::frame_perf_record_capture(
-                    capture_started_at.elapsed().as_secs_f32() * 1000.0,
-                );
-            }
-
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("main_pass"),
@@ -1310,69 +1189,7 @@ impl WgpuRenderer {
                     ..Default::default()
                 });
 
-                // Z-ordering: compute insertion point for cached texture compositing.
-                // Cached textures composite after all content batches at or below the
-                // cache regions' z-position, before any batch with a higher draw order
-                // (e.g., overlay layers, tooltips, popups).
-                #[cfg(feature = "texture-cache")]
-                let cache_regions_max_order = scene.cache_composite_max_order();
-                #[cfg(feature = "texture-cache")]
-                let mut cache_composited = false;
-
                 for batch in scene.batches() {
-                    // Composite cached textures before the first batch whose draw
-                    // order exceeds all cache regions' composite orders.
-                    // Safety: batches() only yields ranges with ≥1 element.
-                    #[cfg(feature = "texture-cache")]
-                    if !cache_composited && !overflow {
-                        if let Some(max_order) = cache_regions_max_order {
-                            let batch_order = match &batch {
-                                PrimitiveBatch::Shadows(r) => scene.shadows[r.start].order,
-                                PrimitiveBatch::Quads(r) => scene.quads[r.start].order,
-                                PrimitiveBatch::Paths(r) => scene.paths[r.start].order,
-                                PrimitiveBatch::Underlines(r) => scene.underlines[r.start].order,
-                                PrimitiveBatch::MonochromeSprites { range, .. } => {
-                                    scene.monochrome_sprites[range.start].order
-                                }
-                                PrimitiveBatch::SubpixelSprites { range, .. } => {
-                                    scene.subpixel_sprites[range.start].order
-                                }
-                                PrimitiveBatch::PolychromeSprites { range, .. } => {
-                                    scene.polychrome_sprites[range.start].order
-                                }
-                                PrimitiveBatch::Surfaces(r) => scene.surfaces[r.start].order,
-                            };
-                            if batch_order > max_order {
-                                // CS S499: bracket the interleaved cache composite path.
-                                // `source=interleaved` distinguishes this from the fallback
-                                // path below (cache z lies within batch order range).
-                                #[cfg(feature = "texture-cache-debug")]
-                                let cache_composite_started_at = std::time::Instant::now();
-                                #[cfg(feature = "texture-cache-debug")]
-                                log::info!("event=cache_composite_start source=interleaved");
-                                if !self.draw_cached_regions(
-                                    scene,
-                                    &mut instance_offset,
-                                    &mut pass,
-                                ) {
-                                    overflow = true;
-                                }
-                                #[cfg(feature = "texture-cache-debug")]
-                                {
-                                    let duration_ms =
-                                        cache_composite_started_at.elapsed().as_secs_f32() * 1000.0;
-                                    log::info!(
-                                        "event=cache_composite_end duration_ms={:.1} source=interleaved",
-                                        duration_ms
-                                    );
-                                    // S513 perf: feed the consolidated paint_timing_breakdown.
-                                    gpui::frame_perf_record_composite(duration_ms);
-                                }
-                                cache_composited = true;
-                            }
-                        }
-                    }
-
                     let ok = match batch {
                         PrimitiveBatch::Quads(range) => {
                             self.draw_quads(&scene.quads[range], &mut instance_offset, &mut pass)
@@ -1458,33 +1275,6 @@ impl WgpuRenderer {
                         break;
                     }
                 }
-
-                // Fallback: composite if the batch loop ended without finding a batch
-                // with order > max_order (all content at or below cache z-position,
-                // e.g., no overlay layers present).
-                #[cfg(feature = "texture-cache")]
-                if !cache_composited && !overflow {
-                    // CS S499: bracket the fallback cache composite path. Exactly one of
-                    // interleaved vs fallback fires per paint (guarded by `cache_composited`).
-                    #[cfg(feature = "texture-cache-debug")]
-                    let cache_composite_started_at = std::time::Instant::now();
-                    #[cfg(feature = "texture-cache-debug")]
-                    log::info!("event=cache_composite_start source=fallback");
-                    if !self.draw_cached_regions(scene, &mut instance_offset, &mut pass) {
-                        overflow = true;
-                    }
-                    #[cfg(feature = "texture-cache-debug")]
-                    {
-                        let duration_ms =
-                            cache_composite_started_at.elapsed().as_secs_f32() * 1000.0;
-                        log::info!(
-                            "event=cache_composite_end duration_ms={:.1} source=fallback",
-                            duration_ms
-                        );
-                        // S513 perf: feed the consolidated paint_timing_breakdown.
-                        gpui::frame_perf_record_composite(duration_ms);
-                    }
-                }
             }
 
             if overflow {
@@ -1494,20 +1284,7 @@ impl WgpuRenderer {
                         "instance buffer size grew too large: {}",
                         self.instance_buffer_capacity
                     );
-                    // CS S499: bracket frame.present() on the overflow-abort path so the
-                    // trace still closes the present span in this pathological exit.
-                    #[cfg(feature = "texture-cache-debug")]
-                    let frame_present_started_at = std::time::Instant::now();
                     frame.present();
-                    #[cfg(feature = "texture-cache-debug")]
-                    {
-                        let duration_ms =
-                            frame_present_started_at.elapsed().as_secs_f32() * 1000.0;
-                        log::info!(
-                            "event=frame_present_end duration_ms={:.1} path=overflow_abort",
-                            duration_ms
-                        );
-                    }
                     return;
                 }
                 self.grow_instance_buffer();
@@ -1517,96 +1294,11 @@ impl WgpuRenderer {
             // CS S500: flush glyph atlas uploads queued during this frame's paint before GPU submits (sage atlas-proper-fix analysis)
             self.atlas.before_frame();
 
-            // IP-2 V1: pre-submit liveness assertion. If any region processed
-            // this frame is no longer in `pool.active`, something dropped its
-            // texture after the encoder already bound the view — exactly the
-            // RW1 / RW3 race. Emit INVARIANT_VIOLATION per offending region and
-            // SKIP the submit. The command buffer is dropped (frame goes blank
-            // or shows the previous swap-chain contents) and the next frame
-            // reconverges naturally. Strict improvement over the async 20-
-            // frame panic: sync detection, recoverable, with a named cause.
-            #[cfg(feature = "texture-cache-debug")]
-            {
-                let violations = self
-                    .texture_pool
-                    .as_ref()
-                    .map(|p| p.check_pre_submit_liveness())
-                    .unwrap_or_default();
-                if !violations.is_empty() {
-                    for rid in &violations {
-                        log::warn!(
-                            "event=INVARIANT_VIOLATION rule=V1 region_id={} reason=backing_destroyed",
-                            rid
-                        );
-                    }
-                    log::warn!(
-                        "event=V1_submit_skipped violations={} reason=backing_destroyed",
-                        violations.len()
-                    );
-                    let v1_count = violations.len() as u32;
-                    if let Some(pool) = self.texture_pool.as_mut() {
-                        pool.clear_frame_regions_processed();
-                        // S510 Stream 2: park V1 count for emit next frame.
-                        pool.park_v1_violation_count(v1_count);
-                    }
-                    return;
-                }
-            }
-
-            // CS S499: bracket queue.submit() to measure GPU command submission cost.
-            // If this interval dominates the silent transition window, hypothesis A
-            // (GPU backpressure / fence wait) is confirmed. If it's sub-millisecond,
-            // hypothesis A is ruled out and the wait is downstream (compositor / idle).
-            #[cfg(feature = "texture-cache-debug")]
-            let wgpu_submit_started_at = std::time::Instant::now();
-            #[cfg(feature = "texture-cache-debug")]
-            log::info!("event=wgpu_submit_start");
             self.resources()
                 .queue
                 .submit(std::iter::once(encoder.finish()));
-            #[cfg(feature = "texture-cache-debug")]
-            {
-                let duration_ms = wgpu_submit_started_at.elapsed().as_secs_f32() * 1000.0;
-                log::info!(
-                    "event=wgpu_submit_end duration_ms={:.1}",
-                    duration_ms
-                );
-            }
 
-            // One-shot texture dump: reads back all active cached textures to PNG.
-            // Triggered by gpui::request_texture_dump() (hotkey in CS app).
-            #[cfg(feature = "texture-cache")]
-            self.dump_active_textures_if_requested();
-
-            // Card timeline: flush any pending PNG dumps staged during process_cache_regions.
-            #[cfg(feature = "texture-cache")]
-            self.flush_timeline_dumps();
-
-            // CS S499: bracket frame.present() — the compositor-handoff call. Combined
-            // with wgpu_submit_end above, a reader can compute the gap between submit
-            // and present to see if wgpu drivers backpressure between the two.
-            // Hypothesis B: a slow frame.present() implicates compositor backpressure;
-            // a fast one places the wait in the compositor-callback interval downstream.
-            #[cfg(feature = "texture-cache-debug")]
-            let frame_present_started_at = std::time::Instant::now();
             frame.present();
-            // CS S503 (GH #90): stamp the present-end timestamp into a shared
-            // thread_local so the wayland presentation-feedback handler can
-            // compute `since_present_ms` on the next `Presented` event.
-            #[cfg(feature = "texture-cache-debug")]
-            gpui::record_frame_present_end();
-            #[cfg(feature = "texture-cache-debug")]
-            {
-                let duration_ms = frame_present_started_at.elapsed().as_secs_f32() * 1000.0;
-                log::info!(
-                    "event=frame_present_end duration_ms={:.1} path=normal",
-                    duration_ms
-                );
-                // S513 perf: emit the consolidated paint_timing_breakdown event,
-                // pulling the layout / capture / composite / hit-miss-plain
-                // numbers stashed by earlier phases. Reset accumulator after.
-                gpui::frame_perf_emit_with_present(duration_ms);
-            }
             return;
         }
     }
@@ -2036,13 +1728,6 @@ impl WgpuRenderer {
         self.resources = None;
         self.atlas
             .handle_device_lost(Arc::clone(&context.device), Arc::clone(&context.queue));
-
-        // EC-11: Clear stale texture cache state before rebuilding.
-        // new_internal() creates a fresh renderer with texture_pool: None,
-        // but the global cached_region_ids still holds IDs from the old pool.
-        // Without clearing, list.rs would skip-paint items that have no texture.
-        #[cfg(feature = "texture-cache")]
-        gpui::clear_cached_region_ids();
 
         *self = Self::new_internal(
             Some(gpu_context.clone()),

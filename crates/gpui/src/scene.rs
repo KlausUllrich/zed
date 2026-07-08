@@ -4,8 +4,6 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "texture-cache")]
-use crate::{CacheRegion, CacheRegionId};
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
     Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
@@ -24,6 +22,7 @@ pub type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
 #[expect(missing_docs)]
 pub type DrawOrder = u32;
 
+#[derive(Default)]
 #[expect(missing_docs)]
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
@@ -37,40 +36,6 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
-    #[cfg(feature = "texture-cache")]
-    cache_regions_data: Vec<CacheRegion>,
-    #[cfg(feature = "texture-cache")]
-    active_cache_region: Option<(CacheRegionId, Bounds<ScaledPixels>, Hsla, usize, DrawOrder, Bounds<ScaledPixels>)>,
-    /// S502 fade overlay alpha read by the wgpu composite shader.
-    /// Default 1.0 = no fade. List::paint writes this each frame from
-    /// `ListState::fade_alpha`. f32 default would be 0.0 (black-screen
-    /// composite), so Scene needs a manual Default impl below.
-    #[cfg(feature = "texture-cache")]
-    pub composite_fade_alpha: f32,
-}
-
-impl Default for Scene {
-    fn default() -> Self {
-        Self {
-            paint_operations: Vec::new(),
-            primitive_bounds: BoundsTree::default(),
-            layer_stack: Vec::new(),
-            shadows: Vec::new(),
-            quads: Vec::new(),
-            paths: Vec::new(),
-            underlines: Vec::new(),
-            monochrome_sprites: Vec::new(),
-            subpixel_sprites: Vec::new(),
-            polychrome_sprites: Vec::new(),
-            surfaces: Vec::new(),
-            #[cfg(feature = "texture-cache")]
-            cache_regions_data: Vec::new(),
-            #[cfg(feature = "texture-cache")]
-            active_cache_region: None,
-            #[cfg(feature = "texture-cache")]
-            composite_fade_alpha: 1.0,
-        }
-    }
 }
 
 #[expect(missing_docs)]
@@ -87,14 +52,6 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
-        #[cfg(feature = "texture-cache")]
-        {
-            self.cache_regions_data.clear();
-            self.active_cache_region = None;
-            // S502: reset fade alpha to no-op each frame; List::paint writes
-            // the controller-driven value when a fade is active.
-            self.composite_fade_alpha = 1.0;
-        }
     }
 
     pub fn len(&self) -> usize {
@@ -120,7 +77,6 @@ impl Scene {
             .intersect(&primitive.content_mask().bounds);
 
         if clipped_bounds.is_empty() {
-            crate::card_timeline::record_clip_drop();
             return;
         }
 
@@ -174,8 +130,6 @@ impl Scene {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
-                #[cfg(feature = "texture-cache")]
-                PaintOperation::BeginCacheRegion(_) | PaintOperation::EndCacheRegion(_) => {}
             }
         }
     }
@@ -206,70 +160,8 @@ impl Scene {
                     self.push_layer(translated);
                 }
                 PaintOperation::EndLayer => self.pop_layer(),
-                #[cfg(feature = "texture-cache")]
-                PaintOperation::BeginCacheRegion(_) | PaintOperation::EndCacheRegion(_) => {}
             }
         }
-    }
-
-    /// Mark the start of a cacheable region in the scene.
-    /// All primitives painted between begin and end are captured as a group.
-    /// The renderer may render them to an offscreen texture for reuse.
-    /// Inserts bounds into the draw-order tree so cache-HIT items (which emit
-    /// no primitives) still reserve a z-position for correct compositing.
-    #[cfg(feature = "texture-cache")]
-    pub fn begin_cache_region(
-        &mut self,
-        id: CacheRegionId,
-        bounds: Bounds<ScaledPixels>,
-        clear_color: Hsla,
-        viewport_clip: Bounds<ScaledPixels>,
-    ) {
-        // Each cache region gets its own draw order via primitive_bounds.insert(),
-        // same as every other primitive. This ensures correct z-position for
-        // inline composite triggering in the renderer's batch loop.
-        let order = self.primitive_bounds.insert(bounds);
-        self.paint_operations
-            .push(PaintOperation::BeginCacheRegion(id));
-        let start = self.paint_operations.len();
-        self.active_cache_region = Some((id, bounds, clear_color, start, order, viewport_clip));
-    }
-
-    /// Mark the end of the current cache region.
-    #[cfg(feature = "texture-cache")]
-    pub fn end_cache_region(&mut self, id: CacheRegionId) {
-        let end = self.paint_operations.len();
-        self.paint_operations
-            .push(PaintOperation::EndCacheRegion(id));
-        if let Some((region_id, bounds, clear_color, start, order, viewport_clip)) = self.active_cache_region.take() {
-            debug_assert_eq!(region_id, id, "Mismatched cache region begin/end");
-            self.cache_regions_data.push(CacheRegion {
-                id: region_id,
-                bounds,
-                clear_color,
-                paint_op_range: start..end,
-                composite_order: order,
-                viewport_clip,
-            });
-        }
-    }
-
-    /// Iterate over completed cache regions in the scene.
-    #[cfg(feature = "texture-cache")]
-    pub fn cache_regions(&self) -> &[CacheRegion] {
-        &self.cache_regions_data
-    }
-
-    /// Maximum composite draw order across all cache regions.
-    /// Returns `None` if no cache regions exist. Used by the renderer
-    /// to insert cached texture compositing at the correct z-position
-    /// in the batch loop (after content, before overlays).
-    #[cfg(feature = "texture-cache")]
-    pub fn cache_composite_max_order(&self) -> Option<DrawOrder> {
-        self.cache_regions_data
-            .iter()
-            .map(|r| r.composite_order)
-            .max()
     }
 
     pub fn finish(&mut self) {
@@ -339,12 +231,6 @@ pub(crate) enum PaintOperation {
     Primitive(Primitive),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
-    #[cfg(feature = "texture-cache")]
-    #[allow(dead_code)]
-    BeginCacheRegion(CacheRegionId),
-    #[cfg(feature = "texture-cache")]
-    #[allow(dead_code)]
-    EndCacheRegion(CacheRegionId),
 }
 
 #[derive(Clone)]

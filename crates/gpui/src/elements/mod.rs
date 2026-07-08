@@ -6,8 +6,6 @@ mod div;
 mod image_cache;
 mod img;
 mod list;
-#[cfg(feature = "texture-cache")]
-mod list_fade;
 mod surface;
 mod svg;
 mod text;

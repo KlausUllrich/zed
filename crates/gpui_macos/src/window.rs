@@ -2360,22 +2360,6 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
 }
 
 extern "C" fn step(view: *mut c_void) {
-    // CS S512: record main-thread frame-callback arrival so the CS-side circuit
-    // breaker's stall probe (`since_last_frame_callback_ms`) reflects actual
-    // main-thread cadence on macOS. Mirrors the Wayland hook at
-    // `gpui_linux/.../wayland/client.rs` wl_callback::Done dispatch. CVDisplayLink
-    // fires on vsync on a CoreVideo thread; the DispatchSource event handler
-    // dispatches `step` to the main queue — this function runs on main.
-    #[cfg(feature = "texture-cache-debug")]
-    {
-        let since_last_ms =
-            gpui::record_frame_callback_arrival().unwrap_or(gpui::NO_PRIOR_SAMPLE);
-        log::info!(
-            "event=mac_frame_callback since_last_ms={:.1}",
-            since_last_ms
-        );
-    }
-
     let view = view as id;
     let window_state = unsafe { get_window_state(&*view) };
     let mut lock = window_state.lock();

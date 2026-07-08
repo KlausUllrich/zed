@@ -80,10 +80,7 @@ fn apply_contrast_and_gamma_correction3(sample: vec3<f32>, color: vec3<f32>, enh
 struct GlobalParams {
     viewport_size: vec2<f32>,
     premultiplied_alpha: u32,
-    // S502 fade overlay alpha ∈ [0,1]. Default 1.0 = no fade.
-    // Multiplied into fs_composite output to crossfade cached textures
-    // against the underlying DIRECT paint during the texture→layout transition.
-    composite_fade_alpha: f32,
+    pad: u32,
 }
 
 struct GammaParams {
@@ -1124,57 +1121,6 @@ fn fs_path(input: PathVarying) -> @location(0) vec4<f32> {
     }
     let sample = textureSample(t_sprite, s_sprite, input.texture_coords);
     return sample;
-}
-
-// Composite a standalone cached texture as a quad.  (see fs_composite below)
-// Unlike vs_path (which computes UV from screen_position / viewport_size for the
-// window-sized path intermediate), this shader uses unit_vertex as UV directly.
-// This gives correct [0,1] UV mapping for standalone item textures, enabling
-// sub-pixel positioning — the quad position carries the fractional scroll offset
-// while the texture is sampled uniformly across its full extent.
-@vertex
-fn vs_composite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> PathVarying {
-    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
-    let sprite = b_path_sprites[instance_id];
-    let device_position = to_device_position(unit_vertex, sprite.bounds);
-
-    var out = PathVarying();
-    out.position = device_position;
-    out.texture_coords = unit_vertex;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask);
-    return out;
-}
-
-// Fragment shader for cached texture compositing.
-// The capture pass renders with premultiplied_alpha=0 in its globals (straight alpha
-// shader output). The GPU blend during capture determines the texture's alpha format:
-//
-// - Opaque surface → ALPHA_BLENDING (SrcAlpha/OneMinusSrcAlpha) → texture content
-//   is premultiplied (SrcAlpha factor pre-multiplies the straight shader output).
-//   Return as-is — already correct for One/OneMinusSrcAlpha composite blend.
-//
-// - PreMultiplied surface → PREMULTIPLIED_ALPHA_BLENDING (One/OneMinusSrcAlpha) →
-//   texture content is straight (One factor passes straight output unchanged).
-//   Must pre-multiply rgb by alpha before compositing with One/OneMinusSrcAlpha.
-//
-// The main-pass globals.premultiplied_alpha distinguishes these cases:
-//   0 = opaque surface (texture is premultiplied) → pass through
-//   1 = premultiplied surface (texture is straight) → pre-multiply
-@fragment
-fn fs_composite(input: PathVarying) -> @location(0) vec4<f32> {
-    if any(input.clip_distances < vec4<f32>(0.0)) {
-        return vec4<f32>(0.0);
-    }
-    let sample = textureSample(t_sprite, s_sprite, input.texture_coords);
-    // S502: multiply both rgb and alpha by composite_fade_alpha so the cached
-    // texture composites at the controller-driven fade alpha. Default 1.0 is
-    // a no-op for non-fading frames.
-    let fa = globals.composite_fade_alpha;
-    if globals.premultiplied_alpha != 0u {
-        // Texture has straight alpha — pre-multiply for One/OneMinusSrcAlpha blend
-        return vec4<f32>(sample.rgb * sample.a * fa, sample.a * fa);
-    }
-    return vec4<f32>(sample.rgb * fa, sample.a * fa);
 }
 
 // --- underlines --- //

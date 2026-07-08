@@ -227,14 +227,6 @@ impl WgpuAtlasState {
     }
 
     fn flush_uploads(&mut self) {
-        // CS S500: counter telemetry to settle hypothesis B (atlas-upload latency) — fires from both before_frame() call sites; non-zero counts at the pre-submit flush prove atlas misses occurred during paint.
-        #[cfg(feature = "texture-cache-debug")]
-        if !self.pending_uploads.is_empty() {
-            log::info!(
-                "event=atlas_flush_uploads count={}",
-                self.pending_uploads.len()
-            );
-        }
         for upload in self.pending_uploads.drain(..) {
             let texture = &self.storage[upload.id];
             let bytes_per_pixel = texture.bytes_per_pixel();

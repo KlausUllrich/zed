@@ -14,9 +14,6 @@ path = "src/gpui_linux.rs"
 [features]
 default = ["wayland", "x11"]
 test-support = ["gpui/test-support"]
-# CS S499: diagnostic trace events (wayland_frame_callback, presentation_feedback).
-# Propagated from gpui_platform -> gpui -> gpui_wgpu -> cs-app.
-texture-cache-debug = []
 wayland = [
     "bitflags",
     "gpui_wgpu",

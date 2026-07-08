@@ -1123,16 +1123,6 @@ impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, ObjectId>
                     window.set_presentation_time(nanos);
                 }
             }
-            wp_presentation_feedback::Event::Discarded => {
-                // CS S503 (GH #90, sage rev #2): compositor discarded the buffer
-                // without ever showing it (occlusion, minimize, focus-loss). Without
-                // this arm, presentation_time_nanos sits stale and `since_present_ms`
-                // would compute a large delta on the NEXT `Presented` — a false
-                // C4 positive. Emit under the existing gate so trace readers can
-                // correlate stalls with buffer-discard bursts (a new C7 candidate).
-                #[cfg(feature = "texture-cache-debug")]
-                log::info!("event=presentation_feedback_discarded");
-            }
             _ => {}
         }
     }
@@ -1155,27 +1145,6 @@ impl Dispatch<WlCallback, ObjectId> for WaylandClientStatePtr {
         drop(state);
 
         if let wl_callback::Event::Done { .. } = event {
-            // CS S499: every compositor frame-callback "done" marks a point at which
-            // we're cleared to present the next frame. If the silent transition window
-            // ends consistently within <5ms of this event, the wait is compositor-paced
-            // (hypothesis B). If the gap between this event and next view_render_start
-            // is much larger, something is throttling us even after the compositor
-            // released us.
-            //
-            // CS S503 (GH #90): `since_last_ms` is the inter-arrival gap. Normal
-            // 144Hz ≈ 7ms, 60Hz ≈ 17ms. Outlier stalls show >50ms — direct evidence
-            // of compositor throttling (C1). `gpui::record_frame_callback_arrival`
-            // updates a shared thread_local so gpui's on_request_frame closure can
-            // compute dispatch→wake latency on the same timeline.
-            #[cfg(feature = "texture-cache-debug")]
-            {
-                let since_last_ms = gpui::record_frame_callback_arrival()
-                    .unwrap_or(gpui::NO_PRIOR_SAMPLE);
-                log::info!(
-                    "event=wayland_frame_callback since_last_ms={:.1}",
-                    since_last_ms
-                );
-            }
             window.frame();
         }
     }
