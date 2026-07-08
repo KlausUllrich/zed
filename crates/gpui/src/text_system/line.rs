@@ -393,8 +393,12 @@ fn paint_line(
                             glyph_origin.x - underline_origin.x,
                             underline_style,
                         );
-                        underline_origin.x = origin.x;
-                        underline_origin.y += line_height;
+                        if glyph.index < run_end {
+                            underline_origin.x = origin.x;
+                            underline_origin.y += line_height;
+                        } else {
+                            current_underline = None;
+                        }
                     }
                     if let Some((strikethrough_origin, strikethrough_style)) =
                         current_strikethrough.as_mut()
@@ -407,8 +411,12 @@ fn paint_line(
                             glyph_origin.x - strikethrough_origin.x,
                             strikethrough_style,
                         );
-                        strikethrough_origin.x = origin.x;
-                        strikethrough_origin.y += line_height;
+                        if glyph.index < run_end {
+                            strikethrough_origin.x = origin.x;
+                            strikethrough_origin.y += line_height;
+                        } else {
+                            current_strikethrough = None;
+                        }
                     }
 
                     glyph_origin.x = aligned_origin_x(
@@ -626,8 +634,12 @@ fn paint_line_background(
                             },
                             *background_color,
                         ));
-                        background_origin.x = origin.x;
-                        background_origin.y += line_height;
+                        if glyph.index < run_end {
+                            background_origin.x = origin.x;
+                            background_origin.y += line_height;
+                        } else {
+                            current_background = None;
+                        }
                     }
 
                     glyph_origin.x = aligned_origin_x(
@@ -772,7 +784,7 @@ mod tests {
                 }],
                 len: text.len(),
             }),
-            text: SharedString::new(text.to_string()),
+            text: SharedString::new(text),
             decoration_runs: SmallVec::from(decorations.to_vec()),
         }
     }
@@ -890,7 +902,7 @@ mod tests {
                 ],
                 len: 6,
             }),
-            text: SharedString::new("abcdef".to_string()),
+            text: "abcdef".into(),
             decoration_runs: SmallVec::new(),
         };
 
