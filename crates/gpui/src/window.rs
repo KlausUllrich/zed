@@ -61,6 +61,9 @@ use uuid::Uuid;
 
 pub(crate) mod a11y;
 mod prompts;
+// CS (S603): compositor present-time exposure — kept in its own file to minimise
+// the upstream footprint. See `window/cs_presentation_time.rs`.
+mod cs_presentation_time;
 
 pub use a11y::A11ySubtreeBuilder;
 
@@ -1069,6 +1072,11 @@ pub struct Window {
     active: Rc<Cell<bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
+    /// CS (S603): sticky compositor present-time. The record logic and the public
+    /// accessor live in `window/cs_presentation_time.rs` (kept separate to
+    /// minimise the upstream footprint); this field is the only struct-resident
+    /// piece.
+    pub(crate) last_presentation_time_nanos: Rc<Cell<Option<u64>>>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
@@ -1388,6 +1396,7 @@ impl Window {
         let active = Rc::new(Cell::new(platform_window.is_active()));
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
+        let last_presentation_time_nanos = Rc::new(Cell::new(None));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
         let last_frame_time = Rc::new(Cell::new(None));
@@ -1501,9 +1510,16 @@ impl Window {
             let invalidator = invalidator.clone();
             let active = active.clone();
             let needs_present = needs_present.clone();
+            let last_presentation_time_nanos = last_presentation_time_nanos.clone();
             let next_frame_callbacks = next_frame_callbacks.clone();
             let input_rate_tracker = input_rate_tracker.clone();
             move |request_frame_options| {
+                // CS (S603): sticky-record the compositor present time (logic in
+                // window/cs_presentation_time.rs). Runs even on throttled frames.
+                cs_presentation_time::cs_record_presentation_time(
+                    &last_presentation_time_nanos,
+                    &request_frame_options,
+                );
                 let thermal_state = handle
                     .update(&mut cx, |_, _, cx| cx.thermal_state())
                     .log_err();
@@ -1777,6 +1793,7 @@ impl Window {
             active,
             hovered,
             needs_present,
+            last_presentation_time_nanos,
             input_rate_tracker,
             #[cfg(feature = "input-latency-histogram")]
             input_latency_tracker: InputLatencyTracker::new()?,
