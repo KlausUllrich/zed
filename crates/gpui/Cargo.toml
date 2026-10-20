@@ -288,6 +288,10 @@ name = "list_example"
 path = "examples/list_example.rs"
 
 [[example]]
+name = "list_width_change"
+path = "examples/list_width_change.rs"
+
+[[example]]
 name = "mouse_pressure"
 path = "examples/mouse_pressure.rs"
 
