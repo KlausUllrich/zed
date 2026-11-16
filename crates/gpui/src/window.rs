@@ -4777,6 +4777,14 @@ impl Window {
         self.last_input_modality = match &event {
             PlatformInput::KeyDown(_) => InputModality::Keyboard,
             PlatformInput::MouseMove(_) | PlatformInput::MouseDown(_) => InputModality::Mouse,
+            // An external file drag is pointer input and is translated into mouse
+            // events below. It delivers no ordinary mouse moves, so without this a
+            // key press before the drag would keep drop targets un-hovered.
+            PlatformInput::FileDrop(
+                FileDropEvent::Entered { .. }
+                | FileDropEvent::Pending { .. }
+                | FileDropEvent::Submit { .. },
+            ) => InputModality::Mouse,
             _ => self.last_input_modality,
         };
         if self.last_input_modality != old_modality {

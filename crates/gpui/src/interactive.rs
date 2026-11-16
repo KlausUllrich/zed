@@ -709,9 +709,12 @@ impl PlatformInput {
 #[cfg(test)]
 mod test {
 
+    use std::path::PathBuf;
+
     use crate::{
-        self as gpui, AppContext as _, Context, FocusHandle, InteractiveElement, IntoElement,
-        KeyBinding, Keystroke, ParentElement, Render, TestAppContext, Window, div,
+        self as gpui, AppContext as _, Context, ExternalPaths, FileDropEvent, FocusHandle,
+        InteractiveElement, IntoElement, KeyBinding, Keystroke, ParentElement, Render, Styled as _,
+        TestAppContext, Window, div, point, px,
     };
 
     struct TestView {
@@ -777,5 +780,41 @@ mod test {
                 assert!(test_view.saw_action);
             })
             .unwrap();
+    }
+
+    struct DropTarget {
+        dropped: Option<ExternalPaths>,
+    }
+
+    impl Render for DropTarget {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div().id("drop-target").size_full().on_drop(cx.listener(
+                |this, paths: &ExternalPaths, _, _| {
+                    this.dropped = Some(paths.clone());
+                },
+            ))
+        }
+    }
+
+    /// A file dragged in from another application arrives as `FileDropEvent`s,
+    /// never as mouse moves. Drop listeners fire only on a hovered hitbox, and
+    /// hover is suppressed while the last input was the keyboard, so typing
+    /// just before the drag must not leave the drop target unreachable.
+    #[gpui::test]
+    fn test_file_drop_after_keyboard_input(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| DropTarget { dropped: None });
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.simulate_keystrokes("a");
+
+        let position = point(px(10.), px(10.));
+        let paths = ExternalPaths(vec![PathBuf::from("/tmp/dropped.txt")].into());
+        cx.simulate_event(FileDropEvent::Entered {
+            position,
+            paths: paths.clone(),
+        });
+        cx.simulate_event(FileDropEvent::Pending { position });
+        cx.simulate_event(FileDropEvent::Submit { position });
+
+        view.read_with(cx, |view, _| assert_eq!(view.dropped, Some(paths)));
     }
 }
